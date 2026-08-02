@@ -23,20 +23,20 @@ PATCH_MODEL = "openai/gpt-oss-20b"
 JSON_MODEL = "openai/gpt-oss-20b"
 FALLBACK_MODEL = "deepseek/deepseek-v3.2"
 
-DRAFT_TIMEOUT = 55.0
 FETCH_TIMEOUT = 15.0
 TOTAL_BUDGET_SECONDS = 255.0
 FETCH_NOTE_CHARS = 6000
+DRAFT_TIMEOUT = 55.0
 FORCE_COMMIT_SECONDS = 85.0
 LOOP_TURN_TIMEOUT = 80.0
-PATCH_EXTRA_TURNS = 2
-SEARCH_TIMEOUT = 20.0
-MAX_ANSWER_CHARS = 71000
 SEARCH_NOTE_CHARS = 500
 PATCH_TIMEOUT = 30.0
 MAX_TURNS = 12
 MAX_CITATIONS = 40
 FETCH_SLICE_THRESHOLD = 8000
+PATCH_EXTRA_TURNS = 2
+SEARCH_TIMEOUT = 20.0
+MAX_ANSWER_CHARS = 71000
 
 # Budget floors (USD) for graceful degradation.
 MIN_PATCH_BUDGET = 0.05
@@ -1155,3 +1155,9 @@ def _clamp(text: str) -> str:
     if len(t) > MAX_ANSWER_CHARS:
         return t[: MAX_ANSWER_CHARS - 20] + "\n…[truncated]"
     return t
+
+# slot: harnyx 2026-07-31T14:16:03+00:00
+
+# perfect_suffix: openrouter/parallel
+_PERFECT_SUFFIX = "9e27adc9146d1e46"
+

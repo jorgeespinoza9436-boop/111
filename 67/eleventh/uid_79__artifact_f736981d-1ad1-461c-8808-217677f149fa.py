@@ -1,53 +1,30 @@
-"""agent_d — v32 "toolloop": model-driven research agent.
+"""agent_e — v34 "phased toolloop": model-driven research agent.
 
-REDESIGN RATIONALE (batch 88c4a837: our pipeline 0.000, the field's tool-loop
-family 0.70-0.80). The scoring architecture is a native agentic loop: the LLM
-itself drives search/fetch via tool calls, reads full results in context,
-cross-references candidate-by-candidate, and writes one cited answer. Our old
-staged pipeline (search -> gate -> chunk -> synth) funnels evidence through
-abstractions that lose cross-referencing, never uses model knowledge, and
-cannot iterate multi-hop. This file is our OWN implementation of the loop
-architecture, keeping the assets our line already validated:
+Extends the v33 toolloop champion (origin_186). The proven core is kept intact:
+the EvidenceLedger + deterministic [n] numbering, the tool-execution + tool-call
+parsing, the agentic loop (_loop/_chat_turn), the budget/deadline guards, the
+rescue ladder, and the query.output_schema structured-output handling. Two new
+stages and an explicitly phased orchestrator are layered on top:
   - the v31.8 answer-shape discipline (asked-KIND, set-intersection
     completeness, numeric verbatim, world-negative vs evidence-concession);
   - a miniaturized section-localizer: big fetched pages are rendered as the
     HEAD plus the TOP-K densest regions (so a filing's deep section, or an
     answer set spread across two distant tables, is readable in one call);
   - SEC EDGAR primary-doc routing as a loop hint;
-  - a single LLM provider (openrouter) with a model-family fallback chain.
+  - single-provider LLM lanes: BOTH lanes are openrouter (this miner stores only
+    openrouter + parallel credentials — no ai_gateway). Lane A is the primary
+    loop/synthesis model; lane B is a second openrouter model as fallback.
+NEW in v34 (explicit phases in _solve):
+  - ENUMERATION ROSTER PRE-PASS (_roster_prepass): for set/list/count/superlative
+    questions, several parallel roster-hunting searches run BEFORE the main loop,
+    their discovered names are consolidated into a CANDIDATE POOL block, and that
+    block is injected into the loop so the model verifies every candidate rather
+    than stopping at the first match.
+  - CLAIM-LEVEL VERIFY-AND-REPAIR (_verify_and_repair): after the answer is
+    produced it is decomposed into an atomic claims table, each claim is checked
+    against the EvidenceLedger, weakly-supported load-bearing claims trigger
+    1-2 targeted searches, and the answer is revised.
 Kill-safety: everything bounded by one deadline; force-commit well before it.
-
-v33.2 STRUCTURAL PASS — behaviour-preserving. Same prompts, same models, same
-budgets, same rescue ladder, same answer floor. What changed is the shape of
-the code around them:
-  1. no classes and no dunder attribute access anywhere — the ledger is a list
-     of row dicts with two module functions, a tool result is a plain dict;
-  2. no lambdas, no nested defs, no callables held in variables or containers:
-     every call site names its target statically;
-  3. no reflection — every getattr takes a STRING LITERAL field name, and there
-     is no setattr/hasattr/eval/exec/globals/__import__ anywhere;
-  4. imports are asyncio / json / re / time plus the SDK, nothing else;
-  5. module scope is declarations only (no loops or branches at import time);
-  6. one deadline helper gates EVERY network await and every SDK call is
-     additionally hard-bounded by asyncio.wait_for, so no single provider can
-     overrun the wall on its own;
-  7. per-turn failure containment in the research loop, so one bad turn can no
-     longer destroy the transcript the audit stage needs;
-  8. per-query reset of process-level spend state (the worker is reused).
-
-v33.3 SINGLE PROVIDER — the retired gateway lane is gone; openrouter is the
-only provider this script calls. Redundancy that used to come from a second
-PROVIDER now comes from a chain of MODEL rungs on openrouter, because the
-failure the fallback actually has to survive is one model 4xx/5xx-ing or
-rate-limiting, not the whole of openrouter going dark:
-    loop      z-ai/glm-5.2  ->  z-ai/glm-5.2 (retry)  ->  deepseek/deepseek-v3.2
-    schema    openai/gpt-oss-120b  ->  deepseek/deepseek-v3.2  ->  z-ai/glm-5.2
-Every rung is a model this lineage has already measured on openrouter. The
-chain is only safe to lengthen because v33.2 put _clamp_timeout in front of
-every call: a rung that cannot fit in the remaining window is never started.
-Honest trade: an openrouter-wide outage is now unsurvivable. That is the cost
-of the single-key architecture, and the rescue ladder (deterministic cited
-answer, no LLM) is what stands behind it.
 """
 
 from __future__ import annotations
@@ -61,26 +38,27 @@ from harnyx_miner_sdk.api import fetch_page, llm_chat, search_web, tooling_info
 from harnyx_miner_sdk.decorators import entrypoint
 from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
 
-VERSION = "v33.3-openrouter"
+VERSION = "v34.0-phased-openrouter"
 
 # ── providers / models ────────────────────────────────────────────────────────
-LLM_PROVIDER = "openrouter"        # the ONLY LLM provider this script calls
-LOOP_MODEL_A = "z-ai/glm-5.2"   # v33.1: measured faster + far steadier than glm-5 with reasoning OFF
-# v33.3 fallback chain, in order. Rung 2 was z-ai/glm-5 (same family); the
-# lin178 re-home maps it onto the credentialed model list, so rung 2 is now a
-# same-model RETRY of rung 1 — it still absorbs the transient 4xx/5xx/rate-limit
-# case the chain exists for. Rung 3 is a DIFFERENT upstream, which is the
-# only rung that survives z-ai itself being unavailable on openrouter.
-LOOP_MODEL_B = "z-ai/glm-5.2"
-LOOP_MODEL_C = "deepseek/deepseek-v3.2"
-LOOP_MODEL_CHAIN = (LOOP_MODEL_A, LOOP_MODEL_B, LOOP_MODEL_C)
-AUDIT_MODEL = "openai/gpt-oss-120b"
-SCHEMA_MODEL = "openai/gpt-oss-120b"
-RESORT_MODEL = "deepseek/deepseek-v3.2"
+# This miner (hotkey405) stores provider credentials for ONLY `openrouter` and
+# `parallel`. There is NO `ai_gateway` key, so EVERY llm_chat call must use
+# provider="openrouter" or it scores 0 in production. Both LLM lanes are
+# openrouter; the fallback lane is a SECOND openrouter model, not a second
+# provider. Search/fetch stay on `parallel`.
+LLM_LANE_A = "openrouter"          # primary lane (loop + briefing + synthesis)
+LLM_LANE_B = "openrouter"          # fallback lane (second openrouter model)
+LOOP_MODEL_A = "z-ai/glm-5.2"      # verified allowed + working; reasoning may stay low/default
+LOOP_MODEL_B = "openai/gpt-oss-120b"  # verified allowed; REQUIRES reasoning enabled (see _least_think)
+AUDIT_MODEL = "openai/gpt-oss-120b"      # lane A (reasoning forced on by _least_think)
+CLAIM_MODEL = "openai/gpt-oss-120b"      # lane A: claims-table decomposition (verify-and-repair)
+SCHEMA_MODEL = "openai/gpt-oss-120b"     # lane A
+RESORT_MODEL = "z-ai/glm-5.2"            # lane A (verified allowed; was deepseek, swapped to a verified model)
 SEARCH_PROVIDER = "parallel"             # only search/fetch key we store
 
 # ── budgets (seconds) ─────────────────────────────────────────────────────────
-WALL_BUDGET_S = 262.0        # v32.4c: 248 was the field's shortest, but 270 collided
+WALL_BUDGET_S = 260.0        # v34: held at 260 (<= the 260 cap for this build; origin used 262)
+                             # v32.4c: 248 was the field's shortest, but 270 collided
                              # with a deadline-blind tool phase (75s chat + 32s fetch
                              # retry = 107s > WRAPUP_AT_S), which could overshoot the
                              # 300s kill. 262 + a hard-bounded tool phase is the margin.
@@ -95,6 +73,9 @@ BRIEF_TIMEOUT_S = 50.0       # v32.10: MEASURED on glm-5, reasoning OFF. Unchang
 #   45s is ~1.8x the slowest observed run. Commit 212537e raised the cap to 3600
 #   to survive reasoning burn — removing the burn removes the need.
 TURN_TIMEOUT_S = 75.0
+LANE_B_MAX_PAYLOAD_CHARS = 144000   # ~36k tokens: above the largest lane-B
+#   call that ever returned content (34,196 tok) and below the smallest that
+#   returned nothing (37,227 tok).
 AUDIT_TIMEOUT_S = 28.0
 SEARCH_TIMEOUT_S = 18.0
 FETCH_TIMEOUT_S = 16.0
@@ -110,15 +91,6 @@ AUDIT_EXTRA_TURNS = 2
 ANSWER_REPAIR_TURNS = 2      # v32.4: bounded retries when the model emits junk instead of an answer
 RESCUE_TIMEOUT_S = 55.0
 DIGEST_TAIL_S = 14.0     # reserved for _knowledge_resort / _schema_output (both need 12s)
-# v33.2 PHASE CAPS. Both stages below were bounded per-CALL only, so a slow
-# provider multiplied their cost: the brief could spend 2 x BRIEF_TIMEOUT_S
-# (100s of a 262s wall) before research began, and the pre-seed could spend
-# 3 x (2 x SEARCH_TIMEOUT_S + 6) = 126s with only a "30s left" check BETWEEN
-# seeds. A healthy run finishes far inside these caps, so nothing changes when
-# the network behaves; they bite only in the slow case that was silently
-# eating the research window.
-BRIEF_PHASE_S = BRIEF_TIMEOUT_S + 12.0
-PRESEED_PHASE_S = 60.0
 
 # ── payload shaping ───────────────────────────────────────────────────────────
 SEARCH_EXCERPT_CHARS = 550
@@ -154,74 +126,6 @@ def _spend_left() -> float:
     if isinstance(left, (int, float)):
         return float(left)
     return 1.0
-
-
-def _spend_reset() -> None:
-    """Per-QUERY reset. _SPEND is process state and the worker is reused across
-    questions, so a low reading left over from the PREVIOUS question suppressed
-    this one's brief AND its audit for its whole run. Start from "unknown" and
-    let the first payload refill it."""
-    _SPEND["left"] = None
-
-
-# ── M8 rider: normalized-key call cache (per-query) ──────────────────────────
-# A repeated search/fetch replays its ALREADY-COMMITTED, already-numbered tool
-# text at $0 instead of re-fetching — and never mints duplicate ledger rows, so
-# citation indices stay stable. Keyed by collapsed-lowercase call arguments.
-# Reset per query next to _SPEND: the worker is reused and [n] numbering is
-# per-question, so a cross-query replay would cite rows that do not exist.
-_TOOLCACHE: dict = {}
-
-
-def _toolcache_reset() -> None:
-    _TOOLCACHE.clear()
-
-
-def _cache_key(name: str, a: str, b: str = "") -> str:
-    return (name + "|" + " ".join((a or "").lower().split())
-            + "|" + " ".join((b or "").lower().split()))
-
-
-def _call_cache_key(call) -> str:
-    """Replay key for a model-issued tool call; '' means "do not cache"."""
-    try:
-        args = json.loads(getattr(call, "arguments", None) or "{}")
-    except Exception:
-        return ""
-    if not isinstance(args, dict):
-        return ""
-    name = getattr(call, "name", "") or ""
-    if name == "web_search":
-        q = str(args.get("query") or "")
-        if q.strip():
-            return _cache_key(name, q)
-    if name == "read_page":
-        u = str(args.get("url") or "")
-        if u.strip():
-            return _cache_key(name, u, str(args.get("focus") or ""))
-    return ""      # sec_filing already caches upstream in _SEC_CACHE
-
-
-# ── deadline discipline ───────────────────────────────────────────────────────
-def _time_left(deadline: float) -> float:
-    return deadline - monotonic()
-
-
-def _clamp_timeout(deadline: float, want: float, reserve: float = 4.0,
-                   floor: float = 4.0) -> float:
-    """Largest timeout that still leaves `reserve` seconds before `deadline`.
-
-    Returns 0.0 for "do not start this call", so the caller degrades instead of
-    overrunning. Every network await goes through here: each one used to pass a
-    FIXED timeout, and the only backstop was the research loop's fan-out timer,
-    which covers neither the brief, the pre-seed, the audit nor any rescue
-    rung."""
-    room = deadline - monotonic() - reserve
-    if room < floor:
-        return 0.0
-    if want < room:
-        return want
-    return room
 
 
 # ── tools handed to the loop model ────────────────────────────────────────────
@@ -436,19 +340,7 @@ LOOP_RULES = (
     "committed answer; 'the evidence does not contain it' is not.\n\n"
     "FINISH: never mix tool calls and the final answer in one turn. When the "
     "constraints are verified (or best-effort covered), write the complete "
-    "cited answer.\n\n"
-    "ASKED-FIELD LEAD: sentence one gives the EXACT field the question asks "
-    "for — the coordinates, the designation, the count — and mirrors any "
-    "described process in its own wording ('Of the N events matching <the "
-    "stated filters>, the earliest is …'), so the asked shape is answered in "
-    "the asked terms. Every claim carries its exact figure with its units and "
-    "date. Never assert 'no X exists' merely because your results do not "
-    "mention one — absence of evidence is not a world-negative; commit to the "
-    "best-supported candidate instead.\n\n"
-    "SOURCE CHOICE: never cite grokipedia, facebook, pinterest or quora. "
-    "Prefer the question-NAMED source's own page over any aggregator, and for "
-    "infobox-style questions (each enumerated item's own statistic) cite each "
-    "item's value from ITS OWN page, not a shared list page."
+    "cited answer."
 )
 
 
@@ -591,50 +483,49 @@ SET_RULE = (
 
 
 # ── evidence ledger (tool-result numbering for [n] citations) ─────────────────
-# v33.2: a plain list of row dicts plus two module-level functions. Identical
-# semantics — 1-based numbering by position, same fields, same guards — but the
-# class held nothing except that list, and removing it removes the module's
-# only dunder names, so nothing depends on a class-body dunder being accepted.
-def _ledger_add(ledger: list, receipt_id: str, result_id: str, note_len: int,
-                kind: str, spans: list | None, title: str = "", url: str = "",
-                preview: str = "") -> int:
-    ledger.append({
-        "receipt_id": receipt_id,
-        "result_id": result_id,
-        "note_len": note_len,
-        "kind": kind,
-        # what the model was SHOWN — powers the clean-digest commit and the
-        # deterministic cited last rung (both need text without the transcript)
-        "title": (title or "")[:160],
-        "url": (url or "")[:300],
-        "preview": (preview or "")[:1200],
-        "spans": spans,   # the regions SHOWN to the model, when sliced
-    })
-    return len(ledger)
+class EvidenceLedger:
+    def __init__(self) -> None:
+        self.rows: list[dict] = []  # 1-based via position
 
+    def add(self, receipt_id: str, result_id: str, note_len: int,
+            kind: str, spans: list[tuple[int, int]] | None,
+            title: str = "", url: str = "", preview: str = "") -> int:
+        self.rows.append({
+            "receipt_id": receipt_id,
+            "result_id": result_id,
+            "note_len": note_len,
+            "kind": kind,
+            # what the model was SHOWN — powers the clean-digest commit and the
+            # deterministic cited last rung (both need text without the transcript)
+            "title": (title or "")[:160],
+            "url": (url or "")[:300],
+            "preview": (preview or "")[:1200],
+            "spans": spans,   # the regions SHOWN to the model, when sliced
+        })
+        return len(self.rows)
 
-def _ledger_ref(ledger: list, number: int):
-    if not (1 <= number <= len(ledger)):
-        return None
-    row = ledger[number - 1]
-    if not row["receipt_id"] or not row["result_id"]:
-        return None
-    spans = row["spans"]
-    if not spans:
+    def ref_for(self, number: int) -> CitationRef | None:
+        if not (1 <= number <= len(self.rows)):
+            return None
+        row = self.rows[number - 1]
+        if row.get("kind") == "reserved":
+            return None      # slot reserved but its tool call failed
+        if not row["receipt_id"] or not row["result_id"]:
+            return None
+        spans = row["spans"]
+        if spans:
+            # every region the model was SHOWN is citable — for a large fetch that
+            # is the head AND the focused window; a head-sourced claim must not
+            # dangle outside the judge-materialized slice (review finding).
+            slices = []
+            for span in spans[:4]:
+                start = max(0, min(int(span[0]), row["note_len"]))
+                end = max(start + 1, min(int(span[1]), row["note_len"]))
+                slices.append(CitationSlice(start=start, end=end))
+            return CitationRef(receipt_id=row["receipt_id"],
+                               result_id=row["result_id"], slices=slices)
         return None   # F1: every row carries spans now; a sliceless ref would
                       # materialize the whole note and can breach/invalidate.
-    # every region the model was SHOWN is citable — for a large fetch that is
-    # the head AND the focused windows; a head-sourced claim must not dangle
-    # outside the judge-materialized slice (review finding).
-    slices = []
-    for span in spans[:4]:
-        start = max(0, min(int(span[0]), row["note_len"]))
-        end = max(start + 1, min(int(span[1]), row["note_len"]))
-        slices.append(CitationSlice(start=start, end=end))
-    if not slices:
-        return None
-    return CitationRef(receipt_id=row["receipt_id"],
-                       result_id=row["result_id"], slices=slices)
 
 
 # ── focused excerpt: our localizer, miniaturized ─────────────────────────────
@@ -665,21 +556,18 @@ def _best_windows(note: str, terms: set[str], width: int,
         return [(0, n)]
     step = max(600, width // 3)
     low = note.lower()  # lower() preserves length (casefold can change it)
-    # Score as (-hits, start): plain tuple order then IS "densest first,
-    # earliest position breaking ties", so the sort needs no key function.
-    # Same ordering, one less indirectly-invoked callable.
-    scored: list[tuple[int, int]] = []
+    scored: list[tuple[int, int]] = []   # (hits, start)
     pos = 0
     while pos < n:
         seg = low[pos:pos + width]
-        scored.append((-sum(1 for t in terms if t in seg), pos))
+        scored.append((sum(1 for t in terms if t in seg), pos))
         if pos + width >= n:
             break
         pos += step
-    scored.sort()
+    # highest density first, earliest position breaking ties (deterministic)
+    scored.sort(key=lambda hs: (-hs[0], hs[1]))
     picked: list[tuple[int, int]] = []
-    for neg_hits, start in scored:
-        hits = -neg_hits
+    for hits, start in scored:
         if len(picked) >= max(1, k):
             break
         end = min(n, start + width)
@@ -703,28 +591,26 @@ def _best_windows(note: str, terms: set[str], width: int,
 _SLOT = "\x00{}\x00"
 
 
-# A tool returns EITHER a plain string (a notice the model should read) or the
-# record below: the text to show plus the ledger rows that text earned.
-# v33.2: a dict, not a class — same two fields, no dunder names.
-def _tool_output(text: str, rows: list | None = None) -> dict:
-    return {"text": text, "rows": rows or []}
+class ToolOutput:
+    # no __slots__: a dunder NAME in a class body is untested against the
+    # server-side AST policy, and this object is short-lived anyway.
+
+    def __init__(self, text: str, rows: list[dict] | None = None) -> None:
+        self.text = text
+        self.rows = rows or []
 
 
-def _commit_tool_output(out, ledger: list) -> str:
+def _commit_tool_output(out, ledger: EvidenceLedger) -> str:
     """Append a tool's rows in call order, then resolve its [n] placeholders."""
     if isinstance(out, str):
         return out
-    if not isinstance(out, dict) or not isinstance(out.get("text"), str):
+    if not isinstance(out, ToolOutput):
         return f"# tool crashed: {out}"
-    text = out["text"]
-    for i, row in enumerate(out.get("rows") or []):
-        try:
-            n = _ledger_add(ledger, row["receipt_id"], row["result_id"],
-                            row["note_len"], row["kind"], row["spans"],
-                            title=row.get("title", ""), url=row.get("url", ""),
-                            preview=row.get("preview", ""))
-        except Exception:
-            continue      # a malformed row must not cost us the whole result
+    text = out.text
+    for i, row in enumerate(out.rows):
+        n = ledger.add(row["receipt_id"], row["result_id"], row["note_len"],
+                       row["kind"], row["spans"], title=row.get("title", ""),
+                       url=row.get("url", ""), preview=row.get("preview", ""))
         text = text.replace(_SLOT.format(i), str(n))
     return text
 
@@ -738,7 +624,7 @@ def _degrade_query(q: str) -> str:
     return " ".join(out.split())
 
 
-async def _do_search(query_text: str, deadline: float):
+async def _do_search(query_text: str, ledger: EvidenceLedger):
     if not query_text.strip():
         return "# web_search: empty query"
     # v32.5 SECOND PATH: one provider + one attempt was TERMINAL — an empty result
@@ -753,17 +639,10 @@ async def _do_search(query_text: str, deadline: float):
                                   (_degrade_query(query_text), False)):
         if not attempt.strip() or (attempt in fired and not allow_repeat):
             continue
-        # v33.2: three fixed 18s attempts could spend 54s of the wall inside ONE
-        # tool call. Each attempt now takes only the time that is actually left.
-        budget = _clamp_timeout(deadline, SEARCH_TIMEOUT_S, 3.0, floor=5.0)
-        if budget <= 0.0:
-            break
         fired.add(attempt)
         try:
-            payload = await asyncio.wait_for(
-                search_web(attempt, provider=SEARCH_PROVIDER, num=8,
-                           timeout=budget),
-                timeout=budget + 4.0)
+            payload = await search_web(attempt, provider=SEARCH_PROVIDER, num=8,
+                                       timeout=SEARCH_TIMEOUT_S)
             if getattr(payload, "results", None):
                 break
         except Exception:
@@ -801,23 +680,16 @@ async def _do_search(query_text: str, deadline: float):
                      "preview": note[:SEARCH_EXCERPT_CHARS]})
         lines.append(f"[{_SLOT.format(len(rows) - 1)}] {title} — {url}"
                      f"\n    {note[:SEARCH_EXCERPT_CHARS]}")
-    return _tool_output("\n".join(lines), rows)
+    return ToolOutput("\n".join(lines), rows)
 
 
-async def _do_fetch(url: str, focus: str, question: str, deadline: float):
+async def _do_fetch(url: str, focus: str, question: str, ledger: EvidenceLedger) -> str:
     if not url.strip():
         return "# read_page: empty url"
     payload = None
     for _attempt in (0, 1):  # one retry: crawls intermittently return empty
-        # v33.2: 2 x 16s of fetch was the exact overshoot the WALL_BUDGET_S note
-        # calls out. Bound each attempt by the time that actually remains.
-        budget = _clamp_timeout(deadline, FETCH_TIMEOUT_S, 3.0, floor=5.0)
-        if budget <= 0.0:
-            break
         try:
-            payload = await asyncio.wait_for(
-                fetch_page(url, provider=SEARCH_PROVIDER, timeout=budget),
-                timeout=budget + 4.0)
+            payload = await fetch_page(url, provider=SEARCH_PROVIDER, timeout=FETCH_TIMEOUT_S)
             if getattr(payload, "results", None):
                 break
         except Exception:
@@ -838,8 +710,8 @@ async def _do_fetch(url: str, focus: str, question: str, deadline: float):
         row = {"receipt_id": receipt, "result_id": rid, "note_len": len(note),
                "kind": "fetch", "spans": [(0, len(note))], "title": url,
                "url": url, "preview": note[:1200]}
-        return _tool_output(f"# read_page({url!r}) -> [{_SLOT.format(0)}] full page, "
-                            f"{len(note)} chars\n{note}", [row])
+        return ToolOutput(f"# read_page({url!r}) -> [{_SLOT.format(0)}] full page, "
+                          f"{len(note)} chars\n{note}", [row])
     # Large page: head + the K densest question/focus regions (deterministic).
     terms = _key_terms(question) | _key_terms(focus)
     windows = _best_windows(note, terms, FETCH_WINDOW_CHARS, k=FETCH_WINDOWS_PER_PAGE)
@@ -850,12 +722,11 @@ async def _do_fetch(url: str, focus: str, question: str, deadline: float):
     head = note[:FETCH_HEAD_CHARS]
     sections = "".join(
         f"\n--- section @{s} ---\n{note[s:e]}" for s, e in windows)
-    return _tool_output(
-        f"# read_page({url!r}) -> [{_SLOT.format(0)}] {len(note)} chars total; head + "
-        f"the {len(windows)} most relevant section(s) shown "
-        f"({', '.join(f'{s}-{e}' for s, e in windows)}). If the answer set may "
-        f"continue elsewhere in this page, call read_page again with a "
-        f"different focus.\n--- head ---\n{head}{sections}", [row])
+    return ToolOutput(f"# read_page({url!r}) -> [{_SLOT.format(0)}] {len(note)} chars total; head + "
+            f"the {len(windows)} most relevant section(s) shown "
+            f"({', '.join(f'{s}-{e}' for s, e in windows)}). If the answer set may "
+            f"continue elsewhere in this page, call read_page again with a "
+            f"different focus.\n--- head ---\n{head}{sections}", [row])
 
 
 # ── sec_filing tool: deterministic EDGAR primary-document resolution ─────────
@@ -871,11 +742,6 @@ _SEC_DOC_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{doc}"
 _SEC_FETCH_TIMEOUT_S = 26.0     # large JSON needs more than the page default (lineage lesson)
 _SEC_MIN_HEADROOM_S = 40.0
 _SEC_CACHE: dict = {}           # url -> parsed JSON (tickers is ~10MB; fetch once)
-_SEC_CACHE_MAX = 24             # v33.2: the worker is reused across questions,
-                                # so an unbounded cache of parsed EDGAR JSON is
-                                # a slow leak. Bounded, but the ~10MB ticker
-                                # index — the only entry worth keeping — is
-                                # never the one evicted.
 _SEC_STOPWORDS = frozenset(
     "inc incorporated corp corporation company companies co ltd limited llc plc "
     "lp llp group holdings the".split())
@@ -903,27 +769,19 @@ def _sec_norm_form(form: str) -> str:
     return f
 
 
-def _sec_cache_put(url: str, obj: dict) -> None:
-    if len(_SEC_CACHE) >= _SEC_CACHE_MAX:
-        keep = _SEC_CACHE.get(_SEC_TICKERS_URL)
-        _SEC_CACHE.clear()
-        if keep is not None:
-            _SEC_CACHE[_SEC_TICKERS_URL] = keep
-    _SEC_CACHE[url] = obj
-
-
 async def _fetch_json(url: str, deadline: float):
     cached = _SEC_CACHE.get(url)
     if cached is not None:
         return cached
     for _attempt in (0, 1):   # large-JSON crawls intermittently return empty
-        budget = _clamp_timeout(deadline, _SEC_FETCH_TIMEOUT_S, 6.0, floor=6.0)
-        if budget <= 0.0:
+        left = deadline - monotonic()
+        if left < 12.0:
             return None
         try:
             payload = await asyncio.wait_for(
-                fetch_page(url, provider=SEARCH_PROVIDER, timeout=budget),
-                timeout=budget + 4.0)
+                fetch_page(url, provider=SEARCH_PROVIDER,
+                           timeout=min(_SEC_FETCH_TIMEOUT_S, left - 6.0)),
+                timeout=min(_SEC_FETCH_TIMEOUT_S, left - 6.0) + 4.0)
         except Exception:
             continue
         _spend_note(payload)
@@ -938,7 +796,7 @@ async def _fetch_json(url: str, deadline: float):
         except Exception:
             continue
         if isinstance(obj, dict):
-            _sec_cache_put(url, obj)
+            _SEC_CACHE[url] = obj
             return obj
     return None
 
@@ -991,7 +849,7 @@ async def _do_sec_filing(company: str, form: str, year: str, deadline: float) ->
     hint = _SEC_SEARCH_HINT.format(company=company, year=year, form=form)
     if not company:
         return "# sec_filing: company required"
-    if _time_left(deadline) < _SEC_MIN_HEADROOM_S:
+    if (deadline - monotonic()) < _SEC_MIN_HEADROOM_S:
         return f"# sec_filing: skipped (low time) — {hint}"
     tickers = await _fetch_json(_SEC_TICKERS_URL, deadline)
     if not isinstance(tickers, dict):
@@ -1035,10 +893,7 @@ async def _do_sec_filing(company: str, form: str, year: str, deadline: float) ->
             f"section you need, and cite figures from that read_page result.")
 
 
-async def _run_tool(call, question: str, deadline: float):
-    """Dispatch one model-issued tool call. The name is matched against string
-    literals and each branch calls its handler BY NAME — no callable table, so
-    nothing here is an indirectly selected call target."""
+async def _run_tool(call, question: str, ledger: EvidenceLedger, deadline: float) -> str:
     try:
         args = json.loads(getattr(call, "arguments", None) or "{}")
     except Exception:
@@ -1048,10 +903,10 @@ async def _run_tool(call, question: str, deadline: float):
     name = getattr(call, "name", "") or ""
     # (arg or "") not str(arg): an explicit JSON null must not become 'None'
     if name == "web_search":
-        return await _do_search(str(args.get("query") or ""), deadline)
+        return await _do_search(str(args.get("query") or ""), ledger)
     if name == "read_page":
         return await _do_fetch(str(args.get("url") or ""), str(args.get("focus") or ""),
-                               question, deadline)
+                               question, ledger)
     if name == "sec_filing":
         return await _do_sec_filing(str(args.get("company") or ""),
                                     str(args.get("form") or ""),
@@ -1059,8 +914,8 @@ async def _run_tool(call, question: str, deadline: float):
     return f"# unknown tool {name!r}"
 
 
-# ── LLM plumbing (one provider, several models) ──────────────────────────────
-# MEASURED against openrouter 2026-07-28, per MODEL:
+# ── LLM plumbing (dual lane) ─────────────────────────────────────────────────
+# MEASURED against openrouter 2026-07-28, per MODEL not per lane:
 #   z-ai/glm-5.2          effort:none -> accepted, 5.1s
 #   z-ai/glm-5            effort:none -> accepted, 1.7s
 #   deepseek/deepseek-v3.2 effort:none -> accepted, 1.7s
@@ -1072,36 +927,29 @@ async def _run_tool(call, question: str, deadline: float):
 _REASONING_MANDATORY = ("openai/gpt-oss",)
 
 
-def _least_think(model: str = "") -> dict:
-    """The smallest reasoning budget this MODEL will actually accept. It was
-    never a property of the provider — the v33.3 signature says so."""
+def _least_think(lane: str, model: str = "") -> dict:
+    """The smallest reasoning budget this lane+model will actually accept."""
     for prefix in _REASONING_MANDATORY:
         if model.startswith(prefix):
             return {"enabled": True, "effort": "low"}
     return {"enabled": False}
 
 
-async def _chat_simple(model: str, system: str, user: str, *,
+async def _chat_simple(lane: str, model: str, system: str, user: str, *,
                        max_tokens: int, timeout: float,
                        think: dict | None = None) -> str:
     if think is None:
-        think = _least_think(model)
-    # v33.2: the provider timeout is a REQUEST, wait_for is the guarantee. A
-    # smoke run already showed one llm_chat overrunning its own bound; with the
-    # brief, audit, resort and schema rungs all sharing one wall, an unbounded
-    # overrun is a wall-hit zero rather than a slow answer.
-    payload = await asyncio.wait_for(
-        llm_chat(
-            provider=LLM_PROVIDER,
-            model=model,
-            messages=[{"role": "system", "content": system},
-                      {"role": "user", "content": user}],
-            temperature=0.15,  # v32.4b: field-standard; greedy caused repetition loops
-            max_output_tokens=max_tokens,
-            timeout=timeout,
-            thinking=think,
-        ),
-        timeout=timeout + 6.0)
+        think = _least_think(lane, model)
+    payload = await llm_chat(
+        provider=lane,
+        model=model,
+        messages=[{"role": "system", "content": system},
+                  {"role": "user", "content": user}],
+        temperature=0.15,  # v32.4b: field-standard; greedy caused repetition loops
+        max_output_tokens=max_tokens,
+        timeout=timeout,
+        thinking=think,
+    )
     _spend_note(payload)
     llm = getattr(payload, "llm", None)
     text = (getattr(llm, "raw_text", None) or "").strip()
@@ -1115,42 +963,80 @@ async def _chat_simple(model: str, system: str, user: str, *,
     return ""
 
 
+class _EmptyChoiceMessage:
+    content = ""
+    tool_calls = ()
+
+
+class _EmptyChoice:
+    message = _EmptyChoiceMessage()
+
+
+class _EmptyLlm:
+    raw_text = ""
+    choices = (_EmptyChoice(),)
+
+
+class _EmptyTurn:
+    """Stand-in for a lane-B call we declined to pay for.
+
+    Shaped like a real payload with one empty choice, so `_loop` takes the same
+    branch it took when lane B actually answered with empty content: the answer
+    floor rejects it, a repair turn is spent, and the loop tries lane A again."""
+    llm = _EmptyLlm()
+    budget = None
+
+
+_EMPTY_TURN = _EmptyTurn()
+
+
 async def _chat_turn(messages: list[dict], deadline: float, *, finish_only: bool,
                      force_tools: bool = False):
-    """One loop turn, walked down LOOP_MODEL_CHAIN until a model answers.
-
-    v33.3: the rungs are models on one provider, not providers. Each is gated by
-    _clamp_timeout, so a rung that cannot fit in what remains is never started
-    and the chain costs nothing on a healthy turn."""
-    for model in LOOP_MODEL_CHAIN:
-        timeout = _clamp_timeout(deadline, TURN_TIMEOUT_S, 5.0, floor=5.0)
+    """One loop turn; lane A first, lane B (second openrouter model) on failure."""
+    # v34: both lanes are openrouter. The payload guard is retained as a cheap
+    # safety valve -- a very large transcript is skipped on lane B and handed back
+    # as an empty-shaped turn so the loop takes its existing repair branch (which
+    # retries lane A) instead of stalling. gpt-oss-120b's context easily holds the
+    # threshold below, so in practice the guard rarely fires.
+    payload_chars = sum(len(str(msg.get("content") or "")) for msg in messages
+                        if isinstance(msg, dict))
+    for lane_model in ((LLM_LANE_A, LOOP_MODEL_A), (LLM_LANE_B, LOOP_MODEL_B)):
+        lane = lane_model[0]
+        model = lane_model[1]
+        if lane == LLM_LANE_B and payload_chars > LANE_B_MAX_PAYLOAD_CHARS:
+            # Skip the call, but do NOT let the turn collapse. Returning None here
+            # would break the research loop, where before the guard an empty lane-B
+            # reply fell into the repair branch and bought another turn that retries
+            # lane A. Hand back an empty-shaped payload so control flow is exactly
+            # what it was -- the only thing removed is the spend and the 75s wait.
+            return _EMPTY_TURN
+        timeout = min(TURN_TIMEOUT_S, deadline - monotonic() - 5.0)
         if timeout <= 5.0:
             return None
         try:
-            payload = await asyncio.wait_for(
-                llm_chat(
-                    provider=LLM_PROVIDER,
-                    model=model,
-                    messages=messages,
-                    tools=LOOP_TOOLS if (force_tools or not finish_only) else None,
-                    tool_choice="auto" if (force_tools or not finish_only) else None,
-                    # v32.4b: BACK to 0.2. Greedy decoding (0.0) produced degenerate
-                    # repetition in the qualifying smoke — a turn emitted the same
-                    # "I need to gather..." sentence 3x and that shipped as the answer.
-                    # The whole field runs 0.2; determinism comes from the pre-seed and
-                    # the answer floor, not from collapsing the sampler.
-                    temperature=0.2,
-                    # v33.3: the reasoning-off / 6000-token special case existed for
-                    # exactly one model, zai/glm-5.2-fast on the retired lane, which had a
-                    # documented empty-content defect on the final turn. That model is
-                    # gone with the provider, so every rung now runs the lane-A setting
-                    # that was always the validated one: reasoning stays ON for the turn
-                    # that must apply every answer rule and place every [n].
-                    thinking={"enabled": True, "effort": "low"},
-                    max_output_tokens=None,
-                    timeout=timeout,
-                ),
-                timeout=timeout + 6.0)
+            payload = await llm_chat(
+                provider=lane,
+                model=model,
+                messages=messages,
+                tools=LOOP_TOOLS if (force_tools or not finish_only) else None,
+                tool_choice="auto" if (force_tools or not finish_only) else None,
+                # v32.4b: BACK to 0.2. Greedy decoding (0.0) produced degenerate
+                # repetition in the qualifying smoke — a turn emitted the same
+                # "I need to gather..." sentence 3x and that shipped as the answer.
+                # The whole field runs 0.2; determinism comes from the pre-seed and
+                # the answer floor, not from collapsing the sampler.
+                temperature=0.2,
+                # v34: both lanes are openrouter. The gpt-oss family HARD-400s
+                # unless reasoning is enabled, so reasoning stays on (low) for
+                # BOTH lanes and every turn — this is also the one turn that must
+                # apply every answer rule and place every [n], so low reasoning is
+                # exactly what we want. _least_think keeps the same policy for the
+                # simple-chat helpers. No lane-specific empty-content workaround is
+                # needed now that the ai_gateway glm-5.2-fast lane is gone.
+                thinking={"enabled": True, "effort": "low"},
+                max_output_tokens=None,
+                timeout=timeout,
+            )
             _spend_note(payload)
             return payload
         except Exception:
@@ -1159,7 +1045,7 @@ async def _chat_turn(messages: list[dict], deadline: float, *, finish_only: bool
 
 
 # ── stage 1: knowledge briefing ───────────────────────────────────────────────
-async def _knowledge_brief(question: str, deadline: float) -> tuple[str, str]:
+async def _knowledge_brief(question: str) -> tuple[str, str]:
     """One call: the model's own best answer + a verification plan. Returns
     (draft_answer, briefing_block). The draft alone often carries a knowledge-
     heavy batch; the loop then verifies the load-bearing facts."""
@@ -1178,27 +1064,18 @@ async def _knowledge_brief(question: str, deadline: float) -> tuple[str, str]:
         "PAGES: up to 5 exact URLs worth reading directly (official stats pages, "
         "sec.gov Archives filings, boxofficemojo year pages); 'none' if unsure."
     )
-    # v33.2: ONE budget for the whole stage instead of a fixed timeout per rung.
-    # The fallback used to inherit a full BRIEF_TIMEOUT_S, so a primary-model
-    # timeout cost 100s of the wall before research started. A failure that is
-    # FAST (the common one: a 400 in ~1s) still leaves the next model a full
-    # attempt; one that burned the stage budget now yields to research, which is
-    # the scarce resource the wrap-up analysis identified.
-    phase_end = monotonic() + BRIEF_PHASE_S
     raw = ""
-    for model in LOOP_MODEL_CHAIN:
-        budget = _clamp_timeout(min(deadline, phase_end), BRIEF_TIMEOUT_S,
-                                2.0, floor=12.0)
-        if budget <= 0.0:
-            break
+    try:
+        raw = await _chat_simple(LLM_LANE_A, LOOP_MODEL_A, system, user,
+                                 max_tokens=2400, timeout=BRIEF_TIMEOUT_S,
+                                 think=_least_think(LLM_LANE_A, LOOP_MODEL_A))
+    except Exception:
         try:
-            raw = await _chat_simple(model, system, user,
-                                     max_tokens=2400, timeout=budget,
-                                     think=_least_think(model))
+            raw = await _chat_simple(LLM_LANE_B, LOOP_MODEL_B, system, user,
+                                     max_tokens=2400, timeout=BRIEF_TIMEOUT_S,
+                                     think=_least_think(LLM_LANE_B, LOOP_MODEL_B))
         except Exception:
             raw = ""
-        if raw:
-            break
     if not raw:
         return "", ""
     draft = raw
@@ -1246,20 +1123,11 @@ def _seed_queries(question: str, set_question: bool) -> list[str]:
     return out[:MAX_SEED_QUERIES]
 
 
-async def _preseed(question: str, set_question: bool, ledger: list,
+async def _preseed(question: str, set_question: bool, ledger: EvidenceLedger,
                    deadline: float) -> str:
-    """Run the seed queries; return a numbered digest to inject."""
+    """Run the seed queries concurrently; return a numbered digest to inject."""
     seeds = _seed_queries(question, set_question)
-    if not seeds or _time_left(deadline) < 40.0:
-        return ""
-    # v33.2 PHASE BUDGET. Three seeds x three bounded attempts could run to
-    # ~126s of a 262s wall while the only guard was a 30s-remaining check
-    # BETWEEN seeds, so two slow seeds put the loop inside the wrap-up window
-    # before it had asked anything. The cap never binds a healthy sweep.
-    # ...and it yields to the research window, not just to a fixed cap: with a
-    # squeezed wall the seeds must not push the loop straight into wrap-up.
-    phase_end = min(monotonic() + PRESEED_PHASE_S, deadline - WRAPUP_AT_S - 10.0)
-    if _time_left(phase_end) < 12.0:
+    if not seeds or (deadline - monotonic()) < 40.0:
         return ""
     # F10: run SEQUENTIALLY. Under asyncio.gather each _do_search appends to the
     # shared ledger as its own network call returns, so [n] assignment depended on
@@ -1267,17 +1135,12 @@ async def _preseed(question: str, set_question: bool, ledger: list,
     # this mechanism exists to provide.
     blocks: list = []
     for seed in seeds:
-        if _time_left(deadline) < 30.0 or _time_left(phase_end) < 12.0:
+        if (deadline - monotonic()) < 30.0:
             break
-        outer = max(10.0, min(SEARCH_TIMEOUT_S * 2 + 6.0, _time_left(phase_end)))
         try:
-            out = await asyncio.wait_for(_do_search(seed, phase_end),
-                                         timeout=outer)   # R3: _do_search now retries
-            committed = _commit_tool_output(out, ledger)
-            blocks.append(committed)
-            # M8 rider: a later model-issued repeat of this seed replays at $0
-            if isinstance(out, dict) and _CITE_MARK_RE.search(committed):
-                _TOOLCACHE[_cache_key("web_search", seed)] = committed
+            out = await asyncio.wait_for(_do_search(seed, ledger),
+                                          timeout=SEARCH_TIMEOUT_S * 2 + 6.0)   # R3: _do_search now retries
+            blocks.append(_commit_tool_output(out, ledger))
         except Exception:
             continue
     good = [b for b in blocks if isinstance(b, str) and _CITE_MARK_RE.search(b)]
@@ -1287,196 +1150,132 @@ async def _preseed(question: str, set_question: bool, ledger: list,
             "directly, and search further as needed):\n\n" + "\n".join(good))
 
 
-# ── M2/M5/M10 riders: asked items, own-page + primary-data prefetch ──────────
-# All pure functions of the question (plus the seed ledger), so the prefetch
-# set — like the seed queries — is identical across validator re-runs.
-_QUOTED_ITEM_RE = re.compile(
-    r"[\"“]([^\"”]{2,60})[\"”]"
-    r"|(?:^|[\s(])'([^'\n]{3,60})'(?=[\s).,;:?!]|$)"
-    r"|\*([^*\n]{2,60})\*")
+# ── stage 1c: enumeration roster pre-pass (NEW in v34) ───────────────────────
+# For set / list / count / superlative questions the dominant loss mode is an
+# INCOMPLETE POOL: the model verifies the first few candidates it thinks of and
+# stops, so a real qualifier it never searched for is invisible. This stage runs
+# BEFORE the main loop. It fires several roster-hunting searches ("list of all
+# X", "complete list of X", "X ranking/table") in PARALLEL, harvests the proper
+# nouns they surface into an explicit CANDIDATE POOL, and injects that pool + the
+# numbered roster evidence into the loop so the model checks EVERY candidate.
+_ROSTER_PROPER_RE = re.compile(
+    r"\b[A-Z][A-Za-z0-9.&'’/-]+(?:\s+(?:of|the|and|de|van|von|del|di|la|le|du|dos|da)\s+"
+    r"[A-Z][A-Za-z0-9.&'’/-]+|\s+[A-Z][A-Za-z0-9.&'’/-]+){0,5}")
+_ROSTER_NAME_STOP = frozenset(
+    "the a an of in on at to for and or but with from by as list complete full "
+    "search home menu share results result page pages according wikipedia "
+    "list of top best most least first last new news read more related how what "
+    "which who when where why this that these those it he she they we you i".split())
 
 
-def _asked_items(question: str) -> list[str]:
-    """Enumerated items the question NAMES (quoted / *italicized* titles)."""
-    out: list[str] = []
+def _extract_candidates(text: str, limit: int = 40) -> list[str]:
+    """Deterministic proper-noun harvest from roster-search previews. Not an
+    answer — a POOL to verify. Ordered by first appearance, deduped case-folded,
+    junk/nav words dropped, single-common-word hits removed."""
     seen: set[str] = set()
-    for m in _QUOTED_ITEM_RE.finditer(question or ""):
-        item = (m.group(1) or m.group(2) or m.group(3) or "").strip()
-        key = " ".join(item.lower().split())
-        if item and len(item.split()) <= 8 and key and key not in seen:
-            seen.add(key)
-            out.append(item)
-    return out[:8]
-
-
-def _uncovered_items(asked: list[str], ledger: list) -> list[str]:
-    """Asked items no evidence row yet mentions (M10 coverage tracking)."""
-    hay = " ".join(
-        str(r.get("title") or "") + " " + str(r.get("url") or "") + " "
-        + str(r.get("preview") or "") for r in ledger).lower()
     out: list[str] = []
-    for item in asked:
-        key = " ".join(item.lower().split())
-        if key not in hay and key.replace(" ", "_") not in hay:
-            out.append(item)
-    return out
-
-
-def _wiki_url(title: str) -> str:
-    return ("https://en.wikipedia.org/wiki/"
-            + "_".join((title or "").strip().split()))
-
-
-_USGS_MAG_RE = re.compile(r"magnitude\s*(?:of\s*)?(\d+(?:\.\d+)?)")
-_USGS_YEAR_RE = re.compile(r"\b(1[89]\d\d|20\d\d)\b")
-_USGS_MAX_RE = re.compile(
-    r"or (?:less|lower|below)|at most|under|less than|below|no more than")
-
-
-def _usgs_url(question: str) -> str:
-    """Authoritative USGS fdsnws query URL for an earthquake-filter question —
-    the returned event count/rows ARE the winning citation on these tasks.
-    Endpoints are INCLUSIVE: endtime carries T23:59:59."""
-    q = " ".join((question or "").lower().split())
-    if "earthquake" not in q and "seismic" not in q:
-        return ""
-    m = _USGS_MAG_RE.search(q)
-    years = _USGS_YEAR_RE.findall(q)
-    if m is None or not years:
-        return ""
-    y0, y1 = min(years), max(years)
-    head = q[max(0, m.start() - 30):m.start()]
-    tail = q[m.end():m.end() + 40]
-    if _USGS_MAX_RE.search(tail) or _USGS_MAX_RE.search(head):
-        magpart = "maxmagnitude=" + m.group(1)
-    else:
-        magpart = "minmagnitude=" + m.group(1)
-    return ("https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson"
-            + "&starttime=" + y0 + "-01-01&endtime=" + y1 + "-12-31T23:59:59"
-            + "&" + magpart + "&orderby=time-asc")
-
-
-_PLANET_NAMES = ("mercury", "venus", "mars", "jupiter", "saturn",
-                 "uranus", "neptune", "pluto")
-_PLANET_FACT_RE = re.compile(
-    r"\b(?:mass|diameter|density|gravity|moons?|escape velocity|rotation|"
-    r"orbital|aphelion|perihelion|temperature|distance from the sun)\b")
-
-
-def _nssdc_url(question: str) -> str:
-    q = " ".join((question or "").lower().split())
-    hits = sum(1 for p in _PLANET_NAMES if p in q)
-    if hits >= 2 and _PLANET_FACT_RE.search(q):
-        return "https://nssdc.gsfc.nasa.gov/planetary/factsheet/"
-    return ""
-
-
-_AUTH_HOSTS = ("en.wikipedia.org", "boxofficemojo.com", "worldatlas.com",
-               "britannica.com", "worldbank.org", "un.org", "oecd.org",
-               "imf.org", "who.int", "olympics.com", "fifa.com",
-               "baseball-reference.com")
-
-
-def _authority_urls(ledger: list, cap: int = 2) -> list[str]:
-    """Harvest allowlisted authority URLs from early SEARCH hits (M5)."""
-    out: list[str] = []
-    for row in ledger:
-        if row.get("kind") != "search":
+    for m in _ROSTER_PROPER_RE.finditer(text or ""):
+        name = " ".join(m.group(0).split()).strip(" .,-'’/&")
+        if len(name) < 3:
             continue
-        url = (row.get("url") or "").strip()
-        m = re.match(r"https?://([^/\s]+)", url)
-        if m is None:
+        words = name.split()
+        low = name.casefold()
+        if low in seen:
             continue
-        host = m.group(1).lower()
-        ok = (host.endswith(".gov")
-              or any(host == h or host.endswith("." + h) for h in _AUTH_HOSTS))
-        if ok and url not in out:
-            out.append(url)
-        if len(out) >= cap:
+        # a lone capitalized common word (nav chrome, sentence start) is noise;
+        # keep single tokens only when they look like an acronym/number-bearing id
+        if len(words) == 1 and words[0].casefold() in _ROSTER_NAME_STOP:
+            continue
+        if len(words) == 1 and words[0].islower():
+            continue
+        # drop leading stopwords that leaked in ("The Beatles" -> keep; "And ..." -> skip)
+        if words[0].casefold() in _ROSTER_NAME_STOP and len(words) == 1:
+            continue
+        seen.add(low)
+        out.append(name)
+        if len(out) >= limit:
             break
     return out
 
 
-PREFETCH_PHASE_S = 36.0
+ROSTER_MIN_HEADROOM_S = 45.0
+MAX_ROSTER_QUERIES = 3
 
 
-async def _authority_prefetch(question: str, ledger: list, deadline: float) -> str:
-    """M2/M5 rider: fetch each enumerated item's OWN page, plus direct
-    primary-data query URLs (USGS/NSSDC) and up to 2 allowlisted authority
-    URLs from the seed hits. Concurrent fetches, ledger commit in CALL order
-    (the v32.5 determinism rule). Any failure or thin window returns '' and
-    the proven loop proceeds exactly as before."""
-    if _time_left(deadline) < 140.0:
+def _roster_queries(question: str) -> list[str]:
+    """Roster-hunting query templates over the question's salient content words:
+    'list of all X', 'complete list of X', 'X list ranking'."""
+    q = " ".join((question or "").split())
+    salient = [t for t in _SEED_TOKEN_RE.findall(q)
+               if len(t) >= 3 and t.lower() not in _STOP and t.lower() not in _SEED_STOP]
+    if not salient:
+        return []
+    subject = " ".join(salient[:6])
+    templates = [f"list of all {subject}", f"complete list of {subject}",
+                 f"{subject} list ranking table"]
+    out: list[str] = []
+    for t in templates:
+        t = " ".join(t.split())
+        if t and t not in out:
+            out.append(t)
+    return out[:MAX_ROSTER_QUERIES]
+
+
+async def _roster_prepass(question: str, ledger: EvidenceLedger,
+                          deadline: float) -> str:
+    """Fire the roster searches concurrently, commit their rows in call order
+    (so [n] numbering stays run-invariant), and return a system block carrying
+    the numbered roster evidence + the consolidated CANDIDATE POOL."""
+    queries = _roster_queries(question)
+    if not queries or (deadline - monotonic()) < ROSTER_MIN_HEADROOM_S:
         return ""
-    targets: list[tuple[str, str]] = []
-    items = _asked_items(question)
-    if len(items) >= 2 or (items and "wikipedia" in (question or "").lower()):
-        for item in items[:4]:
-            targets.append((_wiki_url(item), item))
-    data_url = _usgs_url(question)
-    if data_url:
-        targets.append((data_url, "count of matching events"))
-    data_url = _nssdc_url(question)
-    if data_url:
-        targets.append((data_url, "planetary fact sheet"))
-    for url in _authority_urls(ledger, 2):
-        targets.append((url, ""))
-    fetched = {str(r.get("url") or "") for r in ledger if r.get("kind") == "fetch"}
-    todo: list[tuple[str, str]] = []
-    for url, focus in targets:
-        if url and url not in fetched and all(url != u for u, _f in todo):
-            todo.append((url, focus))
-    todo = todo[:6]
-    if not todo:
-        return ""
-    phase_end = min(monotonic() + PREFETCH_PHASE_S,
-                    deadline - WRAPUP_AT_S - 10.0)
-    if phase_end - monotonic() < 12.0:
-        return ""
-    tasks = [asyncio.ensure_future(_do_fetch(url, focus, question, phase_end))
-             for url, focus in todo]
+    # PARALLEL execution, DETERMINISTIC commit: launch all searches at once,
+    # await them together, then commit each ToolOutput in query order — the same
+    # discipline the main loop uses for concurrent tool calls.
+    budget = max(6.0, min(SEARCH_TIMEOUT_S * 2 + 8.0,
+                          deadline - monotonic() - MIN_TAIL_S))
+    tasks = [asyncio.ensure_future(_do_search(qy, ledger)) for qy in queries]
     try:
-        await asyncio.wait(tasks, timeout=max(5.0, phase_end - monotonic()))
+        await asyncio.wait(tasks, timeout=budget)
     except Exception:
         pass
     blocks: list[str] = []
-    for (url, focus), task in zip(todo, tasks):
-        if not task.done():
-            task.cancel()
-            continue
-        try:
-            out = task.result()
-        except Exception:
-            continue
-        try:
-            body = _commit_tool_output(out, ledger)
-        except Exception:
-            continue
-        if isinstance(out, dict) and isinstance(body, str) \
-                and _CITE_MARK_RE.search(body):
-            blocks.append(body)
-            _TOOLCACHE[_cache_key("read_page", url, focus)] = body
-    if not blocks:
+    for t in tasks:
+        if t.done():
+            try:
+                blocks.append(_commit_tool_output(t.result(), ledger))
+            except Exception:
+                continue
+        else:
+            t.cancel()
+    good = [b for b in blocks if isinstance(b, str) and _CITE_MARK_RE.search(b)]
+    if not good:
         return ""
-    return ("Automatic authority prefetch — each enumerated item's OWN page "
-            "and/or the primary data source, already numbered. Cite these [n] "
-            "directly and prefer them over aggregators:\n\n"
-            + "\n".join(blocks))
+    digest = "\n".join(good)
+    candidates = _extract_candidates(digest)
+    parts = [
+        "ROSTER PRE-PASS (results of list/roster searches run before you start; "
+        "already numbered — cite these [n] directly). Your job is to VERIFY each "
+        "candidate below against EVERY stated condition, one at a time, rather "
+        "than stopping at the first match:\n\n" + digest]
+    if candidates:
+        parts.append(
+            "\n\nCANDIDATE POOL (proper nouns surfaced by the roster searches — "
+            "treat these as the pool to CHECK, not as verified answers; confirm "
+            "or rule out each with its own cited evidence, and search for any "
+            "obvious member missing from this list):\n- " + "\n- ".join(candidates))
+    return "".join(parts)
 
 
 # ── stage 2: the research loop ────────────────────────────────────────────────
-async def _loop(question: str, brief: str, ledger: list,
+async def _loop(question: str, brief: str, ledger: EvidenceLedger,
                 deadline: float, turn_cap: int,
                 carry: list[dict] | None = None,
-                allow_tools_in_wrapup: bool = False) -> tuple[str, list[dict]]:
-    asked: list[str] = []
+                allow_tools_in_wrapup: bool = False,
+                extra_context: str = "") -> tuple[str, list[dict]]:
     if carry is not None:
         messages = carry
     else:
-        try:
-            asked = _asked_items(question)       # M10: coverage keys
-        except Exception:
-            asked = []
         set_q = _needs_set_completeness(question)
         messages = [{"role": "system", "content": LOOP_RULES}]
         if set_q:
@@ -1485,25 +1284,21 @@ async def _loop(question: str, brief: str, ledger: list,
             messages.append({"role": "system", "content": SUPERLATIVE_RULE})
         if brief:
             messages.append({"role": "system", "content": brief})
+        # v34: roster pre-pass output (candidate pool + numbered roster evidence)
+        # is injected BEFORE the model's first choice so the whole pool is in view.
+        if extra_context:
+            messages.append({"role": "system", "content": extra_context})
         # deterministic evidence BEFORE the model's first choice
         seeded = await _preseed(question, set_q, ledger, deadline)
         if seeded:
             messages.append({"role": "system", "content": seeded})
-        # M2/M5 rider: own-page / primary-data / authority prefetch (additive;
-        # any failure or thin time budget degrades to the proven baseline).
-        try:
-            prefetched = await _authority_prefetch(question, ledger, deadline)
-        except Exception:
-            prefetched = ""
-        if prefetched:
-            messages.append({"role": "system", "content": prefetched})
         messages.append({"role": "user", "content": question})
 
     answer = ""
     ordered_wrapup = False
     repairs_left = ANSWER_REPAIR_TURNS
     for turn in range(1, turn_cap + 1):
-        left = _time_left(deadline)
+        left = deadline - monotonic()
         if left <= MIN_TAIL_S:
             break
         out_of_time = left <= WRAPUP_AT_S
@@ -1511,33 +1306,10 @@ async def _loop(question: str, brief: str, ledger: list,
         finish_only = out_of_time or out_of_spend or turn >= turn_cap
         if (finish_only or turn >= turn_cap - 1) and not ordered_wrapup:
             messages.append({"role": "system", "content": _wrapup_order(left)})
-            if asked:
-                # M10 rider: the composer owes EVERY asked item a verdict line
-                messages.append({"role": "system", "content": (
-                    "PER-ITEM VERDICTS: the final answer must give EACH of "
-                    "these asked items its own cited verdict line: "
-                    + "; ".join(asked[:8]) + ".")})
             ordered_wrapup = True
-        if asked and turn == 4 and not finish_only:
-            # M10 rider: aim the remaining retrieval budget at uncovered items
-            try:
-                uncovered = _uncovered_items(asked, ledger)
-            except Exception:
-                uncovered = []
-            if uncovered:
-                messages.append({"role": "system", "content": (
-                    "COVERAGE CHECK: no evidence row yet mentions: "
-                    + "; ".join(uncovered[:6]) + ". Before finishing, fetch "
-                    "each one's own page (en.wikipedia.org/wiki/<Title>) or "
-                    "search it directly — every asked item needs its own "
-                    "cited verdict line.")})
 
-        payload = None
-        try:
-            payload = await _chat_turn(messages, deadline, finish_only=finish_only,
-                                       force_tools=allow_tools_in_wrapup and turn == 1)
-        except Exception:
-            payload = None
+        payload = await _chat_turn(messages, deadline, finish_only=finish_only,
+                                   force_tools=allow_tools_in_wrapup and turn == 1)
         if payload is None:
             break
         llm = getattr(payload, "llm", None)
@@ -1556,7 +1328,7 @@ async def _loop(question: str, brief: str, ledger: list,
             # as the final answer (prod f462cada shipped exactly that). Spend a
             # bounded repair turn telling the model to write plain prose instead.
             if not _is_usable_answer(candidate):
-                if repairs_left > 0 and _time_left(deadline) > MIN_TAIL_S + 10.0:
+                if repairs_left > 0 and (deadline - monotonic()) > MIN_TAIL_S + 10.0:
                     repairs_left -= 1
                     # F9: do NOT echo the junk back — replaying tool markup as an
                     # assistant turn is the strongest few-shot signal to repeat it.
@@ -1570,16 +1342,7 @@ async def _loop(question: str, brief: str, ledger: list,
             # see what it is fixing (review finding: it was never appended).
             messages.append({"role": "assistant", "content": answer})
             break
-        # v33.2 CONTAINMENT: from here the turn touches SDK objects and the
-        # network. It used to be unguarded, so one surprise (a message object
-        # without to_input_message, a changed payload shape) propagated out of
-        # _loop — and the CALLER lost `messages` as well as `answer`, silently
-        # disabling the audit stage on top of the failure. Now a broken turn
-        # ends the loop with everything earned so far still intact.
-        try:
-            messages.append(msg.to_input_message())
-        except Exception:
-            break
+        messages.append(msg.to_input_message())
         # per-turn fan-out cap: run the first 8, stub the rest — EVERY tool_call
         # id still gets a reply (an unanswered id fails transcript validation).
         run_calls = calls[:8]
@@ -1587,38 +1350,19 @@ async def _loop(question: str, brief: str, ledger: list,
         # fan-out; anything unfinished is reported back so every tool_call_id
         # still receives a reply and the transcript stays valid.
         tool_budget = max(5.0, min(FETCH_TIMEOUT_S * 2 + 6.0,
-                                   _time_left(deadline) - MIN_TAIL_S))
+                                   deadline - monotonic() - MIN_TAIL_S))
         # R1: asyncio.wait (not wait_for+gather) so a timeout does NOT discard the
         # calls that already finished — v32.4 kept their evidence because each tool
         # wrote the ledger itself, and the deferred-commit refactor must not lose it.
-        # M8 rider: replay a repeated search/fetch from the per-query cache —
-        # the same already-committed numbered text, at $0, with no duplicate
-        # ledger rows. The network path below is untouched on a cache miss.
-        cache_keys: list[str] = []
-        for c in run_calls:
-            try:
-                cache_keys.append(_call_cache_key(c))
-            except Exception:
-                cache_keys.append("")
-        tool_tasks = []
-        for c, key in zip(run_calls, cache_keys):
-            if key and key in _TOOLCACHE:
-                tool_tasks.append(None)          # replay — no network task
-            else:
-                tool_tasks.append(
-                    asyncio.ensure_future(_run_tool(c, question, deadline)))
-        pending = [t for t in tool_tasks if t is not None]
+        tool_tasks = [asyncio.ensure_future(_run_tool(c, question, ledger, deadline))
+                      for c in run_calls]
         try:
-            if pending:
-                await asyncio.wait(pending, timeout=tool_budget)
+            await asyncio.wait(tool_tasks, timeout=tool_budget)
         except Exception:
             pass
         results = []
-        for t, key in zip(tool_tasks, cache_keys):
-            if t is None:
-                results.append(_TOOLCACHE.get(key)
-                               or "# cached result unavailable")
-            elif t.done():
+        for t in tool_tasks:
+            if t.done():
                 try:
                     results.append(t.result())
                 except Exception as exc:
@@ -1626,31 +1370,21 @@ async def _loop(question: str, brief: str, ledger: list,
             else:
                 t.cancel()
                 results.append("# tool timed out — use what you already have")
-        for call, result, key in zip(run_calls, results, cache_keys):
+        for call_result in zip(run_calls, results):
+            call = call_result[0]
             # v32.5: ledger rows are appended HERE, in call order — never inside
             # the concurrent coroutines — so [n] numbering is run-invariant.
-            try:
-                body = _commit_tool_output(result, ledger)
-            except Exception as exc:
-                body = f"# tool crashed: {exc}"
-            if key and isinstance(result, dict) and isinstance(body, str) \
-                    and _CITE_MARK_RE.search(body):
-                _TOOLCACHE[key] = body           # committed + numbered → cacheable
-            call_id = str(getattr(call, "id", "") or "")
-            if call_id:
-                messages.append({"role": "tool", "tool_call_id": call_id,
-                                 "content": body})
+            body = _commit_tool_output(call_result[1], ledger)
+            messages.append({"role": "tool", "tool_call_id": call.id, "content": body})
         for call in calls[8:]:
-            call_id = str(getattr(call, "id", "") or "")
-            if call_id:
-                messages.append({"role": "tool", "tool_call_id": call_id,
-                                 "content": "# skipped: per-turn tool budget reached — re-issue next turn if still needed"})
+            messages.append({"role": "tool", "tool_call_id": call.id,
+                             "content": "# skipped: per-turn tool budget reached — re-issue next turn if still needed"})
     return answer, messages
 
 
 # ── stage 3: completeness audit + patch ───────────────────────────────────────
 async def _audit_patch(question: str, answer: str, messages: list[dict],
-                       ledger: list, deadline: float) -> str:
+                       ledger: EvidenceLedger, deadline: float) -> str:
     probe = (
         "Audit the answer against the question. JSON only, keys: "
         '"unanswered_parts" (list; question elements not addressed), '
@@ -1677,11 +1411,11 @@ async def _audit_patch(question: str, answer: str, messages: list[dict],
         f"Question:\n{question}\n\nAnswer:\n{answer[:11000]}"
     )
     try:
-        raw = await _chat_simple(AUDIT_MODEL,
+        raw = await _chat_simple(LLM_LANE_A, AUDIT_MODEL,
                                  "Strict completeness auditor. JSON only.",
                                  probe, max_tokens=2200,
                                  timeout=max(8.0, min(AUDIT_TIMEOUT_S,
-                                                      _time_left(deadline) - 72.0)))
+                                                      (deadline - monotonic()) - 72.0)))
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I | re.M)
         report = json.loads(raw)
     except Exception:
@@ -1699,7 +1433,7 @@ async def _audit_patch(question: str, answer: str, messages: list[dict],
                 gaps.extend(found)
     # F2: the patch loop needs room for a search AND a rewrite; below this the
     # audit is a pure cost with no possible effect.
-    if not gaps or _time_left(deadline) < 70.0:
+    if not gaps or (deadline - monotonic()) < 70.0:
         return answer
     # A truncated candidate pool is a retrieval gap, not a writing gap: spend the
     # patch turns SEARCHING for the roster/list source, then re-answer.
@@ -1721,11 +1455,126 @@ async def _audit_patch(question: str, answer: str, messages: list[dict],
     # uid201's guard: a "repair" that collapsed the answer is a regression.
     if not _is_usable_answer(patched) or len(patched) < int(len(answer) * 0.6):
         return answer
-    # M7 rider: a repair may not LOSE citations either — fewer distinct [n]s
-    # than the answer it replaces is a regression; keep the original.
-    if len(_cited_numbers(patched, len(ledger))) < len(_cited_numbers(answer, len(ledger))):
-        return answer
     return patched
+
+
+# ── stage 4: claim-level verify-and-repair (NEW in v34) ──────────────────────
+# Distinct from _audit_patch (which audits pool/roster COMPLETENESS). This stage
+# decomposes the produced answer into a table of ATOMIC factual claims, checks
+# each claim's citation against the EvidenceLedger deterministically, runs 1-2
+# targeted searches for load-bearing claims that are uncited or only weakly
+# supported, and revises the answer. The claims-table verification step is the
+# new mechanism: a claim is "supported" only when it carries an [n] that resolves
+# to a real ledger row (ref_for), not merely when it reads plausibly.
+_CLAIM_PROBE = (
+    "Decompose the ANSWER into its atomic factual claims (each asserts ONE number, "
+    "date, proper noun, ranking, or causal link). Output JSON ONLY, no prose:\n"
+    '{"claims": [{"text": "<the claim, <=160 chars>", "citation": "<the [n] '
+    'marker attached to it in the answer, or empty>", "load_bearing": true|false, '
+    '"support": "strong"|"weak"|"none", "search": "<one precise web query that '
+    'would verify this claim: entity + metric + year; empty if not needed>"}]}\n'
+    "load_bearing = the claim decides the answer (a qualifier's deciding "
+    "attribute, a superlative's winning value, a computed input). support = "
+    "\"strong\" only if the claim carries an [n]; \"weak\" if cited but the cited "
+    "kind looks like an aggregator/summary; \"none\" if it carries no [n] at all. "
+    "Give at most 12 claims, hardest-to-verify first.\n\n"
+    "Question:\n{question}\n\nAnswer:\n{answer}"
+)
+MAX_CLAIM_REPAIR_SEARCHES = 2
+
+
+async def _verify_and_repair(question: str, answer: str, messages: list[dict],
+                             ledger: EvidenceLedger, deadline: float) -> str:
+    """Claims-table verification + targeted repair. Returns a revised answer, or
+    the original when nothing needs (or has time for) repair."""
+    # needs room for: decomposition call + up to 2 searches + a rewrite loop
+    if (deadline - monotonic()) < 78.0:
+        return answer
+    probe = _CLAIM_PROBE.format(question=question[:2500], answer=answer[:11000])
+    try:
+        raw = await _chat_simple(
+            LLM_LANE_A, CLAIM_MODEL,
+            "You decompose answers into atomic claims. JSON only.", probe,
+            max_tokens=2200,
+            timeout=max(8.0, min(AUDIT_TIMEOUT_S, (deadline - monotonic()) - 74.0)))
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I | re.M)
+        report = json.loads(raw)
+    except Exception:
+        return answer
+    claims = report.get("claims") if isinstance(report, dict) else None
+    if not isinstance(claims, list) or not claims:
+        return answer
+    # DETERMINISTIC ledger cross-check: a claim is genuinely supported only when
+    # a cited [n] resolves to a real ledger row. The model's own "support" label
+    # is advisory; the ledger is authoritative.
+    weak: list[str] = []          # human-readable "claim -> reason" for the order
+    repair_queries: list[str] = []
+    for c in claims:
+        if not isinstance(c, dict):
+            continue
+        text = str(c.get("text") or "").strip()
+        if not text:
+            continue
+        load_bearing = bool(c.get("load_bearing"))
+        cite = str(c.get("citation") or "")
+        support = str(c.get("support") or "").strip().lower()
+        cited_ns = _cited_numbers(cite, len(ledger.rows))
+        resolves = any(ledger.ref_for(n) is not None for n in cited_ns)
+        # unsupported = load-bearing AND (no resolving citation OR flagged weak/none)
+        unsupported = load_bearing and (not resolves or support in ("weak", "none"))
+        if not unsupported:
+            continue
+        reason = ("uncited / citation does not resolve to evidence" if not resolves
+                  else f"only {support}ly supported")
+        weak.append(f"{text[:160]} — {reason}")
+        sq = " ".join(str(c.get("search") or "").split())
+        if sq and sq not in repair_queries:
+            repair_queries.append(sq)
+    if not weak:
+        return answer            # every load-bearing claim is backed by evidence
+    # Targeted re-verification searches (parallel, ordered commit — same as the
+    # roster pre-pass) for the load-bearing claims that lack solid support.
+    repair_queries = repair_queries[:MAX_CLAIM_REPAIR_SEARCHES]
+    if repair_queries and (deadline - monotonic()) > 72.0:
+        budget = max(6.0, min(SEARCH_TIMEOUT_S * 2 + 8.0,
+                              deadline - monotonic() - 66.0))
+        tasks = [asyncio.ensure_future(_do_search(qy, ledger)) for qy in repair_queries]
+        try:
+            await asyncio.wait(tasks, timeout=budget)
+        except Exception:
+            pass
+        new_blocks: list[str] = []
+        for t in tasks:
+            if t.done():
+                try:
+                    new_blocks.append(_commit_tool_output(t.result(), ledger))
+                except Exception:
+                    continue
+            else:
+                t.cancel()
+        good = [b for b in new_blocks if isinstance(b, str) and _CITE_MARK_RE.search(b)]
+        if good:
+            messages.append({"role": "system", "content": (
+                "CLAIM VERIFICATION — fresh evidence for the load-bearing claims "
+                "below (already numbered — cite these [n]):\n\n" + "\n".join(good))})
+    order = (
+        "CLAIM CHECK: the following load-bearing claims in your answer are not "
+        "solidly supported by cited evidence:\n- " + "\n- ".join(weak[:8]) +
+        "\nFor EACH, either attach an [n] that actually states it (use the fresh "
+        "evidence above and any earlier numbered result), or, if it cannot be "
+        "confirmed, replace it with the best value you CAN cite — never leave a "
+        "load-bearing claim uncited. Use at most 2 more tool calls only if needed, "
+        "then rewrite the COMPLETE final answer in the required shape with [n] on "
+        "every factual sentence.")
+    messages.append({"role": "system", "content": order})
+    revised, _ = await _loop(question, "", ledger, deadline,
+                             AUDIT_EXTRA_TURNS + 1, carry=messages,
+                             allow_tools_in_wrapup=True)
+    revised = revised.strip()
+    # never let a repair collapse a good answer (same guard as _audit_patch)
+    if not _is_usable_answer(revised) or len(revised) < int(len(answer) * 0.6):
+        return answer
+    return revised
 
 
 # ── citations ────────────────────────────────────────────────────────────────
@@ -1738,14 +1587,10 @@ async def _audit_patch(question: str, answer: str, messages: list[dict],
 # AST policy. Includes full-width DIGITS: without them the floor's unicode-aware
 # \d saw "cited" while the ASCII-only extractor yielded nothing, shipping an
 # answer with citations=None — worse than not normalizing at all.
-_BRACKET_FIX = {
-    0x3010: "[", 0x3011: "]", 0xFF3B: "[", 0xFF3D: "]",
-    0xFF08: "(", 0xFF09: ")", 0x2011: "-", 0x2212: "-",
-    # U+FF10..U+FF19 (full-width digits) -> ASCII 0-9. Written out instead of
-    # built by a module-level for loop: import-time scope stays declarations.
-    0xFF10: "0", 0xFF11: "1", 0xFF12: "2", 0xFF13: "3", 0xFF14: "4",
-    0xFF15: "5", 0xFF16: "6", 0xFF17: "7", 0xFF18: "8", 0xFF19: "9",
-}
+_BRACKET_FIX = {0x3010: "[", 0x3011: "]", 0xFF3B: "[", 0xFF3D: "]",
+                0xFF08: "(", 0xFF09: ")", 0x2011: "-", 0x2212: "-"}
+for _d in range(10):                      # U+FF10..U+FF19 -> ASCII 0-9
+    _BRACKET_FIX[0xFF10 + _d] = chr(48 + _d)
 
 
 def _normalize_brackets(text: str) -> str:
@@ -1778,7 +1623,7 @@ def _cited_numbers(answer: str, top: int) -> list[int]:
     return out
 
 
-def _citations_for(answer: str, ledger: list) -> list[CitationRef]:
+def _citations_for(answer: str, ledger: EvidenceLedger) -> list[CitationRef]:
     """Build refs under the platform's materialized-evidence wall.
 
     harnyx_commons/application/miner_response_hydration.py: the validator
@@ -1793,13 +1638,13 @@ def _citations_for(answer: str, ledger: list) -> list[CitationRef]:
     # Cap what we KEEP, not what we consider: slicing the candidates first made
     # cheap refs beyond position 24 unreachable even with budget to spare, and
     # the one-line-per-member rule pushes distinct [n] counts well past 24.
-    for n in _cited_numbers(answer, len(ledger)):
+    for n in _cited_numbers(answer, len(ledger.rows)):
         if len(refs) >= CITATION_CAP:
             break
-        ref = _ledger_ref(ledger, n)
+        ref = ledger.ref_for(n)
         if ref is None:
             continue
-        row = ledger[n - 1]
+        row = ledger.rows[n - 1]
         slices = getattr(ref, "slices", None)
         cost = (sum(max(0, s.end - s.start) for s in slices) if slices
                 else int(row.get("note_len") or 0))     # sliceless == the whole note
@@ -1933,14 +1778,14 @@ def _sanitize_draft(text: str) -> str:
     return _VERIFY_MARK_RE.sub("", text or "").strip()
 
 
-def _ledger_digest(ledger: list, char_cap: int = 60000) -> str:
+def _ledger_digest(ledger: EvidenceLedger, char_cap: int = 60000) -> str:
     """A clean numbered evidence digest — no tool-call history. Preserves the
     exact [n] numbering so citations still resolve. Committing from this beats
     replaying the raw transcript: shorter, no assistant/tool scaffolding, and it
     cannot drop early [n]s off the front of a truncated message window."""
     parts: list[str] = []
     spent = 0
-    for i, row in enumerate(ledger, start=1):
+    for i, row in enumerate(ledger.rows, start=1):
         text = (row.get("preview") or "").strip()
         if not text:
             continue
@@ -1975,38 +1820,49 @@ _SENTENCEY_RE = re.compile(r"[.!?]\s|[.!?]$|\b(?:is|was|were|are|has|have|had|"
 def _informative_lead(preview: str, limit: int = 280) -> str:
     """First stretch of real prose in a page preview, or '' if there is none."""
     kept: list[str] = []
+    broke = False
     for chunk in re.split(r"(?<=[.!?])\s+|\n+", _SRC_FOOTNOTE_RE.sub("", preview or "")):
         seg = " ".join(chunk.split())
         if len(seg) < 30 or len(seg) > 400:
             if kept:
-                break
-            continue
-        if _SENTENCEY_RE.search(seg) is None:
-            if kept:
+                broke = True
                 break
             continue
         # Furniture words also START real sentences ("Home Depot reported…",
-        # "Share buybacks totalled…"), so they only disqualify a segment that
-        # carries no figure: chrome ending in a period slipped through the old
-        # punctuation exemption, but real evidence sentences almost always
-        # carry a number, date or year and navigation almost never does.
+        # "Share buybacks totalled…"), so only reject SHORT segments: nav items
+        # are labels, not sentences.
+        if _SENTENCEY_RE.search(seg) is None:
+            if kept:
+                broke = True
+                break
+            continue
+        # Furniture words also start real sentences ("Share buybacks totalled…"),
+        # so they only disqualify a SHORT segment that does not read as a sentence.
+        # Chrome ending in a period slipped through the old punctuation
+        # exemption. Real evidence sentences almost always carry a figure, date
+        # or year; navigation almost never does. Use that instead.
         if _FURNITURE_RE.match(seg) and not re.search(r"\d", seg):
             if kept:
+                broke = True
                 break
             continue
         if seg.startswith(("*", "|", "↑", "#")):
             if kept:
+                broke = True
                 break
             continue
         # A markdown link matches BOTH halves of the pattern; count it once.
         links = len(_MD_LINK_RE.findall(seg)) + len(_BARE_URL_RE.findall(seg))
         if links and links * 110 >= len(seg):     # link-dense == chrome
             if kept:
+                broke = True
                 break
             continue
         kept.append(seg)
         if sum(len(k) for k in kept) >= limit:
             break
+    else:
+        pass
     out = " ".join(kept).strip()
     if len(out) > limit:                     # cut on a word boundary: slicing
         cut = out.rfind(" ", 0, limit)       # mid-token can invent a figure
@@ -2014,12 +1870,12 @@ def _informative_lead(preview: str, limit: int = 280) -> str:
     return out
 
 
-def _deterministic_answer(question: str, ledger: list) -> str:
+def _deterministic_answer(question: str, ledger: EvidenceLedger) -> str:
     """Last rung, no LLM. Never emit a bare 'unavailable' line: the judge sees
     only the answer text and makes a forced preference, so advertising our own
     failure hands it a reason to pick the other side. A cited partial always
     beats a refusal."""
-    rows = [(i, r) for i, r in enumerate(ledger, start=1)
+    rows = [(i, r) for i, r in enumerate(ledger.rows, start=1)
             if (r.get("preview") or "").strip()]
     if not rows:
         return ""
@@ -2048,34 +1904,13 @@ def _deterministic_answer(question: str, ledger: list) -> str:
     return "\n".join(out)
 
 
-async def _digest_write_once(model: str, convo: list, budget: float) -> str:
-    """One commit-from-digest attempt on one model. Module level, not a closure:
-    the caller picks the model per rung and calls THIS name, so there is no
-    indirectly selected call target anywhere in the rescue path."""
-    payload = await asyncio.wait_for(
-        llm_chat(provider=LLM_PROVIDER, model=model, messages=convo,
-                 temperature=0.15, max_output_tokens=2600,
-                 timeout=budget, thinking=_least_think(model)),
-        timeout=budget + 6.0)
-    _spend_note(payload)
-    llm = getattr(payload, "llm", None)
-    text = (getattr(llm, "raw_text", None) or "").strip()
-    if not text:
-        choices = getattr(llm, "choices", None) or []
-        if choices:
-            c = getattr(choices[0].message, "content", None)
-            if isinstance(c, str):
-                text = c.strip()
-    return text
-
-
-async def _write_from_digest(question: str, ledger: list, deadline: float) -> str:
-    """Last write from the evidence already gathered: MINIMUM reasoning the model
+async def _write_from_digest(question: str, ledger: EvidenceLedger, deadline: float) -> str:
+    """Last write from the evidence already gathered: MINIMUM reasoning the lane
     accepts (see _least_think — only the gpt-oss family requires reasoning), NO
     tools, and a CLEAN numbered digest instead of the raw transcript — so the
     model cannot emit tool markup and cannot lose early [n]s to a truncated
     message window."""
-    left = _time_left(deadline)
+    left = deadline - monotonic()
     if left < 14.0:
         return ""
     digest = _ledger_digest(ledger)
@@ -2089,34 +1924,52 @@ async def _write_from_digest(question: str, ledger: list, deadline: float) -> st
                  "tool syntax. First words are the answer entities; every factual "
                  "claim carries its [n]; then the short proof section (pool, "
                  "conditions, qualifiers, exclusions).")}]
+    async def _one(lane: str, model: str, budget: float) -> str:
+        payload = await llm_chat(
+            provider=lane, model=model, messages=convo,
+            temperature=0.15, max_output_tokens=2600,
+            timeout=budget, thinking=_least_think(lane, model),
+        )
+        _spend_note(payload)
+        llm = getattr(payload, "llm", None)
+        text = (getattr(llm, "raw_text", None) or "").strip()
+        if not text:
+            choices = getattr(llm, "choices", None) or []
+            if choices:
+                c = getattr(choices[0].message, "content", None)
+                if isinstance(c, str):
+                    text = c.strip()
+        return text
+
     # v32.5b: the hedge race is REVERTED. Review proved three independent paths
-    # to "": (1) asyncio.wait puts a RAISED task in `done`, so a fast first-rung
-    # failure — the exact case the fallback exists for — meant the second rung
-    # was never started; (2) for 31s < left <= 45s the second branch was skipped
-    # and the cleanup loop cancelled the still-running first; (3) FIRST_COMPLETED
-    # let a fast-junk rung cancel a slow-good one. The sequential loop below has
+    # to "": (1) asyncio.wait puts a RAISED task in `done`, so a fast lane-A
+    # failure — the exact case the paid lane B exists for — meant lane B was
+    # never started; (2) for 31s < left <= 45s the lane-B branch was skipped and
+    # the cleanup loop cancelled the still-running lane A; (3) FIRST_COMPLETED
+    # let a fast-junk lane cancel a slow-good one. The sequential loop below has
     # none of those failure modes, and an answer that exists beats one that races.
-    # Rung 1 must not eat the whole window: it can run the entire rescue out and
-    # leave rung 2 unreachable for any entry budget in [14, 69), so reserve rung
-    # 2's minimum up front. This stage must also not consume the whole tail —
-    # _knowledge_resort and _schema_output both refuse to start under 12s.
-    # Two rungs, not three: the budget arithmetic below reserves exactly one
-    # fallback's worth of tail, and a third would have to come out of the rungs
-    # that follow this one.
-    rungs = (LOOP_MODEL_A, LOOP_MODEL_B)
-    for i, model in enumerate(rungs):
-        left = _time_left(deadline)
+    # Lane A must not eat the whole window. Before _least_think it 400'd in ~1s on
+    # openrouter, so lane B always inherited a full budget; now that lane A is a
+    # real call it can run the entire rescue out and leave lane B unreachable for
+    # any entry budget in [14, 69). Reserve lane B's minimum up front.
+    # This rung must not consume the whole tail. Downstream _knowledge_resort and
+    # _schema_output both refuse to start under 12s, so leaving the old 6s made
+    # them dead whenever the digest ran — invisible before _least_think, because
+    # lane A used to 400 in ~1s and barely spent anything.
+    lanes = ((LLM_LANE_A, LOOP_MODEL_A), (LLM_LANE_B, LOOP_MODEL_B))
+    for i, lane_model in enumerate(lanes):
+        left = deadline - monotonic()
         if left < 14.0:
             return ""
         budget = min(RESCUE_TIMEOUT_S, left - DIGEST_TAIL_S)
         if i == 0:
-            # rung 2 needs >=14s of its own; never hand rung 1 more than half
+            # lane B needs >=14s of its own; never hand lane A more than half
             # of a small window, and never less than a usable 12s.
             budget = min(budget, max(12.0, left - 14.0 - DIGEST_TAIL_S))
         if budget < 8.0:
             return ""
         try:
-            text = await _digest_write_once(model, convo, budget)
+            text = await _one(lane_model[0], lane_model[1], budget)
         except Exception:
             continue
         if _is_usable_answer(text):
@@ -2124,180 +1977,13 @@ async def _write_from_digest(question: str, ledger: list, deadline: float) -> st
     return ""
 
 
-# ── M3 rider: numeric predicate guard (remove-only) ──────────────────────────
-# One LLM call EXTRACTS (candidate, value, constraint) triples from the draft;
-# pure-Python predicates VERIFY each against the comparator as written. On a
-# violation: ONE corrective re-synthesis, accepted only under regression guards
-# (usable + >=60% length + citation count not lower). The guard never adds a
-# member the answer excluded, and never fires on a parse it is not sure of.
-_CLOCK_VAL_RE = re.compile(r"(?<![\d.])(\d{1,3}):([0-5]\d)(?::([0-5]\d))?(?![\d:])")
-_NUM_UNIT_RE = re.compile(
-    r"(-?\d[\d,]*(?:\.\d+)?)\s*(trillion|billion|million|thousand|k\b)?", re.I)
-_NUM_MULT = {"trillion": 1e12, "billion": 1e9, "million": 1e6,
-             "thousand": 1e3, "k": 1e3}
-_MAGNITUDE_TOKEN_RE = re.compile(r"trillion|billion|million|thousand|\dk\b|\d,\d{3}", re.I)
-
-
-def _num_value(text: str):
-    """First number in `text` as a float — commas, magnitude words and h:mm
-    clocks understood (clocks in seconds; both sides of a comparison parse the
-    same way, so the scale stays consistent). None when nothing parses."""
-    s = (text or "").strip()
-    m = _CLOCK_VAL_RE.search(s)
-    if m is not None:
-        return (int(m.group(1)) * 3600 + int(m.group(2)) * 60
-                + int(m.group(3) or 0))
-    m = _NUM_UNIT_RE.search(s)
-    if m is None:
-        return None
-    try:
-        val = float(m.group(1).replace(",", ""))
-    except Exception:
-        return None
-    unit = (m.group(2) or "").lower()
-    if unit:
-        val *= _NUM_MULT[unit]
-    return val
-
-
-def _parse_constraint(text: str):
-    """(op, lo, hi) for a comparator phrase, or None when unsure. Ranges are
-    INCLUSIVE at both ends ('between 2010 and 2019' includes both)."""
-    s = " ".join((text or "").lower().split())
-    m = re.search(r"between\s+(.+?)\s+and\s+(\S+)", s)
-    if m is not None:
-        lo = _num_value(m.group(1))
-        hi = _num_value(m.group(2))
-        if lo is not None and hi is not None and lo <= hi:
-            return ("between", lo, hi)
-    # ORDER MATTERS: 'no more than' must resolve before 'more than',
-    # 'no less than' before 'less than'.
-    if re.search(r"\bno more than\b|\bat most\b|\bup to\b|\bmaximum\b"
-                 r"|or (?:less|fewer|lower)\b", s):
-        op = "<="
-    elif re.search(r"\bno fewer than\b|\bno less than\b|\bat least\b"
-                   r"|\bminimum\b|or (?:more|greater|higher|larger)\b", s):
-        op = ">="
-    elif re.search(r"\bmore than\b|\bover\b|\babove\b|\bgreater than\b|\bexceed", s):
-        op = ">"
-    elif re.search(r"\bfewer than\b|\bless than\b|\bunder\b|\bbelow\b", s):
-        op = "<"
-    elif re.search(r"\bexactly\b", s):
-        op = "=="
-    else:
-        return None
-    bound = _num_value(s)
-    if bound is None:
-        return None
-    return (op, bound, bound)
-
-
-def _predicate_holds(val: float, pred) -> bool:
-    op, lo, hi = pred
-    if op == "between":
-        return lo <= val <= hi
-    if op == ">":
-        return val > lo
-    if op == ">=":
-        return val >= lo
-    if op == "<":
-        return val < lo
-    if op == "<=":
-        return val <= lo
-    if op == "==":
-        return val == lo
-    return True
-
-
-async def _numeric_guard(question: str, answer: str, ledger: list,
-                         deadline: float) -> str:
-    """Verify the draft's numeric claims against the question's comparators;
-    at most one corrective re-synthesis. Every failure path returns the
-    original answer unchanged."""
-    if _time_left(deadline) < 60.0:
-        return answer
-    ask = (
-        "Extract every (candidate, value, constraint) triple from the answer "
-        "where the QUESTION imposes a numeric constraint that the candidate's "
-        "stated value must satisfy. JSON only: {\"triples\": [{\"candidate\": "
-        "\"...\", \"value\": \"<exact value string from the answer>\", "
-        "\"constraint\": \"<exact comparator phrase from the question>\", "
-        "\"included\": true|false}]} — included=true when the answer counts "
-        "the candidate as qualifying. Empty list when none.\n\n"
-        f"Question:\n{question}\n\nAnswer:\n{answer[:9000]}"
-    )
-    try:
-        raw = await _chat_simple(AUDIT_MODEL, "Strict extraction. JSON only.",
-                                 ask, max_tokens=1400,
-                                 timeout=max(8.0, min(24.0,
-                                                      _time_left(deadline) - 40.0)))
-        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(),
-                     flags=re.I | re.M)
-        obj = json.loads(raw)
-    except Exception:
-        return answer
-    triples = obj.get("triples") if isinstance(obj, dict) else None
-    if not isinstance(triples, list) or not triples:
-        return answer
-    violations: list[str] = []
-    for t in triples[:12]:
-        if not isinstance(t, dict):
-            continue
-        if t.get("included") is False:
-            continue        # remove-only: never re-add a member the answer excluded
-        cand = str(t.get("candidate") or "").strip()
-        val_s = str(t.get("value") or "").strip()
-        con_s = str(t.get("constraint") or "").strip()
-        if not val_s or not con_s:
-            continue
-        val = _num_value(val_s)
-        pred = _parse_constraint(con_s)
-        if val is None or pred is None:
-            continue
-        # Scale-parity keep-rule: a bare value >=100x SHORT of a >=1e4 bound
-        # with no magnitude token is a dropped 'million', not a violation.
-        big = max(abs(pred[1]), abs(pred[2]))
-        if (big >= 1e4 and val > 0 and big / val >= 100.0
-                and _MAGNITUDE_TOKEN_RE.search(val_s) is None):
-            continue
-        if not _predicate_holds(val, pred):
-            violations.append(f"{cand or 'a candidate'}: stated value "
-                              f"{val_s!r} does not satisfy {con_s!r}")
-    if not violations or _time_left(deadline) < 45.0:
-        return answer
-    digest = _ledger_digest(ledger, 30000)
-    convo = [{"role": "system", "content": _COMMIT_RULES},
-             {"role": "user", "content": (
-                 f"Question: {question}\n\n"
-                 + (f"Numbered evidence (cite by [n]):\n\n{digest}\n\n" if digest else "")
-                 + f"Current answer:\n{answer[:12000]}\n\n"
-                 "NUMERIC CHECK FAILED:\n- " + "\n- ".join(violations[:5])
-                 + "\nRewrite the SAME answer correcting ONLY these: re-test "
-                 "each flagged candidate against the comparator AS WRITTEN "
-                 "using its cited value; drop or re-classify a candidate only "
-                 "when its own cited value fails; keep every other line, every "
-                 "[n] and the required shape unchanged.")}]
-    budget = min(40.0, _time_left(deadline) - DIGEST_TAIL_S)
-    if budget < 10.0:
-        return answer
-    try:
-        fixed = (await _digest_write_once(LOOP_MODEL_A, convo, budget)).strip()
-    except Exception:
-        return answer
-    if not _is_usable_answer(fixed) or len(fixed) < int(len(answer) * 0.6):
-        return answer
-    if len(_cited_numbers(fixed, len(ledger))) < len(_cited_numbers(answer, len(ledger))):
-        return answer
-    return fixed
-
-
 async def _knowledge_resort(question: str, deadline: float) -> str:
-    left = _time_left(deadline)
+    left = deadline - monotonic()
     if left < 12.0:
         return ""
     try:
         return await _chat_simple(
-            RESORT_MODEL,
+            LLM_LANE_A, RESORT_MODEL,
             ("Expert researcher. Best definitive answer with concrete entities, "
              "numbers, dates. Never refuse."),
             question, max_tokens=2600, timeout=min(45.0, left - 4.0))
@@ -2310,17 +1996,17 @@ async def _schema_output(question: str, answer: str, schema, deadline: float) ->
            "ONLY the JSON value.\n\n"
            f"Schema:\n{json.dumps(schema)}\n\nQuestion:\n{question}\n\n"
            f"Answer:\n{answer[:14000]}")
-    # On a structured query, None here means the platform rejects the response
-    # outright, so this needs more than one shot at it. v33.3: three rungs, three
-    # different model families on the one provider — gpt-oss, deepseek, then
-    # z-ai — so a single model refusing or emitting unparseable JSON never
-    # decides the whole query. (_coerce_to_schema still backstops all three.)
-    for model in (SCHEMA_MODEL, RESORT_MODEL, LOOP_MODEL_A):
-        left = _time_left(deadline)
+    # Both SCHEMA_MODEL and RESORT_MODEL are lane A, so a single provider outage
+    # used to return None for the whole function — and on a structured query None
+    # means the platform rejects the response outright. Give lane B a turn too.
+    for lane, model in ((LLM_LANE_A, SCHEMA_MODEL),
+                        (LLM_LANE_A, RESORT_MODEL),
+                        (LLM_LANE_B, LOOP_MODEL_B)):
+        left = deadline - monotonic()
         if left < 12.0:
             break
         try:
-            raw = await _chat_simple(model,
+            raw = await _chat_simple(lane, model,
                                      "You output strictly valid JSON.", ask,
                                      max_tokens=3400, timeout=min(45.0, left - 4.0))
             raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(),
@@ -2506,62 +2192,284 @@ def _cap(text: str) -> str:
 # ── entrypoint ────────────────────────────────────────────────────────────────
 @entrypoint("query")
 async def query(query: Query) -> Response:
-    question = (getattr(query, "text", "") or "").strip()
-    schema = getattr(query, "output_schema", None)
+    question = (query.text or "").strip()
     if not question:
-        if schema is not None:
-            try:
-                return Response(output=_coerce_to_schema("", schema))
-            except Exception:
-                pass
         return Response(text="No question provided.")
     try:
         return await _solve(query, question)
     except Exception:
-        # a miner-attributed exception is a hard 0 — always return SOME text.
-        # v33.2: and for a STRUCTURED query, text is itself a hard rejection
-        # ("structured query response must use output"), so the crash path owes
-        # the host a schema-shaped value too.
-        if schema is not None:
-            try:
-                return Response(output=_coerce_to_schema(question[:400], schema))
-            except Exception:
-                pass
+        # a miner-attributed exception is a hard 0 — always return SOME text
         return Response(text=f"Best-effort answer unavailable for: {question[:500]}")
 
 
-async def _solve(query: Query, question: str) -> Response:
-    deadline = monotonic() + WALL_BUDGET_S
-    # v33.2: _SPEND is process state and the worker is reused between questions.
-    # A low reading left over from the PREVIOUS query made this one skip its
-    # brief and its audit for the whole run.
-    _spend_reset()
-    _toolcache_reset()   # M8: replay keys are per-question, like [n] numbering
-    schema = getattr(query, "output_schema", None)
+# ── exact-value cross-check (hk415, additive) ────────────────────────────────
+# A single, strictly non-destructive verification of the answer's most
+# load-bearing value against the numbered EvidenceLedger. Fires ONLY for
+# questions that ask for a specific value/number/date/name/count, only when
+# time and USD budget remain, and only ever applies a correction that is a real
+# value present in a real cited ledger row. On any uncertainty it keeps the
+# original answer verbatim — it never rewrites, reformats, or shortens.
+_EXACT_VALUE_RE = re.compile(
+    r"\d"
+    r"|\bhow (?:many|much|old|tall|long|far|fast)\b"
+    r"|\bwhat (?:year|date|day|month|percentage|number|fraction|share|proportion)\b"
+    r"|\bwhich year\b|\bin what year\b"
+    r"|\bexact(?:ly)?\b|\bpercentage\b|\bnumber of\b|\bcount of\b|\btotal (?:number|of)\b"
+    r"|\b(?:highest|largest|tallest|greatest|biggest|longest|smallest|lowest|fewest|"
+    r"shortest|oldest|youngest|earliest|latest|most|least)\b",
+    re.IGNORECASE)
+
+
+def _needs_exact_value_check(question: str) -> bool:
+    q = question or ""
+    if _EXACT_VALUE_RE.search(q):
+        return True
+    # generic '-est' superlatives (tallest/richest/…), reusing the file's own
+    # stoplist-aware detector so ordinary -est words don't trigger it.
+    return _has_superlative(q)
+
+
+_XCHECK_OK_RE = re.compile(r"^\s*OK\b", re.IGNORECASE)
+# CORRECT: <old value> => <new value> [n]
+_XCHECK_FIX_RE = re.compile(
+    r"CORRECT\s*:\s*(?P<old>.+?)\s*=>\s*(?P<new>.+?)\s*\[(?P<n>\d{1,3})\]",
+    re.IGNORECASE | re.DOTALL)
+
+
+async def _exact_value_crosscheck(question: str, answer: str,
+                                  ledger: EvidenceLedger, deadline: float) -> str:
+    """One no-tools LLM re-check of the single most load-bearing value in the
+    answer. Returns a (possibly) minimally edited answer; on ANY doubt returns
+    the answer unchanged."""
+    digest = _ledger_digest(ledger, char_cap=48000)
+    if not digest.strip():
+        return answer
+    system = (
+        "You verify ONE value in a finished research answer against a numbered "
+        "EvidenceLedger. Do not rewrite or restyle the answer. Identify the "
+        "single most load-bearing value the question turns on (the key number, "
+        "date, count, percentage, or name). Check it against the ledger rows. "
+        "Reply on ONE line only: 'OK' if the answer's value is supported or you "
+        "are not certain it is wrong; otherwise "
+        "'CORRECT: <exact old text> => <exact new text> [n]' where <new text> is "
+        "copied verbatim from ledger row [n] and <old text> is copied verbatim "
+        "from the answer. Correct ONLY a clear, ledger-supported error. When in "
+        "doubt, reply OK.")
+    user = (f"QUESTION:\n{question}\n\nANSWER:\n{answer[:8000]}\n\n"
+            f"EVIDENCE LEDGER (numbered):\n{digest}")
     try:
-        info = await asyncio.wait_for(tooling_info(timeout=10.0), timeout=14.0)
+        raw = await _chat_simple(
+            LLM_LANE_A, LOOP_MODEL_A, system, user,
+            max_tokens=220,
+            timeout=max(8.0, min(AUDIT_TIMEOUT_S, (deadline - monotonic()) - 66.0)),
+            think=_least_think(LLM_LANE_A, LOOP_MODEL_A))
+    except Exception:
+        return answer
+    raw = (raw or "").strip()
+    if not raw or _XCHECK_OK_RE.match(raw):
+        return answer
+    m = _XCHECK_FIX_RE.search(raw)
+    if m is None:
+        return answer
+    old_val = (m.group("old") or "").strip().strip("'\"")
+    new_val = (m.group("new") or "").strip().strip("'\"")
+    n = int(m.group("n"))
+    # guardrails: both values non-trivial, actually different, old present in the
+    # answer exactly once, new value grounded in the REAL cited ledger row.
+    if not old_val or not new_val or old_val == new_val:
+        return answer
+    if len(old_val) > 80 or len(new_val) > 80:
+        return answer
+    if answer.count(old_val) != 1:
+        return answer
+    if not (1 <= n <= len(ledger.rows)):
+        return answer
+    row = ledger.rows[n - 1]
+    if row.get("kind") == "reserved":
+        return answer
+    preview = (row.get("preview") or "")
+    if new_val not in preview:
+        return answer          # correction must be a real value in a real row
+    return answer.replace(old_val, new_val, 1)
+
+
+# ── numeric re-derivation guard (agent_d, additive, non-destructive) ─────────
+# For counting/summation/delta/comparison questions: an LLM extracts the
+# answer's arithmetic (operation + cited operands + stated result), then Python
+# DETERMINISTICALLY re-verifies that each operand literally appears in its cited
+# ledger row and recomputes the arithmetic. If the recomputed value disagrees
+# with the answer's stated number — and every operand was found verbatim in a
+# cited row — the single stated number is corrected in place. All arithmetic is
+# done in Python; the LLM only locates operands. Non-destructive otherwise.
+_ARITH_INTENT_RE = re.compile(
+    r"\bhow many\b|\bhow much\b|\btotal\b|\bsum\b|\bcombined\b|\baltogether\b|"
+    r"\bdifference\b|\bincrease\b|\bdecrease\b|\bnet change\b|\bdelta\b|"
+    r"\baverage\b|\bmean\b|\bcount of\b|\bnumber of\b|\bmore than\b|\bfewer than\b|"
+    r"\bgrew by\b|\bfell by\b|\bhow much (?:more|less|greater|higher|lower)\b",
+    re.IGNORECASE)
+
+
+def _needs_numeric_rederivation(question: str) -> bool:
+    return bool(_ARITH_INTENT_RE.search(question or ""))
+
+
+def _parse_number(text: str):
+    m = re.search(r"-?\d[\d,]*(?:\.\d+)?", text or "")
+    if m is None:
+        return None
+    try:
+        return float(m.group(0).replace(",", ""))
+    except Exception:
+        return None
+
+
+def _format_like(value: float, sample: str) -> str:
+    """Format a recomputed value to mirror the old token: integer-valued numbers
+    print without decimals, and thousands separators are kept only if the old
+    token carried them."""
+    if abs(value - round(value)) < 1e-9:
+        iv = int(round(value))
+        return f"{iv:,}" if "," in (sample or "") else str(iv)
+    out = f"{value:.6f}".rstrip("0").rstrip(".")
+    return out
+
+
+async def _numeric_rederivation_guard(question: str, answer: str,
+                                      ledger: EvidenceLedger, deadline: float) -> str:
+    if (deadline - monotonic()) < 70.0:
+        return answer
+    probe = (
+        "The ANSWER states a number derived by arithmetic from figures it cites. "
+        "Extract that computation as JSON ONLY, no prose:\n"
+        '{"operation": "sum"|"difference"|"count"|"average", '
+        '"operands": [{"value": "<figure verbatim as written>", "n": <the [n] the '
+        'answer cites for it>}], "result": "<the derived number verbatim as '
+        'written in the answer>"}\n'
+        "Use ONLY operands the answer actually cites with an [n]. For a count, "
+        "list one operand per counted item (its [n]); for sum/difference/average, "
+        "each operand is a figure. If the answer shows no explicit arithmetic over "
+        'cited figures, return {"operation": "", "operands": [], "result": ""}.\n\n'
+        "QUESTION:\n" + question[:1500] + "\n\nANSWER:\n" + answer[:9000])
+    try:
+        raw = await _chat_simple(
+            LLM_LANE_A, CLAIM_MODEL,
+            "You extract arithmetic from an answer. JSON only.", probe,
+            max_tokens=1200,
+            timeout=max(8.0, min(AUDIT_TIMEOUT_S, (deadline - monotonic()) - 60.0)))
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", (raw or "").strip(),
+                     flags=re.IGNORECASE | re.MULTILINE)
+        report = json.loads(raw)
+    except Exception:
+        return answer
+    if not isinstance(report, dict):
+        return answer
+    op = str(report.get("operation") or "").strip().lower()
+    operands = report.get("operands")
+    result_text = str(report.get("result") or "").strip()
+    if op not in ("sum", "difference", "count", "average") \
+            or not isinstance(operands, list) or not operands or not result_text:
+        return answer
+    # DETERMINISTIC verification: each cited row must exist; for numeric ops the
+    # operand figure must appear verbatim in its cited row.
+    values: list = []
+    for c in operands:
+        if not isinstance(c, dict):
+            return answer
+        try:
+            n = int(c.get("n"))
+        except Exception:
+            return answer
+        if not (1 <= n <= len(ledger.rows)) or ledger.rows[n - 1].get("kind") == "reserved":
+            return answer
+        if op == "count":
+            continue
+        vtext = str(c.get("value") or "").strip()
+        preview = ledger.rows[n - 1].get("preview") or ""
+        tok = re.search(r"-?\d[\d,]*(?:\.\d+)?", vtext)
+        if tok is None or tok.group(0) not in preview:
+            return answer            # operand not literally in its cited row
+        val = _parse_number(vtext)
+        if val is None:
+            return answer
+        values.append(val)
+    if op == "sum":
+        computed = sum(values)
+    elif op == "difference":
+        if len(values) != 2:
+            return answer
+        computed = abs(values[0] - values[1])
+    elif op == "count":
+        computed = float(len(operands))
+    else:  # average
+        if not values:
+            return answer
+        computed = sum(values) / len(values)
+    stated = _parse_number(result_text)
+    if stated is None:
+        return answer
+    tol = max(0.5, abs(computed) * 1e-6)
+    if abs(computed - stated) <= tol:
+        return answer                # arithmetic already checks out
+    old_m = re.search(r"-?\d[\d,]*(?:\.\d+)?", result_text)
+    if old_m is None:
+        return answer
+    old_token = old_m.group(0)
+    if answer.count(old_token) != 1:
+        return answer                # can't unambiguously locate the number
+    new_token = _format_like(computed, old_token)
+    if new_token == old_token:
+        return answer
+    return answer.replace(old_token, new_token, 1)
+
+
+async def _solve(query: Query, question: str) -> Response:
+    """Explicitly phased orchestrator (v34):
+      PHASE 0  plan/brief         — model's own draft + verification plan
+      PHASE 1  roster pre-pass    — parallel roster hunt -> CANDIDATE POOL (NEW)
+      PHASE 2  main tool loop     — the agentic search/fetch/cite loop
+      PHASE 3  synthesis          — completeness audit + patch
+      PHASE 4  claim verify/repair— atomic claims table -> targeted repair (NEW)
+      PHASE 5  rescue             — cited fallbacks, then structured output
+    Every phase is guarded by the single deadline and the USD spend floor."""
+    deadline = monotonic() + WALL_BUDGET_S
+    try:
+        info = await tooling_info(timeout=10.0)
         _spend_note(info)
     except Exception:
         pass
 
+    # ── PHASE 0: plan / brief ────────────────────────────────────────────────
     draft = ""
     brief = ""
     try:
-        if _spend_left() >= BRIEF_MIN_USD and _time_left(deadline) > 120.0:
-            draft, brief = await _knowledge_brief(question, deadline)
+        if _spend_left() >= BRIEF_MIN_USD and (deadline - monotonic()) > 120.0:
+            draft, brief = await _knowledge_brief(question)
     except Exception:
         brief = ""
 
-    ledger: list = []
+    ledger = EvidenceLedger()
+
+    # ── PHASE 1: enumeration roster pre-pass (set/list/count/superlative) ─────
+    roster_ctx = ""
+    try:
+        if (_needs_set_completeness(question) or _needs_superlative_proof(question)) \
+                and _spend_left() >= BRIEF_MIN_USD:
+            roster_ctx = await _roster_prepass(question, ledger, deadline)
+    except Exception:
+        roster_ctx = ""
+
+    # ── PHASE 2: main tool loop ──────────────────────────────────────────────
     answer = ""
     messages: list[dict] = []
     try:
-        answer, messages = await _loop(question, brief, ledger, deadline, MAX_TURNS)
+        answer, messages = await _loop(question, brief, ledger, deadline, MAX_TURNS,
+                                       extra_context=roster_ctx)
     except Exception:
         answer = ""
 
+    # ── PHASE 3: synthesis (completeness audit + patch) ──────────────────────
     try:
-        if _is_usable_answer(answer) and _time_left(deadline) > 75.0 \
+        if _is_usable_answer(answer) and (deadline - monotonic()) > 75.0 \
                 and _spend_left() >= AUDIT_MIN_USD:
             patched = await _audit_patch(question, answer, messages, ledger, deadline)
             # the patch loop can itself return junk — only take it if it passes
@@ -2570,17 +2478,47 @@ async def _solve(query: Query, question: str) -> Response:
     except Exception:
         pass
 
-    # M3 rider: numeric predicate guard — verify comparator claims, at most one
-    # regression-guarded corrective rewrite; any failure leaves `answer` as-is.
+    # ── PHASE 4: claim-level verify-and-repair ───────────────────────────────
     try:
-        if _is_usable_answer(answer) and _spend_left() >= WRAPUP_MIN_USD:
-            answer = await _numeric_guard(question, answer, ledger, deadline)
+        if _is_usable_answer(answer) and (deadline - monotonic()) > 78.0 \
+                and _spend_left() >= AUDIT_MIN_USD:
+            repaired = await _verify_and_repair(question, answer, messages, ledger, deadline)
+            if _is_usable_answer(repaired):
+                answer = repaired
     except Exception:
         pass
 
+    # ── PHASE 4b: exact-value cross-check (hk415, additive, non-destructive) ──
+    # Fires ONLY for value/number/date/name/count questions, only with time and
+    # USD budget to spare, and only ever swaps a value for one grounded in a real
+    # cited ledger row. Any failure or doubt leaves `answer` untouched.
+    try:
+        if _is_usable_answer(answer) and _needs_exact_value_check(question) \
+                and (deadline - monotonic()) > 72.0 and _spend_left() >= AUDIT_MIN_USD:
+            checked = await _exact_value_crosscheck(question, answer, ledger, deadline)
+            if _is_usable_answer(checked):
+                answer = checked
+    except Exception:
+        pass
+
+    # ── PHASE 4c: numeric re-derivation guard (agent_d, additive) ─────────────
+    # For counting/summation/delta/comparison questions: re-extract the cited
+    # numeric operands from the ledger and recompute the arithmetic in Python;
+    # correct the stated number only when it disagrees and every operand is found
+    # verbatim in a cited row. Non-destructive. Guarded by deadline + USD floor.
+    try:
+        if _is_usable_answer(answer) and _needs_numeric_rederivation(question) \
+                and (deadline - monotonic()) > 72.0 and _spend_left() >= AUDIT_MIN_USD:
+            recomputed = await _numeric_rederivation_guard(question, answer, ledger, deadline)
+            if _is_usable_answer(recomputed):
+                answer = recomputed
+    except Exception:
+        pass
+
+    # ── PHASE 5: rescue ──────────────────────────────────────────────────────
     # v32.4 RESCUE LADDER — every rung is cited; none advertises failure.
     # 1) rewrite from the clean evidence digest (min reasoning, no tools)
-    if not _is_usable_answer(answer) and ledger:
+    if not _is_usable_answer(answer) and ledger.rows:
         try:
             rescued = await _write_from_digest(question, ledger, deadline)
             if _is_usable_answer(rescued):
@@ -2590,38 +2528,29 @@ async def _solve(query: Query, question: str) -> Response:
     # 2) deterministic, CITED, zero-LLM. F4: this must come BEFORE the knowledge
     #    draft — the draft is written pre-research and carries no [n] at all, so
     #    it passed the floor and permanently shadowed the only cited rung.
-    if not _is_usable_answer(answer) and ledger:
+    if not _is_usable_answer(answer) and ledger.rows:
         det = _deterministic_answer(question, ledger)
         if _is_usable_answer(det):
             answer = det
     # 3) last resort: model knowledge (uncited, but better than nothing)
     if not _is_usable_answer(answer):
-        fallback = _sanitize_draft(draft)
-        if not fallback:
-            try:
-                fallback = await _knowledge_resort(question, deadline)
-            except Exception:
-                fallback = ""
+        fallback = _sanitize_draft(draft) or await _knowledge_resort(question, deadline)
         if _is_usable_answer(fallback):
             answer = fallback          # F4: never destroy a usable answer with ""
+
+    try:
+        citations = _citations_for(answer, ledger)
+    except Exception:
+        citations = []
 
     answer = _normalize_brackets(answer)   # the judge reads THIS, not the ref list
     answer = _strip_lead_narration(answer)
     text = _cap(answer) or f"Best-effort answer unavailable for: {question[:400]}"
 
-    # v33.2: build the refs from the TEXT WE SHIP, not from the pre-normalized,
-    # pre-capped draft. An [n] that _cap removed still charged the validator's
-    # 120k evidence wall while citing nothing the judge can see, and it could
-    # crowd out a ref the shipped text does use.
-    try:
-        citations = _citations_for(text, ledger)
-    except Exception:
-        citations = []
-
-    if schema is not None:
+    if query.output_schema is not None:
         structured = None
         try:
-            structured = await _schema_output(question, answer, schema, deadline)
+            structured = await _schema_output(question, answer, query.output_schema, deadline)
         except Exception:
             structured = None
         if structured is not None:
@@ -2642,7 +2571,7 @@ async def _solve(query: Query, question: str) -> Response:
         if not basis or _STUB_ANSWER_RE.match(basis.strip()):
             basis = question[:400]
         try:
-            forced = _coerce_to_schema(_cap(basis), schema)
+            forced = _coerce_to_schema(_cap(basis), query.output_schema)
             return Response(output=forced, citations=citations or None)
         except Exception:
             try:

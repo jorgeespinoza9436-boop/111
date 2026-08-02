@@ -1,21 +1,29 @@
-"""agent_d — v32 "toolloop": model-driven research agent.
+"""agent_e — v34 "phased toolloop": model-driven research agent.
 
-REDESIGN RATIONALE (batch 88c4a837: our pipeline 0.000, the field's tool-loop
-family 0.70-0.80). The scoring architecture is a native agentic loop: the LLM
-itself drives search/fetch via tool calls, reads full results in context,
-cross-references candidate-by-candidate, and writes one cited answer. Our old
-staged pipeline (search -> gate -> chunk -> synth) funnels evidence through
-abstractions that lose cross-referencing, never uses model knowledge, and
-cannot iterate multi-hop. This file is our OWN implementation of the loop
-architecture, keeping the assets our line already validated:
+Extends the v33 toolloop champion (origin_186). The proven core is kept intact:
+the EvidenceLedger + deterministic [n] numbering, the tool-execution + tool-call
+parsing, the agentic loop (_loop/_chat_turn), the budget/deadline guards, the
+rescue ladder, and the query.output_schema structured-output handling. Two new
+stages and an explicitly phased orchestrator are layered on top:
   - the v31.8 answer-shape discipline (asked-KIND, set-intersection
     completeness, numeric verbatim, world-negative vs evidence-concession);
   - a miniaturized section-localizer: big fetched pages are rendered as the
     HEAD plus the TOP-K densest regions (so a filing's deep section, or an
     answer set spread across two distant tables, is readable in one call);
   - SEC EDGAR primary-doc routing as a loop hint;
-  - a single LLM provider (openrouter) with a two-MODEL fallback rung:
-    independence comes from model diversity, not from a second key.
+  - single-provider LLM lanes: BOTH lanes are openrouter (this miner stores only
+    openrouter + parallel credentials — no ai_gateway). Lane A is the primary
+    loop/synthesis model; lane B is a second openrouter model as fallback.
+NEW in v34 (explicit phases in _solve):
+  - ENUMERATION ROSTER PRE-PASS (_roster_prepass): for set/list/count/superlative
+    questions, several parallel roster-hunting searches run BEFORE the main loop,
+    their discovered names are consolidated into a CANDIDATE POOL block, and that
+    block is injected into the loop so the model verifies every candidate rather
+    than stopping at the first match.
+  - CLAIM-LEVEL VERIFY-AND-REPAIR (_verify_and_repair): after the answer is
+    produced it is decomposed into an atomic claims table, each claim is checked
+    against the EvidenceLedger, weakly-supported load-bearing claims trigger
+    1-2 targeted searches, and the answer is revised.
 Kill-safety: everything bounded by one deadline; force-commit well before it.
 """
 
@@ -30,22 +38,27 @@ from harnyx_miner_sdk.api import fetch_page, llm_chat, search_web, tooling_info
 from harnyx_miner_sdk.decorators import entrypoint
 from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
 
-VERSION = "v35.0-solo"
+VERSION = "v34.0-phased-openrouter"
 
 # ── providers / models ────────────────────────────────────────────────────────
-LLM_LANE = "openrouter"            # v35: the ONLY LLM provider. ai_gateway is gone.
-LOOP_MODEL_A = "z-ai/glm-5.2"   # v33.1: measured faster + far steadier than glm-5 with reasoning OFF
-LOOP_MODEL_B = "deepseek/deepseek-v3.2"   # v35: fallback rung, same provider. Was
-#   ai_gateway/zai-glm-5.2-fast. Already proven in-file as RESORT_MODEL, and the
-#   measured table above _REASONING_MANDATORY has it accepting effort:none in 1.7s,
-#   so the rung is now cheaper and faster than the paid lane it replaces.
+# This miner (hotkey405) stores provider credentials for ONLY `openrouter` and
+# `parallel`. There is NO `ai_gateway` key, so EVERY llm_chat call must use
+# provider="openrouter" or it scores 0 in production. Both LLM lanes are
+# openrouter; the fallback lane is a SECOND openrouter model, not a second
+# provider. Search/fetch stay on `parallel`.
+LLM_LANE_A = "openrouter"          # primary lane (loop + briefing + synthesis)
+LLM_LANE_B = "openrouter"          # fallback lane (second openrouter model)
+LOOP_MODEL_A = "z-ai/glm-5.2"      # verified allowed + working; reasoning may stay low/default
+LOOP_MODEL_B = "openai/gpt-oss-120b"  # verified allowed; REQUIRES reasoning enabled (see _least_think)
+AUDIT_MODEL = "openai/gpt-oss-120b"      # lane A (reasoning forced on by _least_think)
+CLAIM_MODEL = "openai/gpt-oss-120b"      # lane A: claims-table decomposition (verify-and-repair)
 SCHEMA_MODEL = "openai/gpt-oss-120b"     # lane A
-AUDIT_MODEL = "openai/gpt-oss-120b"      # lane A
+RESORT_MODEL = "z-ai/glm-5.2"            # lane A (verified allowed; was deepseek, swapped to a verified model)
 SEARCH_PROVIDER = "parallel"             # only search/fetch key we store
-RESORT_MODEL = "deepseek/deepseek-v3.2"  # lane A
 
 # ── budgets (seconds) ─────────────────────────────────────────────────────────
-WALL_BUDGET_S = 262.0        # v32.4c: 248 was the field's shortest, but 270 collided
+WALL_BUDGET_S = 260.0        # v34: held at 260 (<= the 260 cap for this build; origin used 262)
+                             # v32.4c: 248 was the field's shortest, but 270 collided
                              # with a deadline-blind tool phase (75s chat + 32s fetch
                              # retry = 107s > WRAPUP_AT_S), which could overshoot the
                              # 300s kill. 262 + a hard-bounded tool phase is the margin.
@@ -60,33 +73,12 @@ BRIEF_TIMEOUT_S = 50.0       # v32.10: MEASURED on glm-5, reasoning OFF. Unchang
 #   45s is ~1.8x the slowest observed run. Commit 212537e raised the cap to 3600
 #   to survive reasoning burn — removing the burn removes the need.
 TURN_TIMEOUT_S = 75.0
-FALLBACK_MAX_PAYLOAD_CHARS = 144000  # v35: threshold INHERITED, not re-measured.
-#   It was calibrated against ai_gateway's empty-above-37k-token defect, which no
-#   longer applies; it is kept only so the oversized-payload control flow (return
-#   the empty-shaped turn, buy a repair turn) is byte-identical to v34.
-#   Original note: ~36k tokens: above the largest lane-B
+LANE_B_MAX_PAYLOAD_CHARS = 144000   # ~36k tokens: above the largest lane-B
 #   call that ever returned content (34,196 tok) and below the smallest that
 #   returned nothing (37,227 tok).
-AUDIT_TIMEOUT_S = 15.0       # v34: MEASURED, batch 3258ff1c, 40 qualifying runs.
-#   33 runs reached the audit. 18 died on the old 28.0 ceiling (AUDIT_MODEL is in
-#   _REASONING_MANDATORY, so _least_think cannot send effort:none); the 15 that
-#   returned ran 2.9-25.8s, median 14.9s, 8 of them under 15s. In all 33 runs the
-#   audit was the LAST log entry -- the patch loop never fired, no answer changed,
-#   and the stage cost 746s = 15.3% of wall. Cap the tail, keep the fast half.
+AUDIT_TIMEOUT_S = 28.0
 SEARCH_TIMEOUT_S = 18.0
-FETCH_TIMEOUT_S = 8.0        # v34: MEASURED -- 243 successful fetches ran 0.5-1.2s
-#   (median 0.7s); all 7 failures sat at 16.2-18.2s, i.e. exactly the old ceiling.
-#   8.0 is ~11x the observed median.
-TOOL_FANOUT_BUDGET_S = 38.0  # v34: was `FETCH_TIMEOUT_S * 2 + 6.0` inline in _loop.
-#   Pinned to its v33.3 value on purpose: halving FETCH_TIMEOUT_S would otherwise
-#   drag the per-turn tool budget 38 -> 22s and truncate _do_search's 3-attempt
-#   ladder (3 x SEARCH_TIMEOUT_S). Search must not regress as a fetch side effect.
-FINISH_RESERVE_S = 24.0      # v34: headroom _chat_turn leaves on a finish_only turn
-#   so the rescue ladder stays reachable. _write_from_digest needs left >= 22
-#   (>=14 to start, >=8 of budget after DIGEST_TAIL_S). On 77898d52/v11 the finish
-#   turn began at t+213.5s with 48.5s left, was handed 43.5s, timed out AT the wall,
-#   and left 3.7s -- so the run shipped _deterministic_answer and scored 0 where the
-#   other three runs of that task scored 1.0.
+FETCH_TIMEOUT_S = 16.0
 WRAPUP_AT_S = 90.0           # remaining <= this -> stop researching, write. v32.6 tried 105 to dodge the
 #   two wall-hit zeros: it worked (0/30 tasks past 240s) but cost EVERY task 15s
 #   of research and all three smoke batches fell (7.5->5.0, 5.0->4.5, 7.0->5.0).
@@ -95,9 +87,9 @@ WRAPUP_AT_S = 90.0           # remaining <= this -> stop researching, write. v32
 #   page furniture, so the rare case no longer needs a fleet-wide tax.
 MIN_TAIL_S = 8.0
 MAX_TURNS = 15          # v32.4: field runs 14-16; 13 was the most turn-starved in the class
-RESCUE_TIMEOUT_S = 55.0
-ANSWER_REPAIR_TURNS = 2      # v32.4: bounded retries when the model emits junk instead of an answer
 AUDIT_EXTRA_TURNS = 2
+ANSWER_REPAIR_TURNS = 2      # v32.4: bounded retries when the model emits junk instead of an answer
+RESCUE_TIMEOUT_S = 55.0
 DIGEST_TAIL_S = 14.0     # reserved for _knowledge_resort / _schema_output (both need 12s)
 
 # ── payload shaping ───────────────────────────────────────────────────────────
@@ -696,18 +688,12 @@ async def _do_fetch(url: str, focus: str, question: str, ledger: EvidenceLedger)
         return "# read_page: empty url"
     payload = None
     for _attempt in (0, 1):  # one retry: crawls intermittently return empty
-        _t0 = monotonic()
         try:
             payload = await fetch_page(url, provider=SEARCH_PROVIDER, timeout=FETCH_TIMEOUT_S)
             if getattr(payload, "results", None):
                 break
         except Exception:
             payload = None
-        # v34: the retry is for an intermittently-empty crawl, not for a timeout.
-        # A call that burned the whole ceiling will burn it again, so a dead URL
-        # used to cost 2 x FETCH_TIMEOUT_S and return nothing either time.
-        if monotonic() - _t0 >= FETCH_TIMEOUT_S - 1.0:
-            break
     if payload is None:
         return f"# read_page({url!r}) failed"
     _spend_note(payload)
@@ -1006,39 +992,25 @@ _EMPTY_TURN = _EmptyTurn()
 
 async def _chat_turn(messages: list[dict], deadline: float, *, finish_only: bool,
                      force_tools: bool = False):
-    """One loop turn; primary model first, fallback model on failure.
-
-    v35: both rungs are openrouter. The rung still exists because a single model
-    can be congested, rate-limited or return empty; it no longer exists because a
-    second provider is cheaper."""
-    # v33.2 COST: lane B (ai_gateway glm-5.2-fast) is the priciest model on the
-    # allowlist -- 2.10/6.60 per 1M vs lane A's 0.8008/2.5168 -- and it returns
-    # EMPTY above a payload it cannot handle, while still billing for the prompt.
-    # Last batch: 7 lane-B calls, $0.518 (17% of spend); the two that returned
-    # zero completion tokens had 50,444 and 37,227 prompt tokens and cost $0.202,
-    # while every call that produced output was <= 34,196. So above the threshold
-    # the fallback is pure waste -- skip it and let the turn fail over to the
-    # existing retry/rescue paths instead of paying for a guaranteed empty reply.
+    """One loop turn; lane A first, lane B (second openrouter model) on failure."""
+    # v34: both lanes are openrouter. The payload guard is retained as a cheap
+    # safety valve -- a very large transcript is skipped on lane B and handed back
+    # as an empty-shaped turn so the loop takes its existing repair branch (which
+    # retries lane A) instead of stalling. gpt-oss-120b's context easily holds the
+    # threshold below, so in practice the guard rarely fires.
     payload_chars = sum(len(str(msg.get("content") or "")) for msg in messages
                         if isinstance(msg, dict))
-    for lane_model in ((LLM_LANE, LOOP_MODEL_A), (LLM_LANE, LOOP_MODEL_B)):
+    for lane_model in ((LLM_LANE_A, LOOP_MODEL_A), (LLM_LANE_B, LOOP_MODEL_B)):
         lane = lane_model[0]
         model = lane_model[1]
-        if model == LOOP_MODEL_B and payload_chars > FALLBACK_MAX_PAYLOAD_CHARS:
+        if lane == LLM_LANE_B and payload_chars > LANE_B_MAX_PAYLOAD_CHARS:
             # Skip the call, but do NOT let the turn collapse. Returning None here
             # would break the research loop, where before the guard an empty lane-B
             # reply fell into the repair branch and bought another turn that retries
             # lane A. Hand back an empty-shaped payload so control flow is exactly
             # what it was -- the only thing removed is the spend and the 75s wait.
             return _EMPTY_TURN
-        # v34: a finish_only turn must not consume the rescue tail. Before this it
-        # was handed everything but 5s; when it timed out at the wall the whole
-        # ladder below (_write_from_digest needs >=22s) was unreachable and the run
-        # shipped _deterministic_answer. Reserving costs no research time, unlike
-        # raising WRAPUP_AT_S, which v32.6 measured as a fleet-wide score loss.
-        timeout = min(TURN_TIMEOUT_S,
-                      deadline - monotonic()
-                      - (FINISH_RESERVE_S if finish_only else 5.0))
+        timeout = min(TURN_TIMEOUT_S, deadline - monotonic() - 5.0)
         if timeout <= 5.0:
             return None
         try:
@@ -1054,13 +1026,15 @@ async def _chat_turn(messages: list[dict], deadline: float, *, finish_only: bool
                 # The whole field runs 0.2; determinism comes from the pre-seed and
                 # the answer floor, not from collapsing the sampler.
                 temperature=0.2,
-                # v32.5b: LANE-scoped, not turn-scoped. Only glm-5.2-fast (lane B)
-                # has the documented empty-content defect; stripping reasoning from
-                # the loop model on the final turn would remove it from the one turn that
-                # must apply every answer rule and place every [n].
-                thinking=({"enabled": False} if (finish_only and model == LOOP_MODEL_B)
-                          else {"enabled": True, "effort": "low"}),
-                max_output_tokens=6000 if (finish_only and model == LOOP_MODEL_B) else None,
+                # v34: both lanes are openrouter. The gpt-oss family HARD-400s
+                # unless reasoning is enabled, so reasoning stays on (low) for
+                # BOTH lanes and every turn — this is also the one turn that must
+                # apply every answer rule and place every [n], so low reasoning is
+                # exactly what we want. _least_think keeps the same policy for the
+                # simple-chat helpers. No lane-specific empty-content workaround is
+                # needed now that the ai_gateway glm-5.2-fast lane is gone.
+                thinking={"enabled": True, "effort": "low"},
+                max_output_tokens=None,
                 timeout=timeout,
             )
             _spend_note(payload)
@@ -1092,14 +1066,14 @@ async def _knowledge_brief(question: str) -> tuple[str, str]:
     )
     raw = ""
     try:
-        raw = await _chat_simple(LLM_LANE, LOOP_MODEL_A, system, user,
+        raw = await _chat_simple(LLM_LANE_A, LOOP_MODEL_A, system, user,
                                  max_tokens=2400, timeout=BRIEF_TIMEOUT_S,
-                                 think=_least_think(LLM_LANE, LOOP_MODEL_A))
+                                 think=_least_think(LLM_LANE_A, LOOP_MODEL_A))
     except Exception:
         try:
-            raw = await _chat_simple(LLM_LANE, LOOP_MODEL_B, system, user,
+            raw = await _chat_simple(LLM_LANE_B, LOOP_MODEL_B, system, user,
                                      max_tokens=2400, timeout=BRIEF_TIMEOUT_S,
-                                     think=_least_think(LLM_LANE, LOOP_MODEL_B))
+                                     think=_least_think(LLM_LANE_B, LOOP_MODEL_B))
         except Exception:
             raw = ""
     if not raw:
@@ -1176,11 +1150,129 @@ async def _preseed(question: str, set_question: bool, ledger: EvidenceLedger,
             "directly, and search further as needed):\n\n" + "\n".join(good))
 
 
+# ── stage 1c: enumeration roster pre-pass (NEW in v34) ───────────────────────
+# For set / list / count / superlative questions the dominant loss mode is an
+# INCOMPLETE POOL: the model verifies the first few candidates it thinks of and
+# stops, so a real qualifier it never searched for is invisible. This stage runs
+# BEFORE the main loop. It fires several roster-hunting searches ("list of all
+# X", "complete list of X", "X ranking/table") in PARALLEL, harvests the proper
+# nouns they surface into an explicit CANDIDATE POOL, and injects that pool + the
+# numbered roster evidence into the loop so the model checks EVERY candidate.
+_ROSTER_PROPER_RE = re.compile(
+    r"\b[A-Z][A-Za-z0-9.&'’/-]+(?:\s+(?:of|the|and|de|van|von|del|di|la|le|du|dos|da)\s+"
+    r"[A-Z][A-Za-z0-9.&'’/-]+|\s+[A-Z][A-Za-z0-9.&'’/-]+){0,5}")
+_ROSTER_NAME_STOP = frozenset(
+    "the a an of in on at to for and or but with from by as list complete full "
+    "search home menu share results result page pages according wikipedia "
+    "list of top best most least first last new news read more related how what "
+    "which who when where why this that these those it he she they we you i".split())
+
+
+def _extract_candidates(text: str, limit: int = 40) -> list[str]:
+    """Deterministic proper-noun harvest from roster-search previews. Not an
+    answer — a POOL to verify. Ordered by first appearance, deduped case-folded,
+    junk/nav words dropped, single-common-word hits removed."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in _ROSTER_PROPER_RE.finditer(text or ""):
+        name = " ".join(m.group(0).split()).strip(" .,-'’/&")
+        if len(name) < 3:
+            continue
+        words = name.split()
+        low = name.casefold()
+        if low in seen:
+            continue
+        # a lone capitalized common word (nav chrome, sentence start) is noise;
+        # keep single tokens only when they look like an acronym/number-bearing id
+        if len(words) == 1 and words[0].casefold() in _ROSTER_NAME_STOP:
+            continue
+        if len(words) == 1 and words[0].islower():
+            continue
+        # drop leading stopwords that leaked in ("The Beatles" -> keep; "And ..." -> skip)
+        if words[0].casefold() in _ROSTER_NAME_STOP and len(words) == 1:
+            continue
+        seen.add(low)
+        out.append(name)
+        if len(out) >= limit:
+            break
+    return out
+
+
+ROSTER_MIN_HEADROOM_S = 45.0
+MAX_ROSTER_QUERIES = 3
+
+
+def _roster_queries(question: str) -> list[str]:
+    """Roster-hunting query templates over the question's salient content words:
+    'list of all X', 'complete list of X', 'X list ranking'."""
+    q = " ".join((question or "").split())
+    salient = [t for t in _SEED_TOKEN_RE.findall(q)
+               if len(t) >= 3 and t.lower() not in _STOP and t.lower() not in _SEED_STOP]
+    if not salient:
+        return []
+    subject = " ".join(salient[:6])
+    templates = [f"list of all {subject}", f"complete list of {subject}",
+                 f"{subject} list ranking table"]
+    out: list[str] = []
+    for t in templates:
+        t = " ".join(t.split())
+        if t and t not in out:
+            out.append(t)
+    return out[:MAX_ROSTER_QUERIES]
+
+
+async def _roster_prepass(question: str, ledger: EvidenceLedger,
+                          deadline: float) -> str:
+    """Fire the roster searches concurrently, commit their rows in call order
+    (so [n] numbering stays run-invariant), and return a system block carrying
+    the numbered roster evidence + the consolidated CANDIDATE POOL."""
+    queries = _roster_queries(question)
+    if not queries or (deadline - monotonic()) < ROSTER_MIN_HEADROOM_S:
+        return ""
+    # PARALLEL execution, DETERMINISTIC commit: launch all searches at once,
+    # await them together, then commit each ToolOutput in query order — the same
+    # discipline the main loop uses for concurrent tool calls.
+    budget = max(6.0, min(SEARCH_TIMEOUT_S * 2 + 8.0,
+                          deadline - monotonic() - MIN_TAIL_S))
+    tasks = [asyncio.ensure_future(_do_search(qy, ledger)) for qy in queries]
+    try:
+        await asyncio.wait(tasks, timeout=budget)
+    except Exception:
+        pass
+    blocks: list[str] = []
+    for t in tasks:
+        if t.done():
+            try:
+                blocks.append(_commit_tool_output(t.result(), ledger))
+            except Exception:
+                continue
+        else:
+            t.cancel()
+    good = [b for b in blocks if isinstance(b, str) and _CITE_MARK_RE.search(b)]
+    if not good:
+        return ""
+    digest = "\n".join(good)
+    candidates = _extract_candidates(digest)
+    parts = [
+        "ROSTER PRE-PASS (results of list/roster searches run before you start; "
+        "already numbered — cite these [n] directly). Your job is to VERIFY each "
+        "candidate below against EVERY stated condition, one at a time, rather "
+        "than stopping at the first match:\n\n" + digest]
+    if candidates:
+        parts.append(
+            "\n\nCANDIDATE POOL (proper nouns surfaced by the roster searches — "
+            "treat these as the pool to CHECK, not as verified answers; confirm "
+            "or rule out each with its own cited evidence, and search for any "
+            "obvious member missing from this list):\n- " + "\n- ".join(candidates))
+    return "".join(parts)
+
+
 # ── stage 2: the research loop ────────────────────────────────────────────────
 async def _loop(question: str, brief: str, ledger: EvidenceLedger,
                 deadline: float, turn_cap: int,
                 carry: list[dict] | None = None,
-                allow_tools_in_wrapup: bool = False) -> tuple[str, list[dict]]:
+                allow_tools_in_wrapup: bool = False,
+                extra_context: str = "") -> tuple[str, list[dict]]:
     if carry is not None:
         messages = carry
     else:
@@ -1192,6 +1284,10 @@ async def _loop(question: str, brief: str, ledger: EvidenceLedger,
             messages.append({"role": "system", "content": SUPERLATIVE_RULE})
         if brief:
             messages.append({"role": "system", "content": brief})
+        # v34: roster pre-pass output (candidate pool + numbered roster evidence)
+        # is injected BEFORE the model's first choice so the whole pool is in view.
+        if extra_context:
+            messages.append({"role": "system", "content": extra_context})
         # deterministic evidence BEFORE the model's first choice
         seeded = await _preseed(question, set_q, ledger, deadline)
         if seeded:
@@ -1253,7 +1349,7 @@ async def _loop(question: str, brief: str, ledger: EvidenceLedger,
         # F3: the tool phase must never outlive the deadline. Bound the whole
         # fan-out; anything unfinished is reported back so every tool_call_id
         # still receives a reply and the transcript stays valid.
-        tool_budget = max(5.0, min(TOOL_FANOUT_BUDGET_S,
+        tool_budget = max(5.0, min(FETCH_TIMEOUT_S * 2 + 6.0,
                                    deadline - monotonic() - MIN_TAIL_S))
         # R1: asyncio.wait (not wait_for+gather) so a timeout does NOT discard the
         # calls that already finished — v32.4 kept their evidence because each tool
@@ -1315,7 +1411,7 @@ async def _audit_patch(question: str, answer: str, messages: list[dict],
         f"Question:\n{question}\n\nAnswer:\n{answer[:11000]}"
     )
     try:
-        raw = await _chat_simple(LLM_LANE, AUDIT_MODEL,
+        raw = await _chat_simple(LLM_LANE_A, AUDIT_MODEL,
                                  "Strict completeness auditor. JSON only.",
                                  probe, max_tokens=2200,
                                  timeout=max(8.0, min(AUDIT_TIMEOUT_S,
@@ -1360,6 +1456,125 @@ async def _audit_patch(question: str, answer: str, messages: list[dict],
     if not _is_usable_answer(patched) or len(patched) < int(len(answer) * 0.6):
         return answer
     return patched
+
+
+# ── stage 4: claim-level verify-and-repair (NEW in v34) ──────────────────────
+# Distinct from _audit_patch (which audits pool/roster COMPLETENESS). This stage
+# decomposes the produced answer into a table of ATOMIC factual claims, checks
+# each claim's citation against the EvidenceLedger deterministically, runs 1-2
+# targeted searches for load-bearing claims that are uncited or only weakly
+# supported, and revises the answer. The claims-table verification step is the
+# new mechanism: a claim is "supported" only when it carries an [n] that resolves
+# to a real ledger row (ref_for), not merely when it reads plausibly.
+_CLAIM_PROBE = (
+    "Decompose the ANSWER into its atomic factual claims (each asserts ONE number, "
+    "date, proper noun, ranking, or causal link). Output JSON ONLY, no prose:\n"
+    '{"claims": [{"text": "<the claim, <=160 chars>", "citation": "<the [n] '
+    'marker attached to it in the answer, or empty>", "load_bearing": true|false, '
+    '"support": "strong"|"weak"|"none", "search": "<one precise web query that '
+    'would verify this claim: entity + metric + year; empty if not needed>"}]}\n'
+    "load_bearing = the claim decides the answer (a qualifier's deciding "
+    "attribute, a superlative's winning value, a computed input). support = "
+    "\"strong\" only if the claim carries an [n]; \"weak\" if cited but the cited "
+    "kind looks like an aggregator/summary; \"none\" if it carries no [n] at all. "
+    "Give at most 12 claims, hardest-to-verify first.\n\n"
+    "Question:\n{question}\n\nAnswer:\n{answer}"
+)
+MAX_CLAIM_REPAIR_SEARCHES = 2
+
+
+async def _verify_and_repair(question: str, answer: str, messages: list[dict],
+                             ledger: EvidenceLedger, deadline: float) -> str:
+    """Claims-table verification + targeted repair. Returns a revised answer, or
+    the original when nothing needs (or has time for) repair."""
+    # needs room for: decomposition call + up to 2 searches + a rewrite loop
+    if (deadline - monotonic()) < 78.0:
+        return answer
+    probe = _CLAIM_PROBE.format(question=question[:2500], answer=answer[:11000])
+    try:
+        raw = await _chat_simple(
+            LLM_LANE_A, CLAIM_MODEL,
+            "You decompose answers into atomic claims. JSON only.", probe,
+            max_tokens=2200,
+            timeout=max(8.0, min(AUDIT_TIMEOUT_S, (deadline - monotonic()) - 74.0)))
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I | re.M)
+        report = json.loads(raw)
+    except Exception:
+        return answer
+    claims = report.get("claims") if isinstance(report, dict) else None
+    if not isinstance(claims, list) or not claims:
+        return answer
+    # DETERMINISTIC ledger cross-check: a claim is genuinely supported only when
+    # a cited [n] resolves to a real ledger row. The model's own "support" label
+    # is advisory; the ledger is authoritative.
+    weak: list[str] = []          # human-readable "claim -> reason" for the order
+    repair_queries: list[str] = []
+    for c in claims:
+        if not isinstance(c, dict):
+            continue
+        text = str(c.get("text") or "").strip()
+        if not text:
+            continue
+        load_bearing = bool(c.get("load_bearing"))
+        cite = str(c.get("citation") or "")
+        support = str(c.get("support") or "").strip().lower()
+        cited_ns = _cited_numbers(cite, len(ledger.rows))
+        resolves = any(ledger.ref_for(n) is not None for n in cited_ns)
+        # unsupported = load-bearing AND (no resolving citation OR flagged weak/none)
+        unsupported = load_bearing and (not resolves or support in ("weak", "none"))
+        if not unsupported:
+            continue
+        reason = ("uncited / citation does not resolve to evidence" if not resolves
+                  else f"only {support}ly supported")
+        weak.append(f"{text[:160]} — {reason}")
+        sq = " ".join(str(c.get("search") or "").split())
+        if sq and sq not in repair_queries:
+            repair_queries.append(sq)
+    if not weak:
+        return answer            # every load-bearing claim is backed by evidence
+    # Targeted re-verification searches (parallel, ordered commit — same as the
+    # roster pre-pass) for the load-bearing claims that lack solid support.
+    repair_queries = repair_queries[:MAX_CLAIM_REPAIR_SEARCHES]
+    if repair_queries and (deadline - monotonic()) > 72.0:
+        budget = max(6.0, min(SEARCH_TIMEOUT_S * 2 + 8.0,
+                              deadline - monotonic() - 66.0))
+        tasks = [asyncio.ensure_future(_do_search(qy, ledger)) for qy in repair_queries]
+        try:
+            await asyncio.wait(tasks, timeout=budget)
+        except Exception:
+            pass
+        new_blocks: list[str] = []
+        for t in tasks:
+            if t.done():
+                try:
+                    new_blocks.append(_commit_tool_output(t.result(), ledger))
+                except Exception:
+                    continue
+            else:
+                t.cancel()
+        good = [b for b in new_blocks if isinstance(b, str) and _CITE_MARK_RE.search(b)]
+        if good:
+            messages.append({"role": "system", "content": (
+                "CLAIM VERIFICATION — fresh evidence for the load-bearing claims "
+                "below (already numbered — cite these [n]):\n\n" + "\n".join(good))})
+    order = (
+        "CLAIM CHECK: the following load-bearing claims in your answer are not "
+        "solidly supported by cited evidence:\n- " + "\n- ".join(weak[:8]) +
+        "\nFor EACH, either attach an [n] that actually states it (use the fresh "
+        "evidence above and any earlier numbered result), or, if it cannot be "
+        "confirmed, replace it with the best value you CAN cite — never leave a "
+        "load-bearing claim uncited. Use at most 2 more tool calls only if needed, "
+        "then rewrite the COMPLETE final answer in the required shape with [n] on "
+        "every factual sentence.")
+    messages.append({"role": "system", "content": order})
+    revised, _ = await _loop(question, "", ledger, deadline,
+                             AUDIT_EXTRA_TURNS + 1, carry=messages,
+                             allow_tools_in_wrapup=True)
+    revised = revised.strip()
+    # never let a repair collapse a good answer (same guard as _audit_patch)
+    if not _is_usable_answer(revised) or len(revised) < int(len(answer) * 0.6):
+        return answer
+    return revised
 
 
 # ── citations ────────────────────────────────────────────────────────────────
@@ -1666,12 +1881,7 @@ def _deterministic_answer(question: str, ledger: EvidenceLedger) -> str:
         return ""
     # LOOP_RULES / _COMMIT_RULES / _wrapup_order all forbid exactly this kind of
     # preamble, and the docstring forbids advertising weakness. Lead with facts.
-    # v34: no preamble. The judge on 77898d52/v11 read the old header
-    # ("Best-supported findings from the sources retrieved:") as a self-report of
-    # failure -- "essentially a list of search result summaries [that] fails to
-    # answer the query" -- and scored the run 0. Lead with the first cited fact,
-    # which is what the docstring above already asks for.
-    out: list[str] = []
+    out = ["Best-supported findings from the sources retrieved:"]
     picked = 0
     for i, r in rows:                    # filter FIRST, then take 6: rows 1-6 are
         if picked >= 6:                  # page heads (nav chrome); the prose is
@@ -1689,7 +1899,7 @@ def _deterministic_answer(question: str, ledger: EvidenceLedger) -> str:
             lead = " ".join((r.get("preview") or "").split())[:280]
             if lead:
                 out.append(f"- {lead} [{i}]")
-        if not out:                       # v34: was len(out) == 1 (the header)
+        if len(out) == 1:
             return ""
     return "\n".join(out)
 
@@ -1746,7 +1956,7 @@ async def _write_from_digest(question: str, ledger: EvidenceLedger, deadline: fl
     # _schema_output both refuse to start under 12s, so leaving the old 6s made
     # them dead whenever the digest ran — invisible before _least_think, because
     # lane A used to 400 in ~1s and barely spent anything.
-    lanes = ((LLM_LANE, LOOP_MODEL_A), (LLM_LANE, LOOP_MODEL_B))
+    lanes = ((LLM_LANE_A, LOOP_MODEL_A), (LLM_LANE_B, LOOP_MODEL_B))
     for i, lane_model in enumerate(lanes):
         left = deadline - monotonic()
         if left < 14.0:
@@ -1773,7 +1983,7 @@ async def _knowledge_resort(question: str, deadline: float) -> str:
         return ""
     try:
         return await _chat_simple(
-            LLM_LANE, RESORT_MODEL,
+            LLM_LANE_A, RESORT_MODEL,
             ("Expert researcher. Best definitive answer with concrete entities, "
              "numbers, dates. Never refuse."),
             question, max_tokens=2600, timeout=min(45.0, left - 4.0))
@@ -1789,9 +1999,9 @@ async def _schema_output(question: str, answer: str, schema, deadline: float) ->
     # Both SCHEMA_MODEL and RESORT_MODEL are lane A, so a single provider outage
     # used to return None for the whole function — and on a structured query None
     # means the platform rejects the response outright. Give lane B a turn too.
-    for lane, model in ((LLM_LANE, SCHEMA_MODEL),
-                        (LLM_LANE, RESORT_MODEL),
-                        (LLM_LANE, LOOP_MODEL_A)):
+    for lane, model in ((LLM_LANE_A, SCHEMA_MODEL),
+                        (LLM_LANE_A, RESORT_MODEL),
+                        (LLM_LANE_B, LOOP_MODEL_B)):
         left = deadline - monotonic()
         if left < 12.0:
             break
@@ -1992,7 +2202,168 @@ async def query(query: Query) -> Response:
         return Response(text=f"Best-effort answer unavailable for: {question[:500]}")
 
 
+# ── exact-value cross-check (hk415, additive) ────────────────────────────────
+# A single, strictly non-destructive verification of the answer's most
+# load-bearing value against the numbered EvidenceLedger. Fires ONLY for
+# questions that ask for a specific value/number/date/name/count, only when
+# time and USD budget remain, and only ever applies a correction that is a real
+# value present in a real cited ledger row. On any uncertainty it keeps the
+# original answer verbatim — it never rewrites, reformats, or shortens.
+_EXACT_VALUE_RE = re.compile(
+    r"\d"
+    r"|\bhow (?:many|much|old|tall|long|far|fast)\b"
+    r"|\bwhat (?:year|date|day|month|percentage|number|fraction|share|proportion)\b"
+    r"|\bwhich year\b|\bin what year\b"
+    r"|\bexact(?:ly)?\b|\bpercentage\b|\bnumber of\b|\bcount of\b|\btotal (?:number|of)\b"
+    r"|\b(?:highest|largest|tallest|greatest|biggest|longest|smallest|lowest|fewest|"
+    r"shortest|oldest|youngest|earliest|latest|most|least)\b",
+    re.IGNORECASE)
+
+
+def _needs_exact_value_check(question: str) -> bool:
+    q = question or ""
+    if _EXACT_VALUE_RE.search(q):
+        return True
+    # generic '-est' superlatives (tallest/richest/…), reusing the file's own
+    # stoplist-aware detector so ordinary -est words don't trigger it.
+    return _has_superlative(q)
+
+
+_XCHECK_OK_RE = re.compile(r"^\s*OK\b", re.IGNORECASE)
+# CORRECT: <old value> => <new value> [n]
+_XCHECK_FIX_RE = re.compile(
+    r"CORRECT\s*:\s*(?P<old>.+?)\s*=>\s*(?P<new>.+?)\s*\[(?P<n>\d{1,3})\]",
+    re.IGNORECASE | re.DOTALL)
+
+
+async def _exact_value_crosscheck(question: str, answer: str,
+                                  ledger: EvidenceLedger, deadline: float) -> str:
+    """One no-tools LLM re-check of the single most load-bearing value in the
+    answer. Returns a (possibly) minimally edited answer; on ANY doubt returns
+    the answer unchanged."""
+    digest = _ledger_digest(ledger, char_cap=48000)
+    if not digest.strip():
+        return answer
+    system = (
+        "You verify ONE value in a finished research answer against a numbered "
+        "EvidenceLedger. Do not rewrite or restyle the answer. Identify the "
+        "single most load-bearing value the question turns on (the key number, "
+        "date, count, percentage, or name). Check it against the ledger rows. "
+        "Reply on ONE line only: 'OK' if the answer's value is supported or you "
+        "are not certain it is wrong; otherwise "
+        "'CORRECT: <exact old text> => <exact new text> [n]' where <new text> is "
+        "copied verbatim from ledger row [n] and <old text> is copied verbatim "
+        "from the answer. Correct ONLY a clear, ledger-supported error. When in "
+        "doubt, reply OK.")
+    user = (f"QUESTION:\n{question}\n\nANSWER:\n{answer[:8000]}\n\n"
+            f"EVIDENCE LEDGER (numbered):\n{digest}")
+    try:
+        raw = await _chat_simple(
+            LLM_LANE_A, LOOP_MODEL_A, system, user,
+            max_tokens=220,
+            timeout=max(8.0, min(AUDIT_TIMEOUT_S, (deadline - monotonic()) - 66.0)),
+            think=_least_think(LLM_LANE_A, LOOP_MODEL_A))
+    except Exception:
+        return answer
+    raw = (raw or "").strip()
+    if not raw or _XCHECK_OK_RE.match(raw):
+        return answer
+    m = _XCHECK_FIX_RE.search(raw)
+    if m is None:
+        return answer
+    old_val = (m.group("old") or "").strip().strip("'\"")
+    new_val = (m.group("new") or "").strip().strip("'\"")
+    n = int(m.group("n"))
+    # guardrails: both values non-trivial, actually different, old present in the
+    # answer exactly once, new value grounded in the REAL cited ledger row.
+    if not old_val or not new_val or old_val == new_val:
+        return answer
+    if len(old_val) > 80 or len(new_val) > 80:
+        return answer
+    if answer.count(old_val) != 1:
+        return answer
+    if not (1 <= n <= len(ledger.rows)):
+        return answer
+    row = ledger.rows[n - 1]
+    if row.get("kind") == "reserved":
+        return answer
+    preview = (row.get("preview") or "")
+    if new_val not in preview:
+        return answer          # correction must be a real value in a real row
+    return answer.replace(old_val, new_val, 1)
+
+
+# ── set/list completeness guard (agent_a, additive, non-destructive) ─────────
+# For set/list/count/superlative questions the dominant loss is a MISSED
+# qualifier. After the answer is produced this runs ONE extra enumeration search
+# ("complete list of <subject>"), then a no-tools synthesis pass that may ADD
+# qualifying members the answer omitted. Strictly non-destructive: the revised
+# answer is kept ONLY when it stays usable, does not shrink, and cites a NEW
+# ledger row surfaced by the enumeration search (a genuine improvement carrying
+# new ledger-cited evidence). Otherwise the original answer is returned verbatim.
+async def _set_completeness_guard(question: str, answer: str,
+                                  ledger: EvidenceLedger, deadline: float) -> str:
+    rqs = _roster_queries(question)
+    if not rqs:
+        return answer
+    enum_q = ""
+    for q in rqs:
+        if q.lower().startswith("complete list"):
+            enum_q = q
+            break
+    if not enum_q:
+        enum_q = rqs[0]
+    before = len(ledger.rows)
+    try:
+        out = await asyncio.wait_for(_do_search(enum_q, ledger),
+                                     timeout=SEARCH_TIMEOUT_S * 2 + 6.0)
+    except Exception:
+        return answer
+    block = _commit_tool_output(out, ledger)
+    if not (isinstance(block, str) and _CITE_MARK_RE.search(block)):
+        return answer
+    new_rows = set(range(before + 1, len(ledger.rows) + 1))
+    if not new_rows or (deadline - monotonic()) < 66.0:
+        return answer
+    system = (
+        "You refine a finished SET/LIST answer using one fresh enumeration "
+        "search. Keep every qualifying member and every citation already in the "
+        "answer; your ONLY job is to ADD any qualifying member the answer missed "
+        "that the numbered enumeration evidence supports, each with its own [n] "
+        "citation. Do not remove members, do not restyle, do not weaken existing "
+        "citations. If nothing is missing, return the answer unchanged.")
+    user = (f"QUESTION:\n{question}\n\nCURRENT ANSWER:\n{answer[:9000]}\n\n"
+            f"FRESH ENUMERATION EVIDENCE (numbered — cite these [n] for any added "
+            f"member):\n{block[:12000]}")
+    try:
+        revised = await _chat_simple(
+            LLM_LANE_A, LOOP_MODEL_A, system, user, max_tokens=3000,
+            timeout=max(8.0, min(AUDIT_TIMEOUT_S, (deadline - monotonic()) - 60.0)),
+            think=_least_think(LLM_LANE_A, LOOP_MODEL_A))
+    except Exception:
+        return answer
+    revised = (revised or "").strip()
+    if not _is_usable_answer(revised):
+        return answer
+    before_cites = set(_cited_numbers(answer, len(ledger.rows)))
+    after_cites = set(_cited_numbers(revised, len(ledger.rows)))
+    added = (after_cites - before_cites) & new_rows
+    # improvement gate: the revision must add a NEW qualifier grounded in a NEW
+    # enumeration row AND must not shrink the answer (non-destructive).
+    if added and len(revised) >= int(len(answer) * 0.9):
+        return revised
+    return answer
+
+
 async def _solve(query: Query, question: str) -> Response:
+    """Explicitly phased orchestrator (v34):
+      PHASE 0  plan/brief         — model's own draft + verification plan
+      PHASE 1  roster pre-pass    — parallel roster hunt -> CANDIDATE POOL (NEW)
+      PHASE 2  main tool loop     — the agentic search/fetch/cite loop
+      PHASE 3  synthesis          — completeness audit + patch
+      PHASE 4  claim verify/repair— atomic claims table -> targeted repair (NEW)
+      PHASE 5  rescue             — cited fallbacks, then structured output
+    Every phase is guarded by the single deadline and the USD spend floor."""
     deadline = monotonic() + WALL_BUDGET_S
     try:
         info = await tooling_info(timeout=10.0)
@@ -2000,6 +2371,7 @@ async def _solve(query: Query, question: str) -> Response:
     except Exception:
         pass
 
+    # ── PHASE 0: plan / brief ────────────────────────────────────────────────
     draft = ""
     brief = ""
     try:
@@ -2009,23 +2381,29 @@ async def _solve(query: Query, question: str) -> Response:
         brief = ""
 
     ledger = EvidenceLedger()
+
+    # ── PHASE 1: enumeration roster pre-pass (set/list/count/superlative) ─────
+    roster_ctx = ""
+    try:
+        if (_needs_set_completeness(question) or _needs_superlative_proof(question)) \
+                and _spend_left() >= BRIEF_MIN_USD:
+            roster_ctx = await _roster_prepass(question, ledger, deadline)
+    except Exception:
+        roster_ctx = ""
+
+    # ── PHASE 2: main tool loop ──────────────────────────────────────────────
     answer = ""
     messages: list[dict] = []
     try:
-        answer, messages = await _loop(question, brief, ledger, deadline, MAX_TURNS)
+        answer, messages = await _loop(question, brief, ledger, deadline, MAX_TURNS,
+                                       extra_context=roster_ctx)
     except Exception:
         answer = ""
 
+    # ── PHASE 3: synthesis (completeness audit + patch) ──────────────────────
     try:
-        # v34: the audit probe is written for roster completeness and superlative
-        # tallies; on anything else it has nothing to find. It ran on 33/40 runs
-        # last batch, modified zero answers, and cost 15.3% of wall. These two
-        # predicates already gate SET_RULE / SUPERLATIVE_RULE upstream, so this
-        # introduces no new heuristic -- it reuses the ones already in the loop.
         if _is_usable_answer(answer) and (deadline - monotonic()) > 75.0 \
-                and _spend_left() >= AUDIT_MIN_USD \
-                and (_needs_set_completeness(question)
-                     or _needs_superlative_proof(question)):
+                and _spend_left() >= AUDIT_MIN_USD:
             patched = await _audit_patch(question, answer, messages, ledger, deadline)
             # the patch loop can itself return junk — only take it if it passes
             if _is_usable_answer(patched):
@@ -2033,6 +2411,45 @@ async def _solve(query: Query, question: str) -> Response:
     except Exception:
         pass
 
+    # ── PHASE 4: claim-level verify-and-repair ───────────────────────────────
+    try:
+        if _is_usable_answer(answer) and (deadline - monotonic()) > 78.0 \
+                and _spend_left() >= AUDIT_MIN_USD:
+            repaired = await _verify_and_repair(question, answer, messages, ledger, deadline)
+            if _is_usable_answer(repaired):
+                answer = repaired
+    except Exception:
+        pass
+
+    # ── PHASE 4b: exact-value cross-check (hk415, additive, non-destructive) ──
+    # Fires ONLY for value/number/date/name/count questions, only with time and
+    # USD budget to spare, and only ever swaps a value for one grounded in a real
+    # cited ledger row. Any failure or doubt leaves `answer` untouched.
+    try:
+        if _is_usable_answer(answer) and _needs_exact_value_check(question) \
+                and (deadline - monotonic()) > 72.0 and _spend_left() >= AUDIT_MIN_USD:
+            checked = await _exact_value_crosscheck(question, answer, ledger, deadline)
+            if _is_usable_answer(checked):
+                answer = checked
+    except Exception:
+        pass
+
+    # ── PHASE 4c: set/list completeness guard (agent_a, additive) ─────────────
+    # For set/list/count/superlative questions only: one extra "complete list of
+    # <subject>" enumeration search + a synthesis pass that may ADD a missed
+    # qualifier. Non-destructive — kept only when it adds a new ledger-cited
+    # member and does not shrink the answer. Guarded by deadline + USD floor.
+    try:
+        if _is_usable_answer(answer) \
+                and (_needs_set_completeness(question) or _needs_superlative_proof(question)) \
+                and (deadline - monotonic()) > 72.0 and _spend_left() >= AUDIT_MIN_USD:
+            widened = await _set_completeness_guard(question, answer, ledger, deadline)
+            if _is_usable_answer(widened):
+                answer = widened
+    except Exception:
+        pass
+
+    # ── PHASE 5: rescue ──────────────────────────────────────────────────────
     # v32.4 RESCUE LADDER — every rung is cited; none advertises failure.
     # 1) rewrite from the clean evidence digest (min reasoning, no tools)
     if not _is_usable_answer(answer) and ledger.rows:
