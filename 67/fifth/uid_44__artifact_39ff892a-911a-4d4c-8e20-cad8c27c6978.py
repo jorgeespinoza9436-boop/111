@@ -17,21 +17,15 @@ architecture, keeping the assets our line already validated:
   - dual-provider LLM lanes (openrouter primary, our paid ai_gateway fallback).
 Kill-safety: everything bounded by one deadline; force-commit well before it.
 """
-
 from __future__ import annotations
-
 import asyncio
 import json
 import re
 from time import monotonic
-
 from harnyx_miner_sdk.api import fetch_page, llm_chat, search_web, tooling_info
 from harnyx_miner_sdk.decorators import entrypoint
 from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
-
 VERSION = "v32.5-toolloop"
-
-# ── providers / models ────────────────────────────────────────────────────────
 LLM_LANE_A = "openrouter"          # primary lane (loop + briefing)
 LLM_LANE_B = "ai_gateway"          # fallback lane (paid key; fast + uncongested)
 LOOP_MODEL_A = "z-ai/glm-5"
@@ -40,12 +34,7 @@ AUDIT_MODEL = "openai/gpt-oss-120b"      # lane A
 SCHEMA_MODEL = "openai/gpt-oss-120b"     # lane A
 RESORT_MODEL = "deepseek/deepseek-v3.2"  # lane A
 SEARCH_PROVIDER = "parallel"             # only search/fetch key we store
-
-# ── budgets (seconds) ─────────────────────────────────────────────────────────
 WALL_BUDGET_S = 262.0        # v32.4c: 248 was the field's shortest, but 270 collided
-                             # with a deadline-blind tool phase (75s chat + 32s fetch
-                             # retry = 107s > WRAPUP_AT_S), which could overshoot the
-                             # 300s kill. 262 + a hard-bounded tool phase is the margin.
 BRIEF_TIMEOUT_S = 50.0
 TURN_TIMEOUT_S = 75.0
 AUDIT_TIMEOUT_S = 28.0
@@ -57,44 +46,28 @@ MAX_TURNS = 15          # v32.4: field runs 14-16; 13 was the most turn-starved 
 AUDIT_EXTRA_TURNS = 2
 ANSWER_REPAIR_TURNS = 2      # v32.4: bounded retries when the model emits junk instead of an answer
 RESCUE_TIMEOUT_S = 55.0
-
-# ── payload shaping ───────────────────────────────────────────────────────────
 SEARCH_EXCERPT_CHARS = 550
 FETCH_HEAD_CHARS = 3000
 FETCH_WINDOW_CHARS = 3600
 FETCH_WINDOWS_PER_PAGE = 3   # v32.4: show the top-K disjoint regions, not just one
-                             # (single-window reading made runs see different halves
-                             # of a spread-out answer set -> divergent medians)
 FETCH_PLAIN_CHARS = 6500     # small pages render whole
 ANSWER_CHAR_CAP = 60000
 CITATION_CAP = 24
-# v32.4: the validator materializes every cited slice and rejects the whole
-# response past 120_000 chars (miner_response_invalid = 0). Budget below it.
 EVIDENCE_CHAR_BUDGET = 105_000
-
-# ── spend floors (USD; degrade gracefully when the metered budget runs dry) ───
 BRIEF_MIN_USD = 0.03
 AUDIT_MIN_USD = 0.05
 WRAPUP_MIN_USD = 0.02
-
 _SPEND = {"left": None}
-
-
 def _spend_note(payload) -> None:
     budget = getattr(payload, "budget", None)
     left = getattr(budget, "session_remaining_budget_usd", None)
     if isinstance(left, (int, float)):
         _SPEND["left"] = float(left)
-
-
 def _spend_left() -> float:
     left = _SPEND["left"]
     if isinstance(left, (int, float)):
         return float(left)
     return 1.0
-
-
-# ── tools handed to the loop model ────────────────────────────────────────────
 LOOP_TOOLS = [
     {
         "type": "function",
@@ -154,119 +127,56 @@ LOOP_TOOLS = [
         },
     },
 ]
+LOOP_RULES = """# Research Agent Instructions
 
-# The answer rules are OUR v31.8 discipline, condensed. Every rule below earned
-# its place from a scored prod failure.
-LOOP_RULES = (
-    "You are a research agent answering a hard multi-part factual question. A "
-    "judge compares your answer head-to-head with a strong reference and only "
-    "credits claims that carry a citation to a tool result that states them.\n\n"
-    "METHOD: think in constraints and candidates. Recall what you already know "
-    "to form the candidate pool, then use web_search/read_page to verify every "
-    "load-bearing fact (names, figures, dates, rankings) before asserting it. "
-    "Work every candidate through every stated condition; one search per fact "
-    "beats one broad search. TWO DISTINCT SUB-QUESTIONS: if the question asks two "
-    "separate things, answer BOTH substantively — a partial answer covering both "
-    "sides outscores a complete answer to only one. BATCH YOUR LOOKUPS: independent facts (each "
-    "candidate's score, each entity's figure) should be requested as SEVERAL "
-    "tool calls in the SAME turn — they run in parallel, so a 6-candidate "
-    "sweep costs one turn, not six. TABLE CARE: when reading a table, respect its "
-    "qualifier columns (Owned vs Leased, the exact year, the exact segment) — "
-    "count or compare only rows matching EVERY stated qualifier, and quote the "
-    "row values you used. For a named source (Box Office Mojo, a 10-K, "
-    "Nielsen), fetch THAT page — for SEC filings, use the sec_filing tool to "
-    "resolve the exact primary document from EDGAR's own index, then read_page "
-    "it with a focus hint for the Item/section.\n\n"
-    "CITE EVERYTHING: put [n] (the tool-result number) immediately after the "
-    "SENTENCE carrying each claim — not pooled at the end of a paragraph. Every "
-    "sentence asserting a number, date, proper noun or causal link needs its own "
-    "[n], for the entities you rule OUT as well as those you include. An uncited "
-    "specific reads as invented. Cite only results that actually state the claim, "
-    "and prefer the most AUTHORITATIVE one that does: the official database/"
-    "filing/statistics page over an aggregator, blog, or retrospective article.\n\n"
-    "SOURCE CONFIDENCE: when the question NAMES a source you could not reach but "
-    "other authoritative evidence establishes the same facts, state those facts "
-    "plainly and confidently with their [n], and treat the other sources as "
-    "corroboration. Do not open with, dwell on, or append a note that the named "
-    "source was unavailable — reserve missing-source language for a FACT that is "
-    "genuinely absent everywhere, never for a missing source LABEL.\n\n"
-    "SELF-CONSISTENCY: before you finish, check that the opening names exactly "
-    "the entities your own cited sentences support. If the body establishes a "
-    "different answer than the opening claims, rewrite the opening to match the "
-    "evidence — never leave a weaker fallback in the lead.\n\n"
-    "ANSWER SHAPE: sentence one IS the answer — the exact entities/values/list "
-    "asked for, in the requested format. Never open with 'Based on…', 'From my "
-    "research…', 'I can provide a partial answer', or any preamble — start with "
-    "the answer entities themselves. ANSWER THE ASKED KIND: if the question asks "
-    "which SERIES, name the series (not the people in it); which FILM, the film "
-    "(not its director); which COUNTRY, the country. Then a short proof section: "
-    "the candidate pool, each condition applied, one line per qualifier (cited) "
-    "and one line per prominent exclusion with its cited failing condition. "
-    "EXACT VALUES ONLY: when the answer turns on figures, use the figures you "
-    "READ in a tool result, verbatim — preserve notation exactly (58.58% and "
-    "58.6% are different; 'p < 0.0001' and 'P < .001' must not be merged or "
-    "called consistent). If one source gives a range and another a point value, "
-    "give both and say whether the point falls inside the range. If a figure is "
-    "reported in different units than the question asks, convert it and give the "
-    "exact converted result, preserving units and any timezone label. Answer with "
-    "the value from the exact source, date and scope the question NAMES — do not "
-    "substitute a later or broader figure unless resolving a conflict requires "
-    "it. Bind every claim to the exact actor, target, date-window and instrument "
-    "the evidence ties together; never carry a statement about one party or "
-    "period across to another. Never a remembered or approximate value "
-    "('~$1.33B'), never rounded, never an adjacent year/quarter/metric. If a "
-    "deciding figure is still unverified at writing time, prefer the tool-read "
-    "value you have over a guess, and NEVER write '(verify)' or any uncertainty "
-    "marker in the final answer — the final answer contains only committed "
-    "prose.\n\n"
-    "AMBIGUOUS METRIC? ANSWER BOTH READINGS. If the asked quantity has two "
-    "defensible interpretations ('highest scoring games' = the team's own "
-    "points OR the combined total; 'largest' = area OR population; 'revenue' = "
-    "segment OR consolidated), do NOT silently pick one. Name the ambiguity in "
-    "one clause and give BOTH lists/values, each cited and labelled. A correct "
-    "answer under the reading the grader did not use still scores as wrong.\n\n"
-    "APPLY CONDITIONS LITERALLY: copy each candidate's exact value, then test "
-    "the comparator as written — 'more than 25' is strictly >25 (25 fails); "
-    "'between 2010 and 2019' includes both endpoints; convert a rate condition "
-    "into a concrete integer test ('averaged more than 1 per year over 10 "
-    "years' = 'more than 10 in total'); read edition/date boundaries literally. "
-    "EXCLUDE ONLY ON PROOF: reject a candidate by naming the specific stated "
-    "condition it fails, with the cited fact showing the failure — never "
-    "because it looks weaker than your front-runner. If it is UNCERTAIN "
-    "whether a candidate fails a condition, KEEP IT in the answer rather than "
-    "dropping it on a guess: a wrongly-dropped qualifier costs exactly as much "
-    "as a wrong answer. SAY NO MORE THAN THE CITATION: if the source says "
-    "'brought to', do not write 'incarcerated'; if it gives a count of 12, do "
-    "not write 11. Check every count and every verb against its citation.\n\n"
-    "NEVER NARRATE YOUR EVIDENCE: no sentence about what your results do or "
-    "do not contain ('the evidence does not specify…', 'would be needed to "
-    "determine…'). Those phrasings lose. A substantive negative about the "
-    "WORLD is different and is a real answer when true ('No officer was held "
-    "in all four prisons [n]'). If a datum truly cannot be verified, commit "
-    "to the best-supported value you found and move on. ONE narrow exception: "
-    "when the asked figure genuinely does not exist in any published form, you "
-    "may state the REASONED IMPOSSIBILITY — name the specific dataset that "
-    "would hold it and why it cannot yield the value — as a fact about the "
-    "world, in the first line, alongside the closest cited facts. That is a "
-    "committed answer; 'the evidence does not contain it' is not.\n\n"
-    "FINISH: never mix tool calls and the final answer in one turn. When the "
-    "constraints are verified (or best-effort covered), write the complete "
-    "cited answer."
-)
+You are a research agent answering a hard multi-part factual question. A judge compares your answer head-to-head with a strong reference and only credits claims that carry a citation to a tool result that states them.
 
+## Method
 
+Think in constraints and candidates. Recall what you already know to form the candidate pool, then use `web_search`/`read_page` to verify every load-bearing fact (names, figures, dates, rankings) before asserting it. Work every candidate through every stated condition; one search per fact beats one broad search. **Two distinct sub-questions:** if the question asks two separate things, answer BOTH substantively — a partial answer covering both sides outscores a complete answer to only one. **Batch your lookups:** independent facts (each candidate's score, each entity's figure) should be requested as SEVERAL tool calls in the SAME turn — they run in parallel, so a 6-candidate sweep costs one turn, not six. **Table care:** when reading a table, respect its qualifier columns (Owned vs Leased, the exact year, the exact segment) — count or compare only rows matching EVERY stated qualifier, and quote the row values you used. For a named source (Box Office Mojo, a 10-K, Nielsen), fetch THAT page — for SEC filings, use the `sec_filing` tool to resolve the exact primary document from EDGAR's own index, then `read_page` it with a focus hint for the Item/section.
+
+## Cite Everything
+
+Put `[n]` (the tool-result number) immediately after the SENTENCE carrying each claim — not pooled at the end of a paragraph. Every sentence asserting a number, date, proper noun or causal link needs its own `[n]`, for the entities you rule OUT as well as those you include. An uncited specific reads as invented. Cite only results that actually state the claim, and prefer the most AUTHORITATIVE one that does: the official database/filing/statistics page over an aggregator, blog, or retrospective article.
+
+## Source Confidence
+
+When the question NAMES a source you could not reach but other authoritative evidence establishes the same facts, state those facts plainly and confidently with their `[n]`, and treat the other sources as corroboration. Do not open with, dwell on, or append a note that the named source was unavailable — reserve missing-source language for a FACT that is genuinely absent everywhere, never for a missing source LABEL.
+
+## Self-Consistency
+
+Before you finish, check that the opening names exactly the entities your own cited sentences support. If the body establishes a different answer than the opening claims, rewrite the opening to match the evidence — never leave a weaker fallback in the lead.
+
+## Answer Shape
+
+Sentence one IS the answer — the exact entities/values/list asked for, in the requested format. Never open with `Based on…`, `From my research…`, `I can provide a partial answer`, or any preamble — start with the answer entities themselves. **Answer the asked kind:** if the question asks which SERIES, name the series (not the people in it); which FILM, the film (not its director); which COUNTRY, the country. Then a short proof section: the candidate pool, each condition applied, one line per qualifier (cited) and one line per prominent exclusion with its cited failing condition. **Exact values only:** when the answer turns on figures, use the figures you READ in a tool result, verbatim — preserve notation exactly (`58.58%` and `58.6%` are different; `p < 0.0001` and `P < .001` must not be merged or called consistent). If one source gives a range and another a point value, give both and say whether the point falls inside the range. If a figure is reported in different units than the question asks, convert it and give the exact converted result, preserving units and any timezone label. Answer with the value from the exact source, date and scope the question NAMES — do not substitute a later or broader figure unless resolving a conflict requires it. Bind every claim to the exact actor, target, date-window and instrument the evidence ties together; never carry a statement about one party or period across to another. Never a remembered or approximate value (`~$1.33B`), never rounded, never an adjacent year/quarter/metric. If a deciding figure is still unverified at writing time, prefer the tool-read value you have over a guess, and NEVER write `(verify)` or any uncertainty marker in the final answer — the final answer contains only committed prose.
+
+## Ambiguous Metric? Answer Both Readings
+
+If the asked quantity has two defensible interpretations (`highest scoring games` = the team's own points OR the combined total; `largest` = area OR population; `revenue` = segment OR consolidated), do NOT silently pick one. Name the ambiguity in one clause and give BOTH lists/values, each cited and labelled. A correct answer under the reading the grader did not use still scores as wrong.
+
+## Apply Conditions Literally
+
+Copy each candidate's exact value, then test the comparator as written — `more than 25` is strictly >25 (25 fails); `between 2010 and 2019` includes both endpoints; convert a rate condition into a concrete integer test (`averaged more than 1 per year over 10 years` = `more than 10 in total`); read edition/date boundaries literally. **Exclude only on proof:** reject a candidate by naming the specific stated condition it fails, with the cited fact showing the failure — never because it looks weaker than your front-runner. If it is UNCERTAIN whether a candidate fails a condition, KEEP IT in the answer rather than dropping it on a guess: a wrongly-dropped qualifier costs exactly as much as a wrong answer. **Say no more than the citation:** if the source says `brought to`, do not write `incarcerated`; if it gives a count of 12, do not write 11. Check every count and every verb against its citation.
+
+## Never Narrate Your Evidence
+
+No sentence about what your results do or do not contain (`the evidence does not specify…`, `would be needed to determine…`). Those phrasings lose. A substantive negative about the WORLD is different and is a real answer when true (`No officer was held in all four prisons [n]`). If a datum truly cannot be verified, commit to the best-supported value you found and move on. One narrow exception: when the asked figure genuinely does not exist in any published form, you may state the **reasoned impossibility** — name the specific dataset that would hold it and why it cannot yield the value — as a fact about the world, in the first line, alongside the closest cited facts. That is a committed answer; `the evidence does not contain it` is not.
+
+## Finish
+
+Never mix tool calls and the final answer in one turn. When the constraints are verified (or best-effort covered), write the complete cited answer.
+"""
 def _wrapup_order(seconds_left: float) -> str:
-    return (
-        f"TIME IS UP (~{int(seconds_left)}s left). No more tool calls. Write the "
-        "complete final answer NOW from the numbered results above plus your "
-        "knowledge: the FIRST words are the answer entities (no 'Based on…' "
-        "preamble, no 'partial answer' framing, no '(verify)' markers), cite [n] "
-        "on every claim, keep the required format. A cited partial answer "
-        "scores; a refusal or a remark about insufficient evidence scores zero."
-    )
+    return f"""## Time Is Up
 
+TIME IS UP (~{int(seconds_left)}s left). No more tool calls. Write the complete final answer NOW from the numbered results above plus your knowledge:
 
-# ── deterministic set-question detector (no LLM; fires the completeness rule) ─
+- The **first words** are the answer entities (no `Based on…` preamble, no `partial answer` framing, no `(verify)` markers).
+- Cite `[n]` on every claim and keep the required format.
+
+A cited partial answer scores; a refusal or a remark about insufficient evidence scores zero.
+"""
 _SET_HINT_RE = re.compile(
     r"\b(?:list|name|identify|enumerate)\b[^?]{0,40}\b(?:all|every|each|the)\b"
     r"|\bhow many\b|\bwhich (?:movies|films|series|countries|companies|states|"
@@ -275,8 +185,6 @@ _SET_HINT_RE = re.compile(
     re.IGNORECASE)
 _SET_CONNECTIVE_RE = re.compile(r"\b(?:both|also|and (?:also|had|has|was|were)|as well as)\b",
                                 re.IGNORECASE)
-
-
 _PLURAL_HEAD_RE = re.compile(r"\b(?:which|what)\b(?:\s+\w+){0,2}?\s+([a-z]{3,}s)\b", re.IGNORECASE)
 _PLURAL_FALSE = frozenset(
     "was is has does its this thus across process business series species news "
@@ -285,28 +193,12 @@ _ONE_WINNER_RE = re.compile(
     r"\b(?:highest|lowest|largest|smallest|most|least|greatest|fewest|longest|"
     r"shortest|first|last|best|worst|only|oldest|youngest|newest|biggest)\b",
     re.IGNORECASE)
-# Generic '-est' superlative catcher so we are not limited to a hand-listed
-# vocabulary (tallest/richest/earliest/deepest/… all qualify). The stoplist
-# holds ordinary words that merely end in -est.
 _EST_STOP = frozenset(
     "interest honest modest protest request suggest forest harvest invest "
     "manifest contest arrest digest earnest conquest tempest midwest northwest "
     "southwest unrest bequest behest attest molest ingest infest detest incest "
     "armrest backrest pretest headrest footrest".split())
 _EST_RE = re.compile(r"\b([a-z]{3,})est\b")   # NO IGNORECASE: proper
-# nouns (Budapest, Everest, Bucharest, Ernest) start uppercase and so cannot
-# match — a false positive here CANCELS the set rule (verified regression).
-
-
-def _has_superlative(text: str) -> bool:
-    if _ONE_WINNER_RE.search(text or ""):
-        return True
-    for m in _EST_RE.finditer(text or ""):
-        if m.group(0).lower() not in _EST_STOP:
-            return True
-    return False
-
-
 def _needs_superlative_proof(question: str) -> bool:
     """A superlative/count question ANSWERS with one item, but RESEARCHING it
     requires the whole pool: you cannot know the oldest player without every
@@ -318,8 +210,13 @@ def _needs_superlative_proof(question: str) -> bool:
         return False
     return _has_superlative(q) or bool(
         re.search(r"\b(?:most|least) (?:common|frequent|number|amount)\b|\bhow many\b", q, re.I))
-
-
+def _has_superlative(text: str) -> bool:
+    if _ONE_WINNER_RE.search(text or ""):
+        return True
+    for m in _EST_RE.finditer(text or ""):
+        if m.group(0).lower() not in _EST_STOP:
+            return True
+    return False
 SUPERLATIVE_RULE = (
     "SUPERLATIVE / TALLY — SHOW THE TABLE. The answer is one item, but you "
     "cannot know it without the whole pool. Before naming a winner: (1) list "
@@ -331,8 +228,6 @@ SUPERLATIVE_RULE = (
     "its work, and 'among others' / 'and several more' is not a tally. If the "
     "pool is large, show the top contenders and state the cutoff you applied."
 )
-
-
 def _needs_set_completeness(question: str) -> bool:
     q = " ".join((question or "").split())
     if _SET_HINT_RE.search(q):
@@ -346,8 +241,6 @@ def _needs_set_completeness(question: str) -> bool:
             return True
     # multi-criteria phrasing ("that X and also Y") usually means a filtered SET
     return bool(re.search(r"\bwhich\b", q, re.IGNORECASE)) and bool(_SET_CONNECTIVE_RE.search(q))
-
-
 SET_RULE = (
     "SET ANSWER: this question asks for a set. Missing a qualifying member "
     "scores the same as wrong — enumerate the pool, test EVERY member against "
@@ -369,9 +262,6 @@ SET_RULE = (
     "the answer: state it as a verified fact about the world with the "
     "per-instance citations that prove it."
 )
-
-
-# ── evidence ledger (tool-result numbering for [n] citations) ─────────────────
 class EvidenceLedger:
     def __init__(self) -> None:
         self.rows: list[dict] = []  # 1-based via position
@@ -414,21 +304,13 @@ class EvidenceLedger:
             return CitationRef(receipt_id=row["receipt_id"],
                                result_id=row["result_id"], slices=slices)
         return None   # F1: every row carries spans now; a sliceless ref would
-                      # materialize the whole note and can breach/invalidate.
-
-
-# ── focused excerpt: our localizer, miniaturized ─────────────────────────────
 _WORD_RE = re.compile(r"[a-z0-9][a-z0-9'.\-]{2,}")
 _STOP = frozenset(
     "the and for with from that this have has was were are is been its their "
     "which what when where who how many much according also into over under "
     "between during against about after before while other more most than".split())
-
-
 def _key_terms(text: str) -> set[str]:
     return {w for w in _WORD_RE.findall((text or "").casefold()) if w not in _STOP}
-
-
 def _best_windows(note: str, terms: set[str], width: int,
                   k: int = 1) -> list[tuple[int, int]]:
     """Deterministic scan: the K highest-density, NON-OVERLAPPING windows, in
@@ -467,28 +349,7 @@ def _best_windows(note: str, terms: set[str], width: int,
         picked.append((start, end))
     picked.sort()             # document order reads naturally
     return picked or [(0, min(n, width))]
-
-
-# ── tool execution ────────────────────────────────────────────────────────────
-# v32.5 DETERMINISTIC NUMBERING. Tool calls run concurrently, but each used to
-# append to the ledger as its OWN network call returned, so [n] assignment was
-# latency-ordered and differed between validator re-runs of the same question
-# (the same defect already fixed in the pre-seed). Tools now return their rows
-# plus text carrying \x00i\x00 placeholders; the caller appends rows in CALL
-# order and substitutes the real numbers. Numbering becomes a function of the
-# transcript, not the network.
 _SLOT = "\x00{}\x00"
-
-
-class ToolOutput:
-    # no __slots__: a dunder NAME in a class body is untested against the
-    # server-side AST policy, and this object is short-lived anyway.
-
-    def __init__(self, text: str, rows: list[dict] | None = None) -> None:
-        self.text = text
-        self.rows = rows or []
-
-
 def _commit_tool_output(out, ledger: EvidenceLedger) -> str:
     """Append a tool's rows in call order, then resolve its [n] placeholders."""
     if isinstance(out, str):
@@ -502,17 +363,63 @@ def _commit_tool_output(out, ledger: EvidenceLedger) -> str:
                        url=row.get("url", ""), preview=row.get("preview", ""))
         text = text.replace(_SLOT.format(i), str(n))
     return text
+class ToolOutput:
+    # no __slots__: a dunder NAME in a class body is untested against the
+    # server-side AST policy, and this object is short-lived anyway.
 
+    def __init__(self, text: str, rows: list[dict] | None = None) -> None:
+        self.text = text
+        self.rows = rows or []
 _SITE_OP_RE = re.compile(r"\bsite:\S+\s*", re.I)
-
-
+async def _do_fetch(url: str, focus: str, question: str, ledger: EvidenceLedger) -> str:
+    if not url.strip():
+        return "# read_page: empty url"
+    payload = None
+    for _attempt in (0, 1):  # one retry: crawls intermittently return empty
+        try:
+            payload = await fetch_page(url, provider=SEARCH_PROVIDER, timeout=FETCH_TIMEOUT_S)
+            if getattr(payload, "results", None):
+                break
+        except Exception:
+            payload = None
+    if payload is None:
+        return f"# read_page({url!r}) failed"
+    _spend_note(payload)
+    receipt = str(getattr(payload, "receipt_id", "") or "")
+    results = list(getattr(payload, "results", None) or [])
+    if not results or not receipt:
+        return f"# read_page({url!r}): no content"
+    item = results[0]
+    rid = getattr(item, "result_id", None)
+    note = getattr(item, "note", None) or ""
+    if not isinstance(rid, str) or not rid or not note.strip():
+        return f"# read_page({url!r}): no usable content"
+    if len(note) <= FETCH_PLAIN_CHARS:
+        row = {"receipt_id": receipt, "result_id": rid, "note_len": len(note),
+               "kind": "fetch", "spans": [(0, len(note))], "title": url,
+               "url": url, "preview": note[:1200]}
+        return ToolOutput(f"# read_page({url!r}) -> [{_SLOT.format(0)}] full page, "
+                          f"{len(note)} chars\n{note}", [row])
+    # Large page: head + the K densest question/focus regions (deterministic).
+    terms = _key_terms(question) | _key_terms(focus)
+    windows = _best_windows(note, terms, FETCH_WINDOW_CHARS, k=FETCH_WINDOWS_PER_PAGE)
+    row = {"receipt_id": receipt, "result_id": rid, "note_len": len(note),
+           "kind": "fetch", "spans": [(0, FETCH_HEAD_CHARS)] + list(windows),
+           "title": url, "url": url,
+           "preview": note[windows[0][0]:windows[0][0] + 1200]}
+    head = note[:FETCH_HEAD_CHARS]
+    sections = "".join(
+        f"\n--- section @{s} ---\n{note[s:e]}" for s, e in windows)
+    return ToolOutput(f"# read_page({url!r}) -> [{_SLOT.format(0)}] {len(note)} chars total; head + "
+            f"the {len(windows)} most relevant section(s) shown "
+            f"({', '.join(f'{s}-{e}' for s, e in windows)}). If the answer set may "
+            f"continue elsewhere in this page, call read_page again with a "
+            f"different focus.\n--- head ---\n{head}{sections}", [row])
 def _degrade_query(q: str) -> str:
     """Loosen an over-constrained query: drop site: operators and quoting.
     Champion lineages retry a failed search this way instead of giving up."""
     out = _SITE_OP_RE.sub("", q or "").replace('"', " ")
     return " ".join(out.split())
-
-
 async def _do_search(query_text: str, ledger: EvidenceLedger):
     if not query_text.strip():
         return "# web_search: empty query"
@@ -570,61 +477,6 @@ async def _do_search(query_text: str, ledger: EvidenceLedger):
         lines.append(f"[{_SLOT.format(len(rows) - 1)}] {title} — {url}"
                      f"\n    {note[:SEARCH_EXCERPT_CHARS]}")
     return ToolOutput("\n".join(lines), rows)
-
-
-async def _do_fetch(url: str, focus: str, question: str, ledger: EvidenceLedger) -> str:
-    if not url.strip():
-        return "# read_page: empty url"
-    payload = None
-    for _attempt in (0, 1):  # one retry: crawls intermittently return empty
-        try:
-            payload = await fetch_page(url, provider=SEARCH_PROVIDER, timeout=FETCH_TIMEOUT_S)
-            if getattr(payload, "results", None):
-                break
-        except Exception:
-            payload = None
-    if payload is None:
-        return f"# read_page({url!r}) failed"
-    _spend_note(payload)
-    receipt = str(getattr(payload, "receipt_id", "") or "")
-    results = list(getattr(payload, "results", None) or [])
-    if not results or not receipt:
-        return f"# read_page({url!r}): no content"
-    item = results[0]
-    rid = getattr(item, "result_id", None)
-    note = getattr(item, "note", None) or ""
-    if not isinstance(rid, str) or not rid or not note.strip():
-        return f"# read_page({url!r}): no usable content"
-    if len(note) <= FETCH_PLAIN_CHARS:
-        row = {"receipt_id": receipt, "result_id": rid, "note_len": len(note),
-               "kind": "fetch", "spans": [(0, len(note))], "title": url,
-               "url": url, "preview": note[:1200]}
-        return ToolOutput(f"# read_page({url!r}) -> [{_SLOT.format(0)}] full page, "
-                          f"{len(note)} chars\n{note}", [row])
-    # Large page: head + the K densest question/focus regions (deterministic).
-    terms = _key_terms(question) | _key_terms(focus)
-    windows = _best_windows(note, terms, FETCH_WINDOW_CHARS, k=FETCH_WINDOWS_PER_PAGE)
-    row = {"receipt_id": receipt, "result_id": rid, "note_len": len(note),
-           "kind": "fetch", "spans": [(0, FETCH_HEAD_CHARS)] + list(windows),
-           "title": url, "url": url,
-           "preview": note[windows[0][0]:windows[0][0] + 1200]}
-    head = note[:FETCH_HEAD_CHARS]
-    sections = "".join(
-        f"\n--- section @{s} ---\n{note[s:e]}" for s, e in windows)
-    return ToolOutput(f"# read_page({url!r}) -> [{_SLOT.format(0)}] {len(note)} chars total; head + "
-            f"the {len(windows)} most relevant section(s) shown "
-            f"({', '.join(f'{s}-{e}' for s, e in windows)}). If the answer set may "
-            f"continue elsewhere in this page, call read_page again with a "
-            f"different focus.\n--- head ---\n{head}{sections}", [row])
-
-
-# ── sec_filing tool: deterministic EDGAR primary-document resolution ─────────
-# Ported from our review-hardened v31.6 pipeline router; the MODEL supplies
-# company/form/year as arguments. v32.3 /code-review fixes: symmetric alnum
-# tokenization (legal suffixes/apostrophes/dots no longer break matching),
-# ticker branch only for single-token input, reportDate-only named-year match,
-# form-code canonicalization, null guards, deadline-aware bounded fetches with
-# retry, tickers cache, spend notes, neutral examples, uniform search fallback.
 _SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 _SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik10}.json"
 _SEC_DOC_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{doc}"
@@ -635,61 +487,6 @@ _SEC_STOPWORDS = frozenset(
     "inc incorporated corp corporation company companies co ltd limited llc plc "
     "lp llp group holdings the".split())
 _SEC_ALNUM_RE = re.compile(r"[a-z0-9]+")
-
-
-def _sec_tokens(text: str) -> list[str]:
-    """ONE tokenizer for both the model's company arg and EDGAR titles — the
-    review proved asymmetric tokenization false-negatived 'Apple Inc.',
-    \"McDonald's\" and 'U.S. Bancorp'."""
-    return [w for w in _SEC_ALNUM_RE.findall((text or "").lower())
-            if w not in _SEC_STOPWORDS]
-
-
-def _sec_norm_form(form: str) -> str:
-    """Canonicalize model-supplied form codes to EDGAR's ('10K'->'10-K',
-    'def14a'->'DEF 14A', 'Form 10-Q'->'10-Q')."""
-    f = " ".join((form or "").upper().replace("FORM", " ").split())
-    m = re.fullmatch(r"(\d{1,2})\s*-?\s*([A-Z])", f)
-    if m:
-        return f"{m.group(1)}-{m.group(2)}"
-    m = re.fullmatch(r"(DEF)\s*-?\s*(14A)", f)
-    if m:
-        return "DEF 14A"
-    return f
-
-
-async def _fetch_json(url: str, deadline: float):
-    cached = _SEC_CACHE.get(url)
-    if cached is not None:
-        return cached
-    for _attempt in (0, 1):   # large-JSON crawls intermittently return empty
-        left = deadline - monotonic()
-        if left < 12.0:
-            return None
-        try:
-            payload = await asyncio.wait_for(
-                fetch_page(url, provider=SEARCH_PROVIDER,
-                           timeout=min(_SEC_FETCH_TIMEOUT_S, left - 6.0)),
-                timeout=min(_SEC_FETCH_TIMEOUT_S, left - 6.0) + 4.0)
-        except Exception:
-            continue
-        _spend_note(payload)
-        results = list(getattr(payload, "results", None) or [])
-        note = (getattr(results[0], "note", None) or "") if results else ""
-        start = note.find("{")
-        end = note.rfind("}")
-        if start == -1 or end <= start:
-            continue
-        try:
-            obj = json.loads(note[start:end + 1])
-        except Exception:
-            continue
-        if isinstance(obj, dict):
-            _SEC_CACHE[url] = obj
-            return obj
-    return None
-
-
 def _sec_pick_filing(recent: dict, form: str, year: str):
     """Pick (accession, primaryDocument) for the canonicalized form. A named
     year matches on reportDate ONLY (the fiscal period end) — a filingDate-year
@@ -726,11 +523,174 @@ def _sec_pick_filing(recent: dict, form: str, year: str):
     if pick is None:
         return None
     return pick[1], pick[2]
-
-
+async def _fetch_json(url: str, deadline: float):
+    cached = _SEC_CACHE.get(url)
+    if cached is not None:
+        return cached
+    for _attempt in (0, 1):   # large-JSON crawls intermittently return empty
+        left = deadline - monotonic()
+        if left < 12.0:
+            return None
+        try:
+            payload = await asyncio.wait_for(
+                fetch_page(url, provider=SEARCH_PROVIDER,
+                           timeout=min(_SEC_FETCH_TIMEOUT_S, left - 6.0)),
+                timeout=min(_SEC_FETCH_TIMEOUT_S, left - 6.0) + 4.0)
+        except Exception:
+            continue
+        _spend_note(payload)
+        results = list(getattr(payload, "results", None) or [])
+        note = (getattr(results[0], "note", None) or "") if results else ""
+        start = note.find("{")
+        end = note.rfind("}")
+        if start == -1 or end <= start:
+            continue
+        try:
+            obj = json.loads(note[start:end + 1])
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            _SEC_CACHE[url] = obj
+            return obj
+    return None
+def _sec_tokens(text: str) -> list[str]:
+    """ONE tokenizer for both the model's company arg and EDGAR titles — the
+    review proved asymmetric tokenization false-negatived 'Apple Inc.',
+    \"McDonald's\" and 'U.S. Bancorp'."""
+    return [w for w in _SEC_ALNUM_RE.findall((text or "").lower())
+            if w not in _SEC_STOPWORDS]
+def _sec_norm_form(form: str) -> str:
+    """Canonicalize model-supplied form codes to EDGAR's ('10K'->'10-K',
+    'def14a'->'DEF 14A', 'Form 10-Q'->'10-Q')."""
+    f = " ".join((form or "").upper().replace("FORM", " ").split())
+    m = re.fullmatch(r"(\d{1,2})\s*-?\s*([A-Z])", f)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    m = re.fullmatch(r"(DEF)\s*-?\s*(14A)", f)
+    if m:
+        return "DEF 14A"
+    return f
 _SEC_SEARCH_HINT = "search \"site:sec.gov {company} {year} {form}\" and read_page the Archives result"
-
-
+async def _knowledge_brief(question: str) -> tuple[str, str]:
+    """One call: the model's own best answer + a verification plan. Returns
+    (draft_answer, briefing_block). The draft alone often carries a knowledge-
+    heavy batch; the loop then verifies the load-bearing facts."""
+    system = ("Senior research analyst. Commit to concrete best answers from "
+              "knowledge; mark uncertain values (verify). Never refuse.")
+    user = (
+        f"Question:\n{question}\n\n"
+        "Write these blocks:\n"
+        "BEST ANSWER: your full best answer now — candidate pool, every stated "
+        "condition applied, qualifying entities with figures/dates, near-miss "
+        "exclusions. Flag shaky facts with (verify).\n"
+        "CHECKLIST: each atomic condition in the question, numbered, including "
+        "any output-format demand.\n"
+        "LOOKUPS: 3-6 precise web searches for the facts that decide the answer "
+        "(entity + metric + year; include a named source's site: filter).\n"
+        "PAGES: up to 5 exact URLs worth reading directly (official stats pages, "
+        "sec.gov Archives filings, boxofficemojo year pages); 'none' if unsure."
+    )
+    raw = ""
+    try:
+        raw = await _chat_simple(LLM_LANE_A, LOOP_MODEL_A, system, user,
+                                 max_tokens=3600, timeout=BRIEF_TIMEOUT_S,
+                                 think={"enabled": True, "effort": "low"})
+    except Exception:
+        try:
+            raw = await _chat_simple(LLM_LANE_B, LOOP_MODEL_B, system, user,
+                                     max_tokens=3600, timeout=BRIEF_TIMEOUT_S,
+                                     think={"enabled": True})
+        except Exception:
+            raw = ""
+    if not raw:
+        return "", ""
+    draft = raw
+    cut = re.search(r"[#*\s]*CHECKLIST[#*\s]*:", raw, re.IGNORECASE)
+    if cut is not None:
+        draft = raw[:cut.start()]
+    draft = re.sub(r"^BEST ANSWER\s*:\s*", "", draft).strip()
+    brief = ("PRIOR ANALYSIS (your own; verify anything marked (verify), and "
+             "correct it wherever tool results disagree):\n" + raw.strip())
+    return draft, brief
+async def _chat_turn(messages: list[dict], deadline: float, *, finish_only: bool,
+                     force_tools: bool = False):
+    """One loop turn; lane A first, lane B (our paid ai_gateway) on failure."""
+    for lane_model in ((LLM_LANE_A, LOOP_MODEL_A), (LLM_LANE_B, LOOP_MODEL_B)):
+        lane = lane_model[0]
+        model = lane_model[1]
+        timeout = min(TURN_TIMEOUT_S, deadline - monotonic() - 5.0)
+        if timeout <= 5.0:
+            return None
+        try:
+            payload = await llm_chat(
+                provider=lane,
+                model=model,
+                messages=messages,
+                tools=LOOP_TOOLS if (force_tools or not finish_only) else None,
+                tool_choice="auto" if (force_tools or not finish_only) else None,
+                # v32.4b: BACK to 0.2. Greedy decoding (0.0) produced degenerate
+                # repetition in the qualifying smoke — a turn emitted the same
+                # "I need to gather..." sentence 3x and that shipped as the answer.
+                # The whole field runs 0.2; determinism comes from the pre-seed and
+                # the answer floor, not from collapsing the sampler.
+                temperature=0.2,
+                # v32.5b: LANE-scoped, not turn-scoped. Only glm-5.2-fast (lane B)
+                # has the documented empty-content defect; stripping reasoning from
+                # glm-5 on the final turn would remove it from the one turn that
+                # must apply every answer rule and place every [n].
+                thinking=({"enabled": False} if (finish_only and lane == LLM_LANE_B)
+                          else {"enabled": True, "effort": "low"}),
+                max_output_tokens=6000 if (finish_only and lane == LLM_LANE_B) else None,
+                timeout=timeout,
+            )
+            _spend_note(payload)
+            return payload
+        except Exception:
+            continue
+    return None
+async def _chat_simple(lane: str, model: str, system: str, user: str, *,
+                       max_tokens: int, timeout: float,
+                       think: dict | None = None) -> str:
+    payload = await llm_chat(
+        provider=lane,
+        model=model,
+        messages=[{"role": "system", "content": system},
+                  {"role": "user", "content": user}],
+        temperature=0.15,  # v32.4b: field-standard; greedy caused repetition loops
+        max_output_tokens=max_tokens,
+        timeout=timeout,
+        thinking=think if think is not None else {"enabled": False},
+    )
+    _spend_note(payload)
+    llm = getattr(payload, "llm", None)
+    text = (getattr(llm, "raw_text", None) or "").strip()
+    if text:
+        return text
+    choices = getattr(llm, "choices", None) or []
+    if choices:
+        content = getattr(choices[0].message, "content", None)
+        if isinstance(content, str):
+            return content.strip()
+    return ""
+async def _run_tool(call, question: str, ledger: EvidenceLedger, deadline: float) -> str:
+    try:
+        args = json.loads(getattr(call, "arguments", None) or "{}")
+    except Exception:
+        args = {}
+    if not isinstance(args, dict):
+        args = {}
+    name = getattr(call, "name", "") or ""
+    # (arg or "") not str(arg): an explicit JSON null must not become 'None'
+    if name == "web_search":
+        return await _do_search(str(args.get("query") or ""), ledger)
+    if name == "read_page":
+        return await _do_fetch(str(args.get("url") or ""), str(args.get("focus") or ""),
+                               question, ledger)
+    if name == "sec_filing":
+        return await _do_sec_filing(str(args.get("company") or ""),
+                                    str(args.get("form") or ""),
+                                    str(args.get("year") or ""), deadline)
+    return f"# unknown tool {name!r}"
 async def _do_sec_filing(company: str, form: str, year: str, deadline: float) -> str:
     company = (company or "").strip()
     form = (form or "").strip() or "10-K"
@@ -780,150 +740,10 @@ async def _do_sec_filing(company: str, form: str, year: str, deadline: float) ->
     return (f"# sec_filing -> {title} {form} {year or '(latest)'} primary document:\n"
             f"{url}\nNow call read_page on this URL with a focus hint for the "
             f"section you need, and cite figures from that read_page result.")
-
-
-async def _run_tool(call, question: str, ledger: EvidenceLedger, deadline: float) -> str:
-    try:
-        args = json.loads(getattr(call, "arguments", None) or "{}")
-    except Exception:
-        args = {}
-    if not isinstance(args, dict):
-        args = {}
-    name = getattr(call, "name", "") or ""
-    # (arg or "") not str(arg): an explicit JSON null must not become 'None'
-    if name == "web_search":
-        return await _do_search(str(args.get("query") or ""), ledger)
-    if name == "read_page":
-        return await _do_fetch(str(args.get("url") or ""), str(args.get("focus") or ""),
-                               question, ledger)
-    if name == "sec_filing":
-        return await _do_sec_filing(str(args.get("company") or ""),
-                                    str(args.get("form") or ""),
-                                    str(args.get("year") or ""), deadline)
-    return f"# unknown tool {name!r}"
-
-
-# ── LLM plumbing (dual lane) ─────────────────────────────────────────────────
-async def _chat_simple(lane: str, model: str, system: str, user: str, *,
-                       max_tokens: int, timeout: float,
-                       think: dict | None = None) -> str:
-    payload = await llm_chat(
-        provider=lane,
-        model=model,
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": user}],
-        temperature=0.15,  # v32.4b: field-standard; greedy caused repetition loops
-        max_output_tokens=max_tokens,
-        timeout=timeout,
-        thinking=think if think is not None else {"enabled": False},
-    )
-    _spend_note(payload)
-    llm = getattr(payload, "llm", None)
-    text = (getattr(llm, "raw_text", None) or "").strip()
-    if text:
-        return text
-    choices = getattr(llm, "choices", None) or []
-    if choices:
-        content = getattr(choices[0].message, "content", None)
-        if isinstance(content, str):
-            return content.strip()
-    return ""
-
-
-async def _chat_turn(messages: list[dict], deadline: float, *, finish_only: bool,
-                     force_tools: bool = False):
-    """One loop turn; lane A first, lane B (our paid ai_gateway) on failure."""
-    for lane_model in ((LLM_LANE_A, LOOP_MODEL_A), (LLM_LANE_B, LOOP_MODEL_B)):
-        lane = lane_model[0]
-        model = lane_model[1]
-        timeout = min(TURN_TIMEOUT_S, deadline - monotonic() - 5.0)
-        if timeout <= 5.0:
-            return None
-        try:
-            payload = await llm_chat(
-                provider=lane,
-                model=model,
-                messages=messages,
-                tools=LOOP_TOOLS if (force_tools or not finish_only) else None,
-                tool_choice="auto" if (force_tools or not finish_only) else None,
-                # v32.4b: BACK to 0.2. Greedy decoding (0.0) produced degenerate
-                # repetition in the qualifying smoke — a turn emitted the same
-                # "I need to gather..." sentence 3x and that shipped as the answer.
-                # The whole field runs 0.2; determinism comes from the pre-seed and
-                # the answer floor, not from collapsing the sampler.
-                temperature=0.2,
-                # v32.5b: LANE-scoped, not turn-scoped. Only glm-5.2-fast (lane B)
-                # has the documented empty-content defect; stripping reasoning from
-                # glm-5 on the final turn would remove it from the one turn that
-                # must apply every answer rule and place every [n].
-                thinking=({"enabled": False} if (finish_only and lane == LLM_LANE_B)
-                          else {"enabled": True, "effort": "low"}),
-                max_output_tokens=6000 if (finish_only and lane == LLM_LANE_B) else None,
-                timeout=timeout,
-            )
-            _spend_note(payload)
-            return payload
-        except Exception:
-            continue
-    return None
-
-
-# ── stage 1: knowledge briefing ───────────────────────────────────────────────
-async def _knowledge_brief(question: str) -> tuple[str, str]:
-    """One call: the model's own best answer + a verification plan. Returns
-    (draft_answer, briefing_block). The draft alone often carries a knowledge-
-    heavy batch; the loop then verifies the load-bearing facts."""
-    system = ("Senior research analyst. Commit to concrete best answers from "
-              "knowledge; mark uncertain values (verify). Never refuse.")
-    user = (
-        f"Question:\n{question}\n\n"
-        "Write these blocks:\n"
-        "BEST ANSWER: your full best answer now — candidate pool, every stated "
-        "condition applied, qualifying entities with figures/dates, near-miss "
-        "exclusions. Flag shaky facts with (verify).\n"
-        "CHECKLIST: each atomic condition in the question, numbered, including "
-        "any output-format demand.\n"
-        "LOOKUPS: 3-6 precise web searches for the facts that decide the answer "
-        "(entity + metric + year; include a named source's site: filter).\n"
-        "PAGES: up to 5 exact URLs worth reading directly (official stats pages, "
-        "sec.gov Archives filings, boxofficemojo year pages); 'none' if unsure."
-    )
-    raw = ""
-    try:
-        raw = await _chat_simple(LLM_LANE_A, LOOP_MODEL_A, system, user,
-                                 max_tokens=3600, timeout=BRIEF_TIMEOUT_S,
-                                 think={"enabled": True, "effort": "low"})
-    except Exception:
-        try:
-            raw = await _chat_simple(LLM_LANE_B, LOOP_MODEL_B, system, user,
-                                     max_tokens=3600, timeout=BRIEF_TIMEOUT_S,
-                                     think={"enabled": True})
-        except Exception:
-            raw = ""
-    if not raw:
-        return "", ""
-    draft = raw
-    cut = re.search(r"[#*\s]*CHECKLIST[#*\s]*:", raw, re.IGNORECASE)
-    if cut is not None:
-        draft = raw[:cut.start()]
-    draft = re.sub(r"^BEST ANSWER\s*:\s*", "", draft).strip()
-    brief = ("PRIOR ANALYSIS (your own; verify anything marked (verify), and "
-             "correct it wherever tool results disagree):\n" + raw.strip())
-    return draft, brief
-
-
-# ── stage 1b: deterministic pre-seed ─────────────────────────────────────────
-# The measured variance killer: with the model choosing turn 1, five validator
-# re-runs opened five different trajectories and gathered five different
-# evidence sets (prod f462cada: one run complete, four partial -> median 0).
-# These queries are pure functions of the question, so EVERY run starts from the
-# same numbered evidence — and the rescue rungs are never empty-handed.
 _SEED_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.\-']+")
 _SEED_STOP = frozenset("name list give tell show find identify please could would "
                        "you your can may might should must let make sure both also".split())
 MAX_SEED_QUERIES = 3
-
-
 def _seed_queries(question: str, set_question: bool) -> list[str]:
     q = " ".join((question or "").split())
     if not q:
@@ -945,8 +765,6 @@ def _seed_queries(question: str, set_question: bool) -> list[str]:
         if s and s not in out:
             out.append(s)
     return out[:MAX_SEED_QUERIES]
-
-
 async def _preseed(question: str, set_question: bool, ledger: EvidenceLedger,
                    deadline: float) -> str:
     """Run the seed queries concurrently; return a numbered digest to inject."""
@@ -972,9 +790,6 @@ async def _preseed(question: str, set_question: bool, ledger: EvidenceLedger,
         return ""   # no numbered rows -> do not claim "already numbered"
     return ("Automatic first-pass searches (already numbered — cite these [n] "
             "directly, and search further as needed):\n\n" + "\n".join(good))
-
-
-# ── stage 2: the research loop ────────────────────────────────────────────────
 async def _loop(question: str, brief: str, ledger: EvidenceLedger,
                 deadline: float, turn_cap: int,
                 carry: list[dict] | None = None,
@@ -1082,9 +897,6 @@ async def _loop(question: str, brief: str, ledger: EvidenceLedger,
             messages.append({"role": "tool", "tool_call_id": call.id,
                              "content": "# skipped: per-turn tool budget reached — re-issue next turn if still needed"})
     return answer, messages
-
-
-# ── stage 3: completeness audit + patch ───────────────────────────────────────
 async def _audit_patch(question: str, answer: str, messages: list[dict],
                        ledger: EvidenceLedger, deadline: float) -> str:
     probe = (
@@ -1156,31 +968,13 @@ async def _audit_patch(question: str, answer: str, messages: list[dict],
     if not _is_usable_answer(patched) or len(patched) < int(len(answer) * 0.6):
         return answer
     return patched
-
-
-# ── citations ────────────────────────────────────────────────────────────────
-# v32.5: glm emits full-width/CJK brackets (【1】, ［1］) often enough that
-# champion lineages normalize them explicitly. ASCII-only matching would drop
-# EVERY citation (judge credits nothing) and simultaneously make the answer
-# floor read the answer as uncited.
-# Ordinal-keyed dict (str.translate accepts one directly) — avoids str.maketrans,
-# which is a static access on a builtin type and untested against the server-side
-# AST policy. Includes full-width DIGITS: without them the floor's unicode-aware
-# \d saw "cited" while the ASCII-only extractor yielded nothing, shipping an
-# answer with citations=None — worse than not normalizing at all.
 _BRACKET_FIX = {0x3010: "[", 0x3011: "]", 0xFF3B: "[", 0xFF3D: "]",
                 0xFF08: "(", 0xFF09: ")", 0x2011: "-", 0x2212: "-"}
 for _d in range(10):                      # U+FF10..U+FF19 -> ASCII 0-9
     _BRACKET_FIX[0xFF10 + _d] = chr(48 + _d)
-
-
 def _normalize_brackets(text: str) -> str:
     return (text or "").translate(_BRACKET_FIX)
-
-
 _CITE_NUM_RE = re.compile(r"\[([0-9][0-9,\s\-]*)\]")
-
-
 def _cited_numbers(answer: str, top: int) -> list[int]:
     answer = _normalize_brackets(answer)
     seen: set[int] = set()
@@ -1202,8 +996,6 @@ def _cited_numbers(answer: str, top: int) -> list[int]:
                     seen.add(n)
                     out.append(n)
     return out
-
-
 def _citations_for(answer: str, ledger: EvidenceLedger) -> list[CitationRef]:
     """Build refs under the platform's materialized-evidence wall.
 
@@ -1229,19 +1021,7 @@ def _citations_for(answer: str, ledger: EvidenceLedger) -> list[CitationRef]:
         spent += cost
         refs.append(ref)
     return refs
-
-
-# ── fallbacks / output ────────────────────────────────────────────────────────
 _VERIFY_MARK_RE = re.compile(r"\s*\((?:verify|unverified|uncertain)[^)]*\)", re.I)
-
-# ── v32.4 FINAL-ANSWER FLOOR ─────────────────────────────────────────────────
-# Prod batch f462cada: several validator runs submitted literal tool-call MARKUP
-# as the final answer ("<tool_call>web_search<arg_key>query</arg_key>…", and a
-# corrupted full-width-paren variant) because the loop accepted ANY no-tool-call
-# message as the answer. Others submitted empty text or the internal stub. Each
-# of those is a guaranteed 0, and since validators re-run the agent, they were a
-# major driver of our median-vs-best gap. Nothing may be submitted unless it
-# reads as a real answer.
 _TOOL_MARKUP_RE = re.compile(
     r"<\s*/?\s*tool_call|<\s*/?\s*(?:arg_key|arg_value|function_call|invoke)\b"
     r"|\bweb_search\s*[（(]\s*query|\bread_page\s*[（(]\s*url|\bsec_filing\s*[（(]\s*company",
@@ -1250,40 +1030,12 @@ _STUB_ANSWER_RE = re.compile(r"^\s*(?:best-effort answer unavailable|no question
 _REFUSAL_ONLY_RE = re.compile(
     r"^\s*(?:i (?:cannot|can't|am unable|was unable)|unable to|sorry[,.]|"
     r"i don'?t have (?:enough|access))", re.I)
-# v32.4b: INTENT NARRATION — the model describing what it is about to do instead
-# of answering ("I need to gather...", "Let me search for..."). Observed shipped
-# as a final answer in the qualifying smoke, repeated verbatim 3x.
 _INTENT_NARRATION_RE = re.compile(
     r"^\s*(?:i (?:need|will|should|am going|'ll)\b|let me\b|first,? (?:i|let)\b|"
     r"i'?ll (?:search|look|start|begin|gather|check))", re.I)
 MIN_ANSWER_CHARS = 40
 MIN_CITED_ANSWER_CHARS = 12   # F8: '42 [3]' is a legitimate answer
 _CITE_MARK_RE = re.compile(r"\[[0-9]{1,3}\]")   # ASCII, matching _CITE_NUM_RE
-
-
-def _looks_like_tool_json(s: str) -> bool:
-    """F13: only a tool-call JSON at the very START is junk; an answer that
-    QUOTES a JSON record mid-text is legitimate."""
-    return bool(re.match(r'\s*\{\s*"(?:name|tool|function)"\s*:', s))
-
-
-def _is_degenerate_repetition(text: str) -> bool:
-    """True when the text is the same sentence emitted over and over — the
-    classic stalled/greedy-decoding artifact. Cheap and language-agnostic:
-    if the distinct sentences cover under half the body, it is a loop."""
-    sents = [s.strip().lower() for s in re.split(r"(?<=[.!?])\s+|\n+", text or "") if len(s.strip()) > 25]
-    if len(sents) < 3:
-        return False
-    uniq = set(sents)
-    if len(uniq) * 2 <= len(sents):
-        return True
-    # or one sentence repeated 3+ times anywhere
-    for s in uniq:
-        if sents.count(s) >= 3:
-            return True
-    return False
-
-
 def _is_usable_answer(text: str) -> bool:
     """A submittable answer. F13/F8 fixes: a CITED, substantive answer is always
     an answer — terse replies ('Yes, both are French [1].') and the reasoned-
@@ -1306,8 +1058,25 @@ def _is_usable_answer(text: str) -> bool:
     if len(s) < 400 and (_REFUSAL_ONLY_RE.match(s) or _INTENT_NARRATION_RE.match(s)):
         return False
     return True
-
-
+def _looks_like_tool_json(s: str) -> bool:
+    """F13: only a tool-call JSON at the very START is junk; an answer that
+    QUOTES a JSON record mid-text is legitimate."""
+    return bool(re.match(r'\s*\{\s*"(?:name|tool|function)"\s*:', s))
+def _is_degenerate_repetition(text: str) -> bool:
+    """True when the text is the same sentence emitted over and over — the
+    classic stalled/greedy-decoding artifact. Cheap and language-agnostic:
+    if the distinct sentences cover under half the body, it is a loop."""
+    sents = [s.strip().lower() for s in re.split(r"(?<=[.!?])\s+|\n+", text or "") if len(s.strip()) > 25]
+    if len(sents) < 3:
+        return False
+    uniq = set(sents)
+    if len(uniq) * 2 <= len(sents):
+        return True
+    # or one sentence repeated 3+ times anywhere
+    for s in uniq:
+        if sents.count(s) >= 3:
+            return True
+    return False
 _COMMIT_RULES = (
     "You are writing the FINAL ANSWER to a research question from evidence that "
     "has already been gathered. You have NO tools — never emit tool syntax. A "
@@ -1321,7 +1090,6 @@ _COMMIT_RULES = (
     "Never say what the evidence does not contain; commit to the best-supported "
     "answer you can defend."
 )
-
 _REPAIR_ORDER = (
     "Your last message was not a usable final answer (it contained tool-call "
     "markup, was empty, or was a refusal). Do NOT emit tool syntax as text. "
@@ -1329,51 +1097,6 @@ _REPAIR_ORDER = (
     "entities themselves, every factual claim followed by its [n] citation, "
     "then the short proof section. Nothing else."
 )
-
-
-def _sanitize_draft(text: str) -> str:
-    """The briefing draft marks shaky facts '(verify)' by instruction; those
-    markers must NEVER reach a submitted answer (judge-penalized uncertainty)."""
-    return _VERIFY_MARK_RE.sub("", text or "").strip()
-
-
-def _ledger_digest(ledger: EvidenceLedger, char_cap: int = 60000) -> str:
-    """A clean numbered evidence digest — no tool-call history. Preserves the
-    exact [n] numbering so citations still resolve. Committing from this beats
-    replaying the raw transcript: shorter, no assistant/tool scaffolding, and it
-    cannot drop early [n]s off the front of a truncated message window."""
-    parts: list[str] = []
-    spent = 0
-    for i, row in enumerate(ledger.rows, start=1):
-        text = (row.get("preview") or "").strip()
-        if not text:
-            continue
-        block = f"[{i}] {row.get('title') or ''} ({row.get('url') or ''})\n{text}"
-        if spent + len(block) > char_cap:
-            break
-        spent += len(block)
-        parts.append(block)
-    return "\n\n".join(parts)
-
-
-def _deterministic_answer(question: str, ledger: EvidenceLedger) -> str:
-    """Last rung, no LLM. Never emit a bare 'unavailable' line: the judge sees
-    only the answer text and makes a forced preference, so advertising our own
-    failure hands it a reason to pick the other side. A cited partial always
-    beats a refusal."""
-    rows = [(i, r) for i, r in enumerate(ledger.rows, start=1)
-            if (r.get("preview") or "").strip()]
-    if not rows:
-        return ""
-    out = ["FINAL ANSWER: based on the sources retrieved, the best-supported "
-           "findings for this question are:"]
-    for i, r in rows[:6]:
-        lead = " ".join((r.get("preview") or "").split())[:280]
-        title = (r.get("title") or "").strip()
-        out.append(f"- {title + ': ' if title else ''}{lead} [{i}]")
-    return "\n".join(out)
-
-
 async def _write_from_digest(question: str, ledger: EvidenceLedger, deadline: float) -> str:
     """Last write from the evidence already gathered: thinking OFF, NO tools, and
     a CLEAN numbered digest instead of the raw transcript — so the model cannot
@@ -1429,22 +1152,6 @@ async def _write_from_digest(question: str, ledger: EvidenceLedger, deadline: fl
         if _is_usable_answer(text):
             return text
     return ""
-
-
-async def _knowledge_resort(question: str, deadline: float) -> str:
-    left = deadline - monotonic()
-    if left < 12.0:
-        return ""
-    try:
-        return await _chat_simple(
-            LLM_LANE_A, RESORT_MODEL,
-            ("Expert researcher. Best definitive answer with concrete entities, "
-             "numbers, dates. Never refuse."),
-            question, max_tokens=1500, timeout=min(45.0, left - 4.0))
-    except Exception:
-        return ""
-
-
 async def _schema_output(question: str, answer: str, schema, deadline: float) -> object | None:
     ask = ("Convert the answer to a JSON value valid under the schema. Output "
            "ONLY the JSON value.\n\n"
@@ -1464,16 +1171,60 @@ async def _schema_output(question: str, answer: str, schema, deadline: float) ->
         except Exception:
             continue
     return None
-
-
+def _sanitize_draft(text: str) -> str:
+    """The briefing draft marks shaky facts '(verify)' by instruction; those
+    markers must NEVER reach a submitted answer (judge-penalized uncertainty)."""
+    return _VERIFY_MARK_RE.sub("", text or "").strip()
+def _ledger_digest(ledger: EvidenceLedger, char_cap: int = 60000) -> str:
+    """A clean numbered evidence digest — no tool-call history. Preserves the
+    exact [n] numbering so citations still resolve. Committing from this beats
+    replaying the raw transcript: shorter, no assistant/tool scaffolding, and it
+    cannot drop early [n]s off the front of a truncated message window."""
+    parts: list[str] = []
+    spent = 0
+    for i, row in enumerate(ledger.rows, start=1):
+        text = (row.get("preview") or "").strip()
+        if not text:
+            continue
+        block = f"[{i}] {row.get('title') or ''} ({row.get('url') or ''})\n{text}"
+        if spent + len(block) > char_cap:
+            break
+        spent += len(block)
+        parts.append(block)
+    return "\n\n".join(parts)
+async def _knowledge_resort(question: str, deadline: float) -> str:
+    left = deadline - monotonic()
+    if left < 12.0:
+        return ""
+    try:
+        return await _chat_simple(
+            LLM_LANE_A, RESORT_MODEL,
+            ("Expert researcher. Best definitive answer with concrete entities, "
+             "numbers, dates. Never refuse."),
+            question, max_tokens=1500, timeout=min(45.0, left - 4.0))
+    except Exception:
+        return ""
 def _cap(text: str) -> str:
     t = (text or "").strip()
     if len(t) > ANSWER_CHAR_CAP:
         return t[:ANSWER_CHAR_CAP - 16] + " …"
     return t
-
-
-# ── entrypoint ────────────────────────────────────────────────────────────────
+def _deterministic_answer(question: str, ledger: EvidenceLedger) -> str:
+    """Last rung, no LLM. Never emit a bare 'unavailable' line: the judge sees
+    only the answer text and makes a forced preference, so advertising our own
+    failure hands it a reason to pick the other side. A cited partial always
+    beats a refusal."""
+    rows = [(i, r) for i, r in enumerate(ledger.rows, start=1)
+            if (r.get("preview") or "").strip()]
+    if not rows:
+        return ""
+    out = ["FINAL ANSWER: based on the sources retrieved, the best-supported "
+           "findings for this question are:"]
+    for i, r in rows[:6]:
+        lead = " ".join((r.get("preview") or "").split())[:280]
+        title = (r.get("title") or "").strip()
+        out.append(f"- {title + ': ' if title else ''}{lead} [{i}]")
+    return "\n".join(out)
 @entrypoint("query")
 async def query(query: Query) -> Response:
     question = (query.text or "").strip()
@@ -1484,8 +1235,6 @@ async def query(query: Query) -> Response:
     except Exception:
         # a miner-attributed exception is a hard 0 — always return SOME text
         return Response(text=f"Best-effort answer unavailable for: {question[:500]}")
-
-
 async def _solve(query: Query, question: str) -> Response:
     deadline = monotonic() + WALL_BUDGET_S
     try:

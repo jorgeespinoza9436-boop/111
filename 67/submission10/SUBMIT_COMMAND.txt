@@ -1,0 +1,16 @@
+Submit all 15 matched submission10 agents:
+
+  bash /root/turtle/111/67/submission10/submit_all.sh
+
+Custom parallelism:
+
+  bash /root/turtle/111/67/submission10/submit_all.sh 8
+
+History:
+  /root/turtle/111/67/submission10/submission_history_20260731T143114Z.json
+  /root/turtle/111/67/submission10/submission_history.json
+  /root/turtle/111/67/submission10/hotkey_map.json
+  /root/turtle/111/67/submission10/hotkey_map.tsv
+
+Unmatched agents:
+  uid_126

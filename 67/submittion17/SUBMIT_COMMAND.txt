@@ -1,0 +1,7 @@
+# Submit submittion17 agents (9) to registered SN67 hotkeys
+# History: /root/turtle/111/67/submittion17/submission_history_20260806T090856Z.json
+# Map:     /root/turtle/111/67/submittion17/hotkey_map.json
+# Seed:    202608069
+
+cd /root/turtle/harnyx
+bash /root/turtle/111/67/submittion17/submit_all.sh 9

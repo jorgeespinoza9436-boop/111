@@ -57,41 +57,40 @@ TOOLS = [
     },
 ]
 
-SYSTEM_PROMPT = (
-    "You are a careful research assistant answering a factual multi-part question. "
-    "You have search_web and fetch_page tools. Call them as many times as needed to "
-    "verify every sub-claim before answering -- do not guess ages, dates, or line "
-    "counts from memory; look them up. Every tool result is numbered like [7] when "
-    "shown to you.\n\n"
-    "CITATION RULE: when you write your final answer, put the source number in "
-    "brackets immediately after EVERY factual claim (a number, date, name, or "
-    "yes/no determination) -- e.g. 'Keats died at age 25 [7]' or 'the total is "
-    "4,000 [7, 12].' Cite a claim for entities that qualify AND entities that "
-    "don't -- every stated fact needs its own citation, not just a summary source "
-    "list at the end. A claim with no bracket after it is assumed uncited.\n\n"
-    "When (and only when) you are confident in every fact, write your final answer "
-    "with inline citations as described. Do not call a tool and answer in the same turn."
-)
+SYSTEM_PROMPT = """# Research Assistant Instructions
 
-SYNTHESIS_SYSTEM_PROMPT = (
-    "You are a careful research assistant. The research phase for this question is "
-    "over: tools are DISABLED, and any tool-call syntax you emit will be shipped "
-    "verbatim to the grader as your final answer, scoring zero. Using ONLY the "
-    "numbered evidence excerpts provided, write your best final answer now.\n\n"
-    "COMMIT RULE: scoring is pairwise against a competitor's answer -- an answer "
-    "that refuses or defers scores zero and loses outright. If some sub-claims are "
-    "uncertain, commit to what the evidence supports and note the uncertainty "
-    "inline; a partial, cited answer scores far better than no answer.\n\n"
-    "CITATION RULE: put the evidence number in brackets immediately after every "
-    "factual claim -- e.g. 'the total is 4,000 [7, 12].' A claim with no bracket "
-    "after it is assumed uncited."
-)
+You are a careful research assistant answering a factual multi-part question.
 
-FORCED_COMMIT_SUFFIX = (
-    "\n\n*** FORCED COMMIT ***\nYour previous draft refused, stalled, or was cut "
-    "short. That scores ZERO. Rewrite now: commit to the best evidence-supported "
-    "answer, cite every claim, and do not emit tool-call syntax or apologies."
-)
+## Tools
+
+You have `search_web` and `fetch_page` tools. Call them as many times as needed to verify every sub-claim before answering — do not guess ages, dates, or line counts from memory; look them up. Every tool result is numbered like `[7]` when shown to you.
+
+## Citations
+
+When you write your final answer, put the source number in brackets immediately after **every** factual claim (a number, date, name, or yes/no determination) — e.g. `Keats died at age 25 [7]` or `the total is 4,000 [7, 12].` Cite a claim for entities that qualify AND entities that don't — every stated fact needs its own citation, not just a summary source list at the end. A claim with no bracket after it is assumed uncited.
+
+When (and only when) you are confident in every fact, write your final answer with inline citations as described. Do not call a tool and answer in the same turn.
+"""
+
+SYNTHESIS_SYSTEM_PROMPT = """# Synthesis Instructions
+
+You are a careful research assistant. The research phase for this question is over: tools are DISABLED, and any tool-call syntax you emit will be shipped verbatim to the grader as your final answer, scoring zero. Using ONLY the numbered evidence excerpts provided, write your best final answer now.
+
+## Commit Rule
+
+Scoring is pairwise against a competitor's answer — an answer that refuses or defers scores zero and loses outright. If some sub-claims are uncertain, commit to what the evidence supports and note the uncertainty inline; a partial, cited answer scores far better than no answer.
+
+## Citations
+
+Put the evidence number in brackets immediately after every factual claim — e.g. `the total is 4,000 [7, 12].` A claim with no bracket after it is assumed uncited.
+"""
+
+FORCED_COMMIT_SUFFIX = """
+
+## Forced Commit
+
+Your previous draft refused, stalled, or was cut short. That scores **zero**. Rewrite now: commit to the best evidence-supported answer, cite every claim, and do not emit tool-call syntax or apologies.
+"""
 
 INSUFFICIENT_ANSWER = (
     "I could not complete a source-backed research answer for this question within budget."

@@ -1,0 +1,10 @@
+# Submit submittion18 agents (11 hotkeys)
+# Pool: registered unsubmitted ∪ force-include
+# Force-include: hk-67-15, hk-67-20, hk-67-23, hk-67-25, hk-67-33, hk-67-39, hk-67-42, hk-67-46, hk-67-7
+# Prior submitted excluded (except force-include): 24
+# History: /root/turtle/111/67/submittion18/submission_history_20260807T085746Z.json
+# Map:     /root/turtle/111/67/submittion18/hotkey_map.json
+# Seed:    20260807018
+
+cd /root/turtle/harnyx
+bash /root/turtle/111/67/submittion18/submit_all.sh 11

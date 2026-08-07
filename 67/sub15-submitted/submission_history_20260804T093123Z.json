@@ -1,0 +1,345 @@
+{
+  "created_at": "2026-08-04T09:31:23.284854+00:00",
+  "wallet_name": "money",
+  "coldkey_ss58": "5HECJHXNvsFw7pYookNbk2xekL55oory2ewrWZw6rT7BHrZq",
+  "netuid": 67,
+  "network": "finney",
+  "agent_dir": "/root/turtle/111/67/submittion15",
+  "match": "random",
+  "random_seed": 20260804,
+  "match_pool_mode": "registered_unsubmitted_only",
+  "matched_count": 7,
+  "agent_count": 33,
+  "registered_hotkey_count": 24,
+  "unsubmitted_registered_count": 7,
+  "excluded_submitted_hotkeys_from_history": [
+    "hk-67-14",
+    "hk-67-17",
+    "hk-67-21",
+    "hk-67-22",
+    "hk-67-23",
+    "hk-67-24",
+    "hk-67-25",
+    "hk-67-26",
+    "hk-67-3",
+    "hk-67-30",
+    "hk-67-33",
+    "hk-67-39",
+    "hk-67-4",
+    "hk-67-40",
+    "hk-67-41",
+    "hk-67-42",
+    "hk-67-43",
+    "hk-67-45",
+    "hk-67-46",
+    "hk-67-5",
+    "hk-67-6",
+    "hk-67-7",
+    "hk-67-8",
+    "hk-67-9"
+  ],
+  "leftover_available_hotkeys": [],
+  "unmatched_agents": [
+    {
+      "filename": "uid_222__artifact_0bc59064-940d-43b8-aa42-8f3a030d4227.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_222__artifact_0bc59064-940d-43b8-aa42-8f3a030d4227.py",
+      "agent_uid_label": "uid_222",
+      "agent_name": "uid_222"
+    },
+    {
+      "filename": "uid_68__artifact_3e932dd1-0fac-4d70-a4de-8ce510264ef1.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_68__artifact_3e932dd1-0fac-4d70-a4de-8ce510264ef1.py",
+      "agent_uid_label": "uid_68",
+      "agent_name": "uid_68"
+    },
+    {
+      "filename": "uid_186__artifact_88ecd6a6-8db4-486f-9661-0a458b9480e8.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_186__artifact_88ecd6a6-8db4-486f-9661-0a458b9480e8.py",
+      "agent_uid_label": "uid_186",
+      "agent_name": "uid_186"
+    },
+    {
+      "filename": "uid_217__artifact_14f2f99d-147c-430d-9ab7-896ac579b5c1.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_217__artifact_14f2f99d-147c-430d-9ab7-896ac579b5c1.py",
+      "agent_uid_label": "uid_217",
+      "agent_name": "uid_217"
+    },
+    {
+      "filename": "uid_199__artifact_71b446da-90dc-4d18-a85f-5a3591aaf390.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_199__artifact_71b446da-90dc-4d18-a85f-5a3591aaf390.py",
+      "agent_uid_label": "uid_199",
+      "agent_name": "uid_199"
+    },
+    {
+      "filename": "uid_213__artifact_8ee5c050-8d18-4545-97cb-064362bc3b15.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_213__artifact_8ee5c050-8d18-4545-97cb-064362bc3b15.py",
+      "agent_uid_label": "uid_213",
+      "agent_name": "uid_213"
+    },
+    {
+      "filename": "uid_149__artifact_ea1e5936-2c3a-461b-8636-3b324729ec88.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_149__artifact_ea1e5936-2c3a-461b-8636-3b324729ec88.py",
+      "agent_uid_label": "uid_149",
+      "agent_name": "uid_149"
+    },
+    {
+      "filename": "uid_93__artifact_31ba9c35-b7df-422f-9ff1-d96b826992a4.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_93__artifact_31ba9c35-b7df-422f-9ff1-d96b826992a4.py",
+      "agent_uid_label": "uid_93",
+      "agent_name": "uid_93"
+    },
+    {
+      "filename": "uid_63__artifact_b1da7d27-97ea-4522-be2e-30b29f35ca3d.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_63__artifact_b1da7d27-97ea-4522-be2e-30b29f35ca3d.py",
+      "agent_uid_label": "uid_63",
+      "agent_name": "uid_63"
+    },
+    {
+      "filename": "uid_10__artifact_c1051646-ad49-4864-b3a2-4d45fc217595.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_10__artifact_c1051646-ad49-4864-b3a2-4d45fc217595.py",
+      "agent_uid_label": "uid_10",
+      "agent_name": "uid_10"
+    },
+    {
+      "filename": "uid_150__artifact_cd77ecd5-fb77-4f08-9ac6-a8efb6fd8fd0.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_150__artifact_cd77ecd5-fb77-4f08-9ac6-a8efb6fd8fd0.py",
+      "agent_uid_label": "uid_150",
+      "agent_name": "uid_150"
+    },
+    {
+      "filename": "uid_175__artifact_42c10b98-6d6c-49f0-9238-7193c6f073a8.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_175__artifact_42c10b98-6d6c-49f0-9238-7193c6f073a8.py",
+      "agent_uid_label": "uid_175",
+      "agent_name": "uid_175"
+    },
+    {
+      "filename": "uid_110__artifact_8fd67894-5895-4f4c-b124-3fdde460a345.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_110__artifact_8fd67894-5895-4f4c-b124-3fdde460a345.py",
+      "agent_uid_label": "uid_110",
+      "agent_name": "uid_110"
+    },
+    {
+      "filename": "uid_229__artifact_3bf92c4b-ac1e-4c1d-890f-0f4d92b37481.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_229__artifact_3bf92c4b-ac1e-4c1d-890f-0f4d92b37481.py",
+      "agent_uid_label": "uid_229",
+      "agent_name": "uid_229"
+    },
+    {
+      "filename": "uid_242__artifact_5d01f43f-aac1-4a1f-9d45-f63058096cd7.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_242__artifact_5d01f43f-aac1-4a1f-9d45-f63058096cd7.py",
+      "agent_uid_label": "uid_242",
+      "agent_name": "uid_242"
+    },
+    {
+      "filename": "uid_89__artifact_9ae6c9a8-cf1c-45b9-8417-0491f429025c.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_89__artifact_9ae6c9a8-cf1c-45b9-8417-0491f429025c.py",
+      "agent_uid_label": "uid_89",
+      "agent_name": "uid_89"
+    },
+    {
+      "filename": "uid_159__artifact_2c628b9e-e0b3-4d6a-b708-b8c3ab64004f.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_159__artifact_2c628b9e-e0b3-4d6a-b708-b8c3ab64004f.py",
+      "agent_uid_label": "uid_159",
+      "agent_name": "uid_159"
+    },
+    {
+      "filename": "uid_249__artifact_54bca742-9f47-451d-95ae-eb626d8a7223.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_249__artifact_54bca742-9f47-451d-95ae-eb626d8a7223.py",
+      "agent_uid_label": "uid_249",
+      "agent_name": "uid_249"
+    },
+    {
+      "filename": "uid_118__artifact_2884bbf5-8343-4a01-8fe4-ed39224dbe05.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_118__artifact_2884bbf5-8343-4a01-8fe4-ed39224dbe05.py",
+      "agent_uid_label": "uid_118",
+      "agent_name": "uid_118"
+    },
+    {
+      "filename": "uid_107__artifact_b7905168-4973-4b92-8713-523d22a9042b.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_107__artifact_b7905168-4973-4b92-8713-523d22a9042b.py",
+      "agent_uid_label": "uid_107",
+      "agent_name": "uid_107"
+    },
+    {
+      "filename": "uid_166__artifact_3e071d6b-8b91-45be-a0ad-fe5f6cc62c09.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_166__artifact_3e071d6b-8b91-45be-a0ad-fe5f6cc62c09.py",
+      "agent_uid_label": "uid_166",
+      "agent_name": "uid_166"
+    },
+    {
+      "filename": "uid_21__artifact_7ee41cb6-9758-4f77-be78-9f6f11a3be4a.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_21__artifact_7ee41cb6-9758-4f77-be78-9f6f11a3be4a.py",
+      "agent_uid_label": "uid_21",
+      "agent_name": "uid_21"
+    },
+    {
+      "filename": "uid_76__artifact_3ffca599-cdf5-4924-ab0f-006709a8b088.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_76__artifact_3ffca599-cdf5-4924-ab0f-006709a8b088.py",
+      "agent_uid_label": "uid_76",
+      "agent_name": "uid_76"
+    },
+    {
+      "filename": "uid_231__artifact_65256c1e-1a50-4ae7-92b2-9d728b794d94.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_231__artifact_65256c1e-1a50-4ae7-92b2-9d728b794d94.py",
+      "agent_uid_label": "uid_231",
+      "agent_name": "uid_231"
+    },
+    {
+      "filename": "uid_131__artifact_670030f0-3ed9-4a77-915c-c1481edbf38b.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_131__artifact_670030f0-3ed9-4a77-915c-c1481edbf38b.py",
+      "agent_uid_label": "uid_131",
+      "agent_name": "uid_131"
+    },
+    {
+      "filename": "uid_203__artifact_3ac89cad-4f42-46be-8c21-5eccbf168f8a.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_203__artifact_3ac89cad-4f42-46be-8c21-5eccbf168f8a.py",
+      "agent_uid_label": "uid_203",
+      "agent_name": "uid_203"
+    }
+  ],
+  "must_include_agents": [
+    "uid_182"
+  ],
+  "entries": [
+    {
+      "matched_at": "2026-08-04T09:31:23.284854+00:00",
+      "match": "random",
+      "random_seed": 20260804,
+      "wallet_name": "money",
+      "netuid": 67,
+      "network": "finney",
+      "filename": "uid_140__artifact_5d33f70d-2ee0-4e15-9fb3-8b865eb7bb79.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_140__artifact_5d33f70d-2ee0-4e15-9fb3-8b865eb7bb79.py",
+      "agent_uid_label": "uid_140",
+      "agent_name": "uid_140",
+      "hotkey_name": "hk-67-12",
+      "hotkey_ss58": "5CoUkzmVw6X4Xj9zzXoA2T1ZwRXr2vimbfEQXJvdGXGx6WAg",
+      "hotkey_address": "5CoUkzmVw6X4Xj9zzXoA2T1ZwRXr2vimbfEQXJvdGXGx6WAg",
+      "on_chain_uid": 176,
+      "uid": 176,
+      "date": "2026-08-04",
+      "status": "matched_pending_submit",
+      "submit_status": "pending"
+    },
+    {
+      "matched_at": "2026-08-04T09:31:23.284854+00:00",
+      "match": "random",
+      "random_seed": 20260804,
+      "wallet_name": "money",
+      "netuid": 67,
+      "network": "finney",
+      "filename": "uid_151__artifact_71a75417-ac0a-41eb-8d89-9f99b9e01221.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_151__artifact_71a75417-ac0a-41eb-8d89-9f99b9e01221.py",
+      "agent_uid_label": "uid_151",
+      "agent_name": "uid_151",
+      "hotkey_name": "hk-67-15",
+      "hotkey_ss58": "5H1j52nH6fuPEeii8drWSeH1BgizCqqwh3c6uNYuLPcopiGB",
+      "hotkey_address": "5H1j52nH6fuPEeii8drWSeH1BgizCqqwh3c6uNYuLPcopiGB",
+      "on_chain_uid": 182,
+      "uid": 182,
+      "date": "2026-08-04",
+      "status": "matched_pending_submit",
+      "submit_status": "pending"
+    },
+    {
+      "matched_at": "2026-08-04T09:31:23.284854+00:00",
+      "match": "random",
+      "random_seed": 20260804,
+      "wallet_name": "money",
+      "netuid": 67,
+      "network": "finney",
+      "filename": "uid_182__artifact_2305fac7-2a6f-4bb9-908d-57caa67deac6.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_182__artifact_2305fac7-2a6f-4bb9-908d-57caa67deac6.py",
+      "agent_uid_label": "uid_182",
+      "agent_name": "uid_182",
+      "hotkey_name": "hk-67-13",
+      "hotkey_ss58": "5CSzbYHqHWignpNDpepZjQ29Sg3AXdWyTa3Kq5wNDZhkvbrK",
+      "hotkey_address": "5CSzbYHqHWignpNDpepZjQ29Sg3AXdWyTa3Kq5wNDZhkvbrK",
+      "on_chain_uid": 105,
+      "uid": 105,
+      "date": "2026-08-04",
+      "status": "matched_pending_submit",
+      "submit_status": "pending"
+    },
+    {
+      "matched_at": "2026-08-04T09:31:23.284854+00:00",
+      "match": "random",
+      "random_seed": 20260804,
+      "wallet_name": "money",
+      "netuid": 67,
+      "network": "finney",
+      "filename": "uid_72__artifact_abdbfb5d-cbcc-4dbb-9d72-3d6638677038.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_72__artifact_abdbfb5d-cbcc-4dbb-9d72-3d6638677038.py",
+      "agent_uid_label": "uid_72",
+      "agent_name": "uid_72",
+      "hotkey_name": "hk-67-1",
+      "hotkey_ss58": "5FFLF6CgQgeDn6bgzFGF2FHMecfCA5gEGQNKZQkDc5AwypZU",
+      "hotkey_address": "5FFLF6CgQgeDn6bgzFGF2FHMecfCA5gEGQNKZQkDc5AwypZU",
+      "on_chain_uid": 23,
+      "uid": 23,
+      "date": "2026-08-04",
+      "status": "matched_pending_submit",
+      "submit_status": "pending"
+    },
+    {
+      "matched_at": "2026-08-04T09:31:23.284854+00:00",
+      "match": "random",
+      "random_seed": 20260804,
+      "wallet_name": "money",
+      "netuid": 67,
+      "network": "finney",
+      "filename": "uid_232__artifact_83394cf8-4306-42b8-98f6-d7851d8593f3.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_232__artifact_83394cf8-4306-42b8-98f6-d7851d8593f3.py",
+      "agent_uid_label": "uid_232",
+      "agent_name": "uid_232",
+      "hotkey_name": "hk-67-27",
+      "hotkey_ss58": "5Gdqiqa2Kj93tAcTPYaWgjbWGyi3FYZ38N4NjTdQ9vYhkVjG",
+      "hotkey_address": "5Gdqiqa2Kj93tAcTPYaWgjbWGyi3FYZ38N4NjTdQ9vYhkVjG",
+      "on_chain_uid": 244,
+      "uid": 244,
+      "date": "2026-08-04",
+      "status": "matched_pending_submit",
+      "submit_status": "pending"
+    },
+    {
+      "matched_at": "2026-08-04T09:31:23.284854+00:00",
+      "match": "random",
+      "random_seed": 20260804,
+      "wallet_name": "money",
+      "netuid": 67,
+      "network": "finney",
+      "filename": "uid_155__artifact_e0005389-4677-436a-b3f9-20e2812ac8e3.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_155__artifact_e0005389-4677-436a-b3f9-20e2812ac8e3.py",
+      "agent_uid_label": "uid_155",
+      "agent_name": "uid_155",
+      "hotkey_name": "hk-67-10",
+      "hotkey_ss58": "5DnRmBNm9LH5jsXqzEmEd1M17padmGJrZjouN4g7wr3oWACP",
+      "hotkey_address": "5DnRmBNm9LH5jsXqzEmEd1M17padmGJrZjouN4g7wr3oWACP",
+      "on_chain_uid": 3,
+      "uid": 3,
+      "date": "2026-08-04",
+      "status": "matched_pending_submit",
+      "submit_status": "pending"
+    },
+    {
+      "matched_at": "2026-08-04T09:31:23.284854+00:00",
+      "match": "random",
+      "random_seed": 20260804,
+      "wallet_name": "money",
+      "netuid": 67,
+      "network": "finney",
+      "filename": "uid_72__artifact_808805b2-b5a4-44af-b13b-1a215a26b78b.py",
+      "agent_path": "/root/turtle/111/67/submittion15/uid_72__artifact_808805b2-b5a4-44af-b13b-1a215a26b78b.py",
+      "agent_uid_label": "uid_72",
+      "agent_name": "uid_72",
+      "hotkey_name": "hk-67-11",
+      "hotkey_ss58": "5GWH1rMxPzvwSLV3wZimQt2iMek8JeGNTtoXjs7Wv7uiXgmn",
+      "hotkey_address": "5GWH1rMxPzvwSLV3wZimQt2iMek8JeGNTtoXjs7Wv7uiXgmn",
+      "on_chain_uid": 160,
+      "uid": 160,
+      "date": "2026-08-04",
+      "status": "matched_pending_submit",
+      "submit_status": "pending"
+    }
+  ]
+}

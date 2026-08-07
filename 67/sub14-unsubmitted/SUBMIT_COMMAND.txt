@@ -1,0 +1,6 @@
+# Submit all sub14-unsubmitted agents (24) to registered SN67 hotkeys
+# History: /root/turtle/111/67/sub14-unsubmitted/submission_history_20260803T140237Z.json
+# Map:     /root/turtle/111/67/sub14-unsubmitted/hotkey_map.json
+
+cd /root/turtle/harnyx
+bash /root/turtle/111/67/sub14-unsubmitted/submit_all.sh 24

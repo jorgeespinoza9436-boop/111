@@ -1,0 +1,12 @@
+hotkey_name	hotkey_address	on_chain_uid	agent_name	filename	force_included	primary_llm_provider	primary_search_provider	providers_summary	date
+hk-67-15	5H1j52nH6fuPEeii8drWSeH1BgizCqqwh3c6uNYuLPcopiGB	182	uid_147	uid_147__artifact_3ad22a6a-3a0c-4194-8275-54127bf85f9a.py	True	ai_gateway	desearch	llm:ai_gateway+openrouter | search:desearch+parallel	2026-08-07
+hk-67-20	5CACD5ojXDGRuVjA3o15nFWhuKqM6P31nAddhTwuhQv8mai8	208	uid_35	uid_35__artifact_a4d6fd84-038a-4de0-9ca1-1093c4a55ce4.py	True	openrouter	desearch	llm:openrouter | search:desearch+parallel	2026-08-07
+hk-67-23	5Fn6y1uZGibEW5GtKByE4UCQQCysBk5QaBPJfF2zN5jLYX4H	228	uid_55	uid_55__artifact_248f7cc2-3f8b-4383-9f6e-10f3be66d273.py	True	openrouter	desearch	llm:openrouter | search:desearch+parallel	2026-08-07
+hk-67-25	5HmUEZ65n5hfpoANptv8Xqx6eknnmvYbXV9ySCwwbjv5EXk9	43	uid_150	uid_150__artifact_d5addeba-5a00-47c3-968e-da8df0febdf3.py	True	openrouter	desearch	llm:openrouter | search:desearch+parallel	2026-08-07
+hk-67-26	5FpmGyfU3wfppD9qsBg7e8NawA7J9yZLMuVY81WdnsaJ1U4B	151	uid_186	uid_186__artifact_255ee004-6571-46bc-a4e9-9fd76d6e3662.py	False	ai_gateway	desearch	llm:ai_gateway+openrouter | search:desearch+parallel | fetch:parallel	2026-08-07
+hk-67-33	5ER9h9Nh5PrcErAsamt9o2fkRY6XrDcxp6yffhUwP4VjAmpM	52	uid_72	uid_72__artifact_1935dfbb-48fd-4e9f-a43d-7a29a2b6d65a.py	True	ai_gateway	desearch	llm:ai_gateway+openrouter | search:desearch+parallel	2026-08-07
+hk-67-39	5DFdZnet3LDiddZYGQ2VoMQyhc6mJvRmxPvEPXhdDrYGtVQt	169	uid_213	uid_213__artifact_cf4f93a2-617d-444f-97c9-11470531cf67.py	True	openrouter	desearch	llm:openrouter | search:desearch+parallel	2026-08-07
+hk-67-42	5EPW6pEkAPx6bryrEyFWtM3Ts4VkJwsYGcbRkvb9HMgnjWwC	50	uid_231	uid_231__artifact_10c4ca4e-0432-4633-8657-fef162f1c92c.py	True	ai_gateway	desearch	llm:ai_gateway+openrouter | search:desearch+parallel	2026-08-07
+hk-67-43	5GH8REwcYtYMupG17jgbNHQZR5zjwHxVyr9y8V6eNWKCFvyB	90	uid_229	uid_229__artifact_df34a118-0c12-4837-8812-e9cb52dc01a5.py	False	openrouter	desearch	llm:openrouter | search:desearch+parallel	2026-08-07
+hk-67-46	5GZKnrJjKJGmcz75j8sKEbPfxXmnLXpN4KxNZaGDEf17Sp5q	162	uid_206	uid_206__artifact_96702644-3bc8-4026-a7ca-a89285b5b9eb.py	True	ai_gateway	desearch	llm:ai_gateway+openrouter | search:desearch+parallel | fetch:parallel	2026-08-07
+hk-67-7	5D9f8Ri9kcPnmCSXzs5oPhZPsXqgHALCMArrqnGSFxYhgSYL	38	uid_67	uid_67__artifact_2095f4cc-68e9-4c56-b81c-67156cb6a8a7.py	True	openrouter	desearch	llm:openrouter | search:desearch+parallel | fetch:parallel	2026-08-07

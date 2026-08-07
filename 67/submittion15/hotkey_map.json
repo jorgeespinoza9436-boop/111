@@ -1,0 +1,64 @@
+{
+  "created_at": "2026-08-04T09:31:23.284854+00:00",
+  "wallet_name": "money",
+  "netuid": 67,
+  "match_pool_mode": "registered_unsubmitted_only",
+  "entries": [
+    {
+      "hotkey_name": "hk-67-12",
+      "hotkey_address": "5CoUkzmVw6X4Xj9zzXoA2T1ZwRXr2vimbfEQXJvdGXGx6WAg",
+      "on_chain_uid": 176,
+      "agent_name": "uid_140",
+      "filename": "uid_140__artifact_5d33f70d-2ee0-4e15-9fb3-8b865eb7bb79.py",
+      "date": "2026-08-04"
+    },
+    {
+      "hotkey_name": "hk-67-15",
+      "hotkey_address": "5H1j52nH6fuPEeii8drWSeH1BgizCqqwh3c6uNYuLPcopiGB",
+      "on_chain_uid": 182,
+      "agent_name": "uid_151",
+      "filename": "uid_151__artifact_71a75417-ac0a-41eb-8d89-9f99b9e01221.py",
+      "date": "2026-08-04"
+    },
+    {
+      "hotkey_name": "hk-67-13",
+      "hotkey_address": "5CSzbYHqHWignpNDpepZjQ29Sg3AXdWyTa3Kq5wNDZhkvbrK",
+      "on_chain_uid": 105,
+      "agent_name": "uid_182",
+      "filename": "uid_182__artifact_2305fac7-2a6f-4bb9-908d-57caa67deac6.py",
+      "date": "2026-08-04"
+    },
+    {
+      "hotkey_name": "hk-67-1",
+      "hotkey_address": "5FFLF6CgQgeDn6bgzFGF2FHMecfCA5gEGQNKZQkDc5AwypZU",
+      "on_chain_uid": 23,
+      "agent_name": "uid_72",
+      "filename": "uid_72__artifact_abdbfb5d-cbcc-4dbb-9d72-3d6638677038.py",
+      "date": "2026-08-04"
+    },
+    {
+      "hotkey_name": "hk-67-27",
+      "hotkey_address": "5Gdqiqa2Kj93tAcTPYaWgjbWGyi3FYZ38N4NjTdQ9vYhkVjG",
+      "on_chain_uid": 244,
+      "agent_name": "uid_232",
+      "filename": "uid_232__artifact_83394cf8-4306-42b8-98f6-d7851d8593f3.py",
+      "date": "2026-08-04"
+    },
+    {
+      "hotkey_name": "hk-67-10",
+      "hotkey_address": "5DnRmBNm9LH5jsXqzEmEd1M17padmGJrZjouN4g7wr3oWACP",
+      "on_chain_uid": 3,
+      "agent_name": "uid_155",
+      "filename": "uid_155__artifact_e0005389-4677-436a-b3f9-20e2812ac8e3.py",
+      "date": "2026-08-04"
+    },
+    {
+      "hotkey_name": "hk-67-11",
+      "hotkey_address": "5GWH1rMxPzvwSLV3wZimQt2iMek8JeGNTtoXjs7Wv7uiXgmn",
+      "on_chain_uid": 160,
+      "agent_name": "uid_72",
+      "filename": "uid_72__artifact_808805b2-b5a4-44af-b13b-1a215a26b78b.py",
+      "date": "2026-08-04"
+    }
+  ]
+}

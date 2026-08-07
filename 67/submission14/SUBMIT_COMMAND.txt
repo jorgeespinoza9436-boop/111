@@ -1,0 +1,6 @@
+# Submit all submission14 agents (26) to registered SN67 hotkeys
+# History: /root/turtle/111/67/submission14/submission_history_20260803T074035Z.json
+# Map:     /root/turtle/111/67/submission14/hotkey_map.json
+
+cd /root/turtle/harnyx
+bash /root/turtle/111/67/submission14/submit_all.sh 26

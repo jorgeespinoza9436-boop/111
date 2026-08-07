@@ -1,0 +1,548 @@
+{
+  "created_at": "2026-08-06T09:08:56.481008Z",
+  "archived_at": "2026-08-06T09:17:07.586305Z",
+  "wallet_name": "money",
+  "coldkey_ss58": "5HECJHXNvsFw7pYookNbk2xekL55oory2ewrWZw6rT7BHrZq",
+  "netuid": 67,
+  "network": "finney",
+  "agent_dir": "/root/turtle/111/67/sub17-submitted",
+  "source_dir": "/root/turtle/111/67/submittion17",
+  "match": "random",
+  "random_seed": 202608069,
+  "match_count": 9,
+  "matched_count": 9,
+  "submitted_count": 9,
+  "entries": [
+    {
+      "hotkey_name": "hk-67-1",
+      "hotkey_address": "5FFLF6CgQgeDn6bgzFGF2FHMecfCA5gEGQNKZQkDc5AwypZU",
+      "hotkey_ss58": "5FFLF6CgQgeDn6bgzFGF2FHMecfCA5gEGQNKZQkDc5AwypZU",
+      "on_chain_uid": 23,
+      "uid": 23,
+      "agent_name": "uid_41",
+      "agent_uid_label": "uid_41",
+      "filename": "uid_41__artifact_2812f115-ee98-490b-82bb-bbb77c9be17d.py",
+      "agent_path": "/root/turtle/111/67/sub17-submitted/uid_41__artifact_2812f115-ee98-490b-82bb-bbb77c9be17d.py",
+      "date": "2026-08-06",
+      "matched_at": "2026-08-06T09:08:56.481008Z",
+      "match": "random",
+      "random_seed": 202608069,
+      "wallet_name": "money",
+      "netuid": 67,
+      "network": "finney",
+      "status": "submitted",
+      "submit_status": "success",
+      "artifact_id": "9f4ee3d8-7324-45b5-ac9d-271b5b7df043",
+      "content_hash": "3d1c26d587c83c0a781ffa6945f47ddb8ddc4753f08948aa853f6cc29415148c",
+      "size_bytes": 214526,
+      "submitted_at": "2026-08-06T09:13:54.786174Z",
+      "providers": {
+        "llm_providers": [
+          "openrouter"
+        ],
+        "search_providers": [
+          "desearch",
+          "parallel"
+        ],
+        "fetch_providers": [
+          "parallel"
+        ],
+        "models": [
+          "deepseek/deepseek-v3.2"
+        ],
+        "primary_llm_provider": "openrouter",
+        "primary_search_provider": "desearch",
+        "providers_summary": "llm:openrouter | search:desearch+parallel | fetch:parallel"
+      },
+      "llm_providers": [
+        "openrouter"
+      ],
+      "search_providers": [
+        "desearch",
+        "parallel"
+      ],
+      "fetch_providers": [
+        "parallel"
+      ],
+      "primary_llm_provider": "openrouter",
+      "primary_search_provider": "desearch",
+      "providers_summary": "llm:openrouter | search:desearch+parallel | fetch:parallel",
+      "models": [
+        "deepseek/deepseek-v3.2"
+      ]
+    },
+    {
+      "hotkey_name": "hk-67-13",
+      "hotkey_address": "5CSzbYHqHWignpNDpepZjQ29Sg3AXdWyTa3Kq5wNDZhkvbrK",
+      "hotkey_ss58": "5CSzbYHqHWignpNDpepZjQ29Sg3AXdWyTa3Kq5wNDZhkvbrK",
+      "on_chain_uid": 105,
+      "uid": 105,
+      "agent_name": "uid_69",
+      "agent_uid_label": "uid_69",
+      "filename": "uid_69__artifact_2f2cde69-50d5-4df6-826c-65fd98b332a7.py",
+      "agent_path": "/root/turtle/111/67/sub17-submitted/uid_69__artifact_2f2cde69-50d5-4df6-826c-65fd98b332a7.py",
+      "date": "2026-08-06",
+      "matched_at": "2026-08-06T09:08:56.481008Z",
+      "match": "random",
+      "random_seed": 202608069,
+      "wallet_name": "money",
+      "netuid": 67,
+      "network": "finney",
+      "status": "submitted",
+      "submit_status": "success",
+      "artifact_id": "6f7440dd-989d-4b81-bdc0-f8ef59d51798",
+      "content_hash": "07ab3c2e89dc96bd3cf7b77fbba3f7a83d95c2c99e0c9f58da2fc867de5816b5",
+      "size_bytes": 200427,
+      "submitted_at": "2026-08-06T09:13:52.353747Z",
+      "providers": {
+        "llm_providers": [
+          "chutes",
+          "openrouter"
+        ],
+        "search_providers": [
+          "desearch",
+          "parallel"
+        ],
+        "fetch_providers": [],
+        "models": [
+          "deepseek/deepseek-v3.2",
+          "google/gemma-4-31B-turbo-TEE",
+          "google/gemma-4-31b-it",
+          "openai/gpt-oss-120b",
+          "qwen/qwen3-embedding-8b",
+          "z-ai/glm-5"
+        ],
+        "primary_llm_provider": "chutes",
+        "primary_search_provider": "desearch",
+        "providers_summary": "llm:chutes+openrouter | search:desearch+parallel"
+      },
+      "llm_providers": [
+        "chutes",
+        "openrouter"
+      ],
+      "search_providers": [
+        "desearch",
+        "parallel"
+      ],
+      "fetch_providers": [],
+      "primary_llm_provider": "chutes",
+      "primary_search_provider": "desearch",
+      "providers_summary": "llm:chutes+openrouter | search:desearch+parallel",
+      "models": [
+        "deepseek/deepseek-v3.2",
+        "google/gemma-4-31B-turbo-TEE",
+        "google/gemma-4-31b-it",
+        "openai/gpt-oss-120b",
+        "qwen/qwen3-embedding-8b",
+        "z-ai/glm-5"
+      ]
+    },
+    {
+      "hotkey_name": "hk-67-15",
+      "hotkey_address": "5H1j52nH6fuPEeii8drWSeH1BgizCqqwh3c6uNYuLPcopiGB",
+      "hotkey_ss58": "5H1j52nH6fuPEeii8drWSeH1BgizCqqwh3c6uNYuLPcopiGB",
+      "on_chain_uid": 182,
+      "uid": 182,
+      "agent_name": "uid_177",
+      "agent_uid_label": "uid_177",
+      "filename": "uid_177__artifact_5921b5bb-99c4-4f29-9845-0c9accec5bc2.py",
+      "agent_path": "/root/turtle/111/67/sub17-submitted/uid_177__artifact_5921b5bb-99c4-4f29-9845-0c9accec5bc2.py",
+      "date": "2026-08-06",
+      "matched_at": "2026-08-06T09:08:56.481008Z",
+      "match": "random",
+      "random_seed": 202608069,
+      "wallet_name": "money",
+      "netuid": 67,
+      "network": "finney",
+      "status": "submitted",
+      "submit_status": "success",
+      "artifact_id": "60c734b2-8aa8-48fb-9e19-8cb048df7275",
+      "content_hash": "badcc78b8f02e2cc784a3a111d39411f49b84ca1667323fe79e2649abc991941",
+      "size_bytes": 155050,
+      "submitted_at": "2026-08-06T09:13:51.971052Z",
+      "providers": {
+        "llm_providers": [
+          "ai_gateway",
+          "openrouter"
+        ],
+        "search_providers": [
+          "desearch",
+          "parallel"
+        ],
+        "fetch_providers": [],
+        "models": [
+          "deepseek/deepseek-v3.2"
+        ],
+        "primary_llm_provider": "ai_gateway",
+        "primary_search_provider": "desearch",
+        "providers_summary": "llm:ai_gateway+openrouter | search:desearch+parallel"
+      },
+      "llm_providers": [
+        "ai_gateway",
+        "openrouter"
+      ],
+      "search_providers": [
+        "desearch",
+        "parallel"
+      ],
+      "fetch_providers": [],
+      "primary_llm_provider": "ai_gateway",
+      "primary_search_provider": "desearch",
+      "providers_summary": "llm:ai_gateway+openrouter | search:desearch+parallel",
+      "models": [
+        "deepseek/deepseek-v3.2"
+      ]
+    },
+    {
+      "hotkey_name": "hk-67-20",
+      "hotkey_address": "5CACD5ojXDGRuVjA3o15nFWhuKqM6P31nAddhTwuhQv8mai8",
+      "hotkey_ss58": "5CACD5ojXDGRuVjA3o15nFWhuKqM6P31nAddhTwuhQv8mai8",
+      "on_chain_uid": 208,
+      "uid": 208,
+      "agent_name": "uid_71",
+      "agent_uid_label": "uid_71",
+      "filename": "uid_71__artifact_818ef17a-10c8-4505-9a95-1958dc24eab2.py",
+      "agent_path": "/root/turtle/111/67/sub17-submitted/uid_71__artifact_818ef17a-10c8-4505-9a95-1958dc24eab2.py",
+      "date": "2026-08-06",
+      "matched_at": "2026-08-06T09:08:56.481008Z",
+      "match": "random",
+      "random_seed": 202608069,
+      "wallet_name": "money",
+      "netuid": 67,
+      "network": "finney",
+      "status": "submitted",
+      "submit_status": "success",
+      "artifact_id": "e526dbdc-9b1a-460e-a60e-5257a14a81a7",
+      "content_hash": "dab7e40b3ed696dbd3c9cf5c817f4dda9605a252d3c40bab39fa6692a9c4154e",
+      "size_bytes": 242672,
+      "submitted_at": "2026-08-06T09:13:56.274978Z",
+      "providers": {
+        "llm_providers": [
+          "ai_gateway",
+          "chutes",
+          "openrouter"
+        ],
+        "search_providers": [
+          "desearch",
+          "parallel"
+        ],
+        "fetch_providers": [],
+        "models": [
+          "deepseek/deepseek-v3.2",
+          "google/gemma-4-31B-turbo-TEE",
+          "google/gemma-4-31b-it",
+          "openai/gpt-oss-120b",
+          "qwen/qwen3-embedding-8b",
+          "thinkingmachines/inkling",
+          "z-ai/glm-5"
+        ],
+        "primary_llm_provider": "ai_gateway",
+        "primary_search_provider": "desearch",
+        "providers_summary": "llm:ai_gateway+chutes+openrouter | search:desearch+parallel"
+      },
+      "llm_providers": [
+        "ai_gateway",
+        "chutes",
+        "openrouter"
+      ],
+      "search_providers": [
+        "desearch",
+        "parallel"
+      ],
+      "fetch_providers": [],
+      "primary_llm_provider": "ai_gateway",
+      "primary_search_provider": "desearch",
+      "providers_summary": "llm:ai_gateway+chutes+openrouter | search:desearch+parallel",
+      "models": [
+        "deepseek/deepseek-v3.2",
+        "google/gemma-4-31B-turbo-TEE",
+        "google/gemma-4-31b-it",
+        "openai/gpt-oss-120b",
+        "qwen/qwen3-embedding-8b",
+        "thinkingmachines/inkling",
+        "z-ai/glm-5"
+      ]
+    },
+    {
+      "hotkey_name": "hk-67-22",
+      "hotkey_address": "5GTogHFaYQQWGcmvVE4xmizpobBSuhC2efLH4PvscNEu5fcm",
+      "hotkey_ss58": "5GTogHFaYQQWGcmvVE4xmizpobBSuhC2efLH4PvscNEu5fcm",
+      "on_chain_uid": 92,
+      "uid": 92,
+      "agent_name": "uid_182",
+      "agent_uid_label": "uid_182",
+      "filename": "uid_182__artifact_09249d84-37d9-4992-aa64-b18186f8707f.py",
+      "agent_path": "/root/turtle/111/67/sub17-submitted/uid_182__artifact_09249d84-37d9-4992-aa64-b18186f8707f.py",
+      "date": "2026-08-06",
+      "matched_at": "2026-08-06T09:08:56.481008Z",
+      "match": "random",
+      "random_seed": 202608069,
+      "wallet_name": "money",
+      "netuid": 67,
+      "network": "finney",
+      "status": "submitted",
+      "submit_status": "success",
+      "artifact_id": "9979b81d-3a21-441c-93c4-418a77d6197a",
+      "content_hash": "aa79a41f3218b3013eb88848632bb151425e0e26a0b1b1f9e8f79fb1bc982861",
+      "size_bytes": 130820,
+      "submitted_at": "2026-08-06T09:13:52.451482Z",
+      "providers": {
+        "llm_providers": [
+          "ai_gateway",
+          "openrouter"
+        ],
+        "search_providers": [
+          "desearch",
+          "parallel"
+        ],
+        "fetch_providers": [],
+        "models": [
+          "deepseek/deepseek-v3.2"
+        ],
+        "primary_llm_provider": "ai_gateway",
+        "primary_search_provider": "desearch",
+        "providers_summary": "llm:ai_gateway+openrouter | search:desearch+parallel"
+      },
+      "llm_providers": [
+        "ai_gateway",
+        "openrouter"
+      ],
+      "search_providers": [
+        "desearch",
+        "parallel"
+      ],
+      "fetch_providers": [],
+      "primary_llm_provider": "ai_gateway",
+      "primary_search_provider": "desearch",
+      "providers_summary": "llm:ai_gateway+openrouter | search:desearch+parallel",
+      "models": [
+        "deepseek/deepseek-v3.2"
+      ]
+    },
+    {
+      "hotkey_name": "hk-67-24",
+      "hotkey_address": "5FCTj2DNfMCudQw9YNkQWpgk8zBiJs8TCiWqg9t9BDPatG2z",
+      "hotkey_ss58": "5FCTj2DNfMCudQw9YNkQWpgk8zBiJs8TCiWqg9t9BDPatG2z",
+      "on_chain_uid": 216,
+      "uid": 216,
+      "agent_name": "uid_246",
+      "agent_uid_label": "uid_246",
+      "filename": "uid_246__artifact_1ecdad96-bb6c-41f9-8f5e-e93dbf86cbf1.py",
+      "agent_path": "/root/turtle/111/67/sub17-submitted/uid_246__artifact_1ecdad96-bb6c-41f9-8f5e-e93dbf86cbf1.py",
+      "date": "2026-08-06",
+      "matched_at": "2026-08-06T09:08:56.481008Z",
+      "match": "random",
+      "random_seed": 202608069,
+      "wallet_name": "money",
+      "netuid": 67,
+      "network": "finney",
+      "status": "submitted",
+      "submit_status": "success",
+      "artifact_id": "ec8cb20f-81e7-4583-99a3-5f05ddd9ce0c",
+      "content_hash": "fa6b559c44bd4dfc67eeb3a0ddd0d3313bc1cf17210ba4ac944d96d38a848992",
+      "size_bytes": 347463,
+      "submitted_at": "2026-08-06T09:13:54.115732Z",
+      "providers": {
+        "llm_providers": [
+          "openrouter"
+        ],
+        "search_providers": [
+          "desearch",
+          "parallel"
+        ],
+        "fetch_providers": [],
+        "models": [
+          "deepseek/deepseek-v3.2"
+        ],
+        "primary_llm_provider": "openrouter",
+        "primary_search_provider": "desearch",
+        "providers_summary": "llm:openrouter | search:desearch+parallel"
+      },
+      "llm_providers": [
+        "openrouter"
+      ],
+      "search_providers": [
+        "desearch",
+        "parallel"
+      ],
+      "fetch_providers": [],
+      "primary_llm_provider": "openrouter",
+      "primary_search_provider": "desearch",
+      "providers_summary": "llm:openrouter | search:desearch+parallel",
+      "models": [
+        "deepseek/deepseek-v3.2"
+      ]
+    },
+    {
+      "hotkey_name": "hk-67-26",
+      "hotkey_address": "5FpmGyfU3wfppD9qsBg7e8NawA7J9yZLMuVY81WdnsaJ1U4B",
+      "hotkey_ss58": "5FpmGyfU3wfppD9qsBg7e8NawA7J9yZLMuVY81WdnsaJ1U4B",
+      "on_chain_uid": 151,
+      "uid": 151,
+      "agent_name": "uid_112",
+      "agent_uid_label": "uid_112",
+      "filename": "uid_112__artifact_179f4796-1dbe-424a-929f-6b01f280187d.py",
+      "agent_path": "/root/turtle/111/67/sub17-submitted/uid_112__artifact_179f4796-1dbe-424a-929f-6b01f280187d.py",
+      "date": "2026-08-06",
+      "matched_at": "2026-08-06T09:08:56.481008Z",
+      "match": "random",
+      "random_seed": 202608069,
+      "wallet_name": "money",
+      "netuid": 67,
+      "network": "finney",
+      "status": "submitted",
+      "submit_status": "success",
+      "artifact_id": "851a46e8-4cfc-45a4-b4ed-a2b99b399353",
+      "content_hash": "4e27c3969737fa964baced5d160b7304018e7eefa62a50fec063c46997d1a1a1",
+      "size_bytes": 137708,
+      "submitted_at": "2026-08-06T09:13:57.212122Z",
+      "providers": {
+        "llm_providers": [
+          "ai_gateway",
+          "openrouter"
+        ],
+        "search_providers": [
+          "desearch",
+          "parallel"
+        ],
+        "fetch_providers": [],
+        "models": [
+          "deepseek/deepseek-v3.2"
+        ],
+        "primary_llm_provider": "ai_gateway",
+        "primary_search_provider": "desearch",
+        "providers_summary": "llm:ai_gateway+openrouter | search:desearch+parallel"
+      },
+      "llm_providers": [
+        "ai_gateway",
+        "openrouter"
+      ],
+      "search_providers": [
+        "desearch",
+        "parallel"
+      ],
+      "fetch_providers": [],
+      "primary_llm_provider": "ai_gateway",
+      "primary_search_provider": "desearch",
+      "providers_summary": "llm:ai_gateway+openrouter | search:desearch+parallel",
+      "models": [
+        "deepseek/deepseek-v3.2"
+      ]
+    },
+    {
+      "hotkey_name": "hk-67-42",
+      "hotkey_address": "5EPW6pEkAPx6bryrEyFWtM3Ts4VkJwsYGcbRkvb9HMgnjWwC",
+      "hotkey_ss58": "5EPW6pEkAPx6bryrEyFWtM3Ts4VkJwsYGcbRkvb9HMgnjWwC",
+      "on_chain_uid": 50,
+      "uid": 50,
+      "agent_name": "uid_162",
+      "agent_uid_label": "uid_162",
+      "filename": "uid_162__artifact_2f510bbe-1568-456d-a8ab-fc96eccc4edf.py",
+      "agent_path": "/root/turtle/111/67/sub17-submitted/uid_162__artifact_2f510bbe-1568-456d-a8ab-fc96eccc4edf.py",
+      "date": "2026-08-06",
+      "matched_at": "2026-08-06T09:08:56.481008Z",
+      "match": "random",
+      "random_seed": 202608069,
+      "wallet_name": "money",
+      "netuid": 67,
+      "network": "finney",
+      "status": "submitted",
+      "submit_status": "success",
+      "artifact_id": "7fd6cee1-65df-4959-a73e-e087a39e2cec",
+      "content_hash": "46543c498b5389323bf819c26745bfdfbfcb28333e3978622f1063f72a5548c0",
+      "size_bytes": 113365,
+      "submitted_at": "2026-08-06T09:13:53.319884Z",
+      "providers": {
+        "llm_providers": [
+          "openrouter"
+        ],
+        "search_providers": [
+          "desearch",
+          "parallel"
+        ],
+        "fetch_providers": [
+          "parallel"
+        ],
+        "models": [
+          "deepseek/deepseek-v3.2"
+        ],
+        "primary_llm_provider": "openrouter",
+        "primary_search_provider": "desearch",
+        "providers_summary": "llm:openrouter | search:desearch+parallel | fetch:parallel"
+      },
+      "llm_providers": [
+        "openrouter"
+      ],
+      "search_providers": [
+        "desearch",
+        "parallel"
+      ],
+      "fetch_providers": [
+        "parallel"
+      ],
+      "primary_llm_provider": "openrouter",
+      "primary_search_provider": "desearch",
+      "providers_summary": "llm:openrouter | search:desearch+parallel | fetch:parallel",
+      "models": [
+        "deepseek/deepseek-v3.2"
+      ]
+    },
+    {
+      "hotkey_name": "hk-67-8",
+      "hotkey_address": "5C8CRzo6nVHY9tNyJ1xBJDzyUU5vSNYHEUouSRkAXbjZB6MN",
+      "hotkey_ss58": "5C8CRzo6nVHY9tNyJ1xBJDzyUU5vSNYHEUouSRkAXbjZB6MN",
+      "on_chain_uid": 177,
+      "uid": 177,
+      "agent_name": "uid_210",
+      "agent_uid_label": "uid_210",
+      "filename": "uid_210__artifact_7e3df84a-9895-42ac-8f46-8d7137117981.py",
+      "agent_path": "/root/turtle/111/67/sub17-submitted/uid_210__artifact_7e3df84a-9895-42ac-8f46-8d7137117981.py",
+      "date": "2026-08-06",
+      "matched_at": "2026-08-06T09:08:56.481008Z",
+      "match": "random",
+      "random_seed": 202608069,
+      "wallet_name": "money",
+      "netuid": 67,
+      "network": "finney",
+      "status": "submitted",
+      "submit_status": "success",
+      "artifact_id": "0798af64-0f5d-480e-bb4e-a8be32019366",
+      "content_hash": "95c20f904f2df052e91ea6b2cfa5553a4e9500536eca7b9f0b61495f69a54226",
+      "size_bytes": 185008,
+      "submitted_at": "2026-08-06T09:13:53.283560Z",
+      "providers": {
+        "llm_providers": [
+          "chutes",
+          "openrouter"
+        ],
+        "search_providers": [
+          "desearch",
+          "parallel"
+        ],
+        "fetch_providers": [],
+        "models": [
+          "deepseek/deepseek-v3.2"
+        ],
+        "primary_llm_provider": "chutes",
+        "primary_search_provider": "desearch",
+        "providers_summary": "llm:chutes+openrouter | search:desearch+parallel"
+      },
+      "llm_providers": [
+        "chutes",
+        "openrouter"
+      ],
+      "search_providers": [
+        "desearch",
+        "parallel"
+      ],
+      "fetch_providers": [],
+      "primary_llm_provider": "chutes",
+      "primary_search_provider": "desearch",
+      "providers_summary": "llm:chutes+openrouter | search:desearch+parallel",
+      "models": [
+        "deepseek/deepseek-v3.2"
+      ]
+    }
+  ],
+  "providers_enriched_at": "2026-08-06T13:03:20.517986Z"
+}

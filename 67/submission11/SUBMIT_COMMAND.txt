@@ -1,0 +1,27 @@
+Submit all 14 matched submission11 agents:
+
+  bash /root/turtle/111/67/submission11/submit_all.sh
+
+Custom parallelism:
+
+  bash /root/turtle/111/67/submission11/submit_all.sh 8
+
+History:
+  /root/turtle/111/67/submission11/submission_history_20260801T093139Z.json
+  /root/turtle/111/67/submission11/submission_history.json
+  /root/turtle/111/67/submission11/hotkey_map.json
+  /root/turtle/111/67/submission11/hotkey_map.tsv
+
+Unmatched agents (9):
+    uid_51__artifact_7610b2af-ef0a-4960-a6f9-197657dbb55d.py
+  uid_147__artifact_577d4ecf-c589-4d52-9cc9-11f5f02b98a8.py
+  uid_26__artifact_5eade7c2-4149-4f24-9ca3-814242254d67.py
+  uid_168__artifact_0e07527d-fd7e-4a39-ab91-9a66eba4fb16.py
+  uid_224__artifact_ac5ab4b5-da97-4e3d-a6eb-07706a410ced.py
+  uid_71__artifact_d137e851-f3c4-4811-9193-98bfd45fddb7.py
+  uid_208__artifact_226f8de0-0452-4184-88d7-7f68fced0088.py
+  uid_211__artifact_3be34f76-132f-4868-b46a-0bd60c308b8a.py
+  uid_210__artifact_a54b619b-1b15-4653-97bf-2007c3f1f468.py
+
+Note: Only 14 registered hotkeys were outside submission10's submitted set;
+matched 14 of 23 agents.

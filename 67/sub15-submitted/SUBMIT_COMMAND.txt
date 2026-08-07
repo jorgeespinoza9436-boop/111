@@ -1,0 +1,8 @@
+# Submit submittion15 agents (7) to registered-UNSUBMITTED SN67 hotkeys only
+# Excluded submitted hotkeys from: /root/turtle/111/67/sub14-unsubmitted/submission_history_20260803T140237Z.json
+# History: /root/turtle/111/67/submittion15/submission_history_20260804T093123Z.json
+# Map:     /root/turtle/111/67/submittion15/hotkey_map.json
+# Seed:    20260804 (uid_182 forced included)
+
+cd /root/turtle/harnyx
+bash /root/turtle/111/67/submittion15/submit_all.sh 7

@@ -1,0 +1,88 @@
+{
+  "created_at": "2026-08-05T06:38:37.784254+00:00",
+  "wallet_name": "money",
+  "netuid": 67,
+  "random_seed": 20260805,
+  "entries": [
+    {
+      "hotkey_name": "hk-67-7",
+      "hotkey_address": "5D9f8Ri9kcPnmCSXzs5oPhZPsXqgHALCMArrqnGSFxYhgSYL",
+      "on_chain_uid": 38,
+      "agent_name": "uid_48",
+      "filename": "uid_48__artifact_8bb7de1d-5297-4ba7-a6f4-913d74f10372.py",
+      "date": "2026-08-05"
+    },
+    {
+      "hotkey_name": "hk-67-27",
+      "hotkey_address": "5Gdqiqa2Kj93tAcTPYaWgjbWGyi3FYZ38N4NjTdQ9vYhkVjG",
+      "on_chain_uid": 244,
+      "agent_name": "uid_244",
+      "filename": "uid_244__artifact_26f86ddd-9fbe-4d18-bc05-8f5bccb9682c.py",
+      "date": "2026-08-05"
+    },
+    {
+      "hotkey_name": "hk-67-21",
+      "hotkey_address": "5DLYKSZS2L7gRrq2JatxgJn2TneUQQpsiY89LiLktk6Rn8jq",
+      "on_chain_uid": 223,
+      "agent_name": "uid_233",
+      "filename": "uid_233__artifact_850a1a55-25ae-4d57-9dda-3c104a8b72be.py",
+      "date": "2026-08-05"
+    },
+    {
+      "hotkey_name": "hk-67-5",
+      "hotkey_address": "5HGofxdSC1fwwFdE5j3ZHpnLjPsgjSNpz8j5DXeus263aDQz",
+      "on_chain_uid": 46,
+      "agent_name": "uid_127",
+      "filename": "uid_127__artifact_67672675-e692-4756-9856-ae62b2c6d383.py",
+      "date": "2026-08-05"
+    },
+    {
+      "hotkey_name": "hk-67-3",
+      "hotkey_address": "5D5fNLa5jm45zmw9gQiyzbNKdC2dowUNEos2DWUWh64ir6oz",
+      "on_chain_uid": 234,
+      "agent_name": "uid_236",
+      "filename": "uid_236__artifact_45941d11-263e-4eb7-82f9-dc62161dd86d.py",
+      "date": "2026-08-05"
+    },
+    {
+      "hotkey_name": "hk-67-43",
+      "hotkey_address": "5GH8REwcYtYMupG17jgbNHQZR5zjwHxVyr9y8V6eNWKCFvyB",
+      "on_chain_uid": 90,
+      "agent_name": "uid_61",
+      "filename": "uid_61__artifact_3b7ecf00-dc94-4f3d-989b-a5e9b932c4e8.py",
+      "date": "2026-08-05"
+    },
+    {
+      "hotkey_name": "hk-67-20",
+      "hotkey_address": "5CACD5ojXDGRuVjA3o15nFWhuKqM6P31nAddhTwuhQv8mai8",
+      "on_chain_uid": 208,
+      "agent_name": "uid_130",
+      "filename": "uid_130__artifact_fc7f7bf6-f28f-4ec1-99ca-743014045a48.py",
+      "date": "2026-08-05"
+    },
+    {
+      "hotkey_name": "hk-67-30",
+      "hotkey_address": "5ELCtSSVcsxPYeFnYe7i2xwjDg3vKLgx7b4c6Cjrv9FhCvtD",
+      "on_chain_uid": 132,
+      "agent_name": "uid_250",
+      "filename": "uid_250__artifact_2e9e8cf8-20b0-49ab-9c9d-38a957233fbf.py",
+      "date": "2026-08-05"
+    },
+    {
+      "hotkey_name": "hk-67-13",
+      "hotkey_address": "5CSzbYHqHWignpNDpepZjQ29Sg3AXdWyTa3Kq5wNDZhkvbrK",
+      "on_chain_uid": 105,
+      "agent_name": "uid_209",
+      "filename": "uid_209__artifact_c2264f85-635c-41a7-922d-4fa3108dc30f.py",
+      "date": "2026-08-05"
+    },
+    {
+      "hotkey_name": "hk-67-24",
+      "hotkey_address": "5FCTj2DNfMCudQw9YNkQWpgk8zBiJs8TCiWqg9t9BDPatG2z",
+      "on_chain_uid": 216,
+      "agent_name": "uid_29",
+      "filename": "uid_29__artifact_369deb3c-97ca-4647-8340-9c4e3793e51c.py",
+      "date": "2026-08-05"
+    }
+  ]
+}

@@ -1,0 +1,245 @@
+{
+  "created_at": "2026-08-03T07:40:35.311611+00:00",
+  "wallet_name": "money",
+  "netuid": 67,
+  "network": "finney",
+  "match": "random",
+  "random_seed": 20260803,
+  "matched_count": 26,
+  "entries": [
+    {
+      "hotkey_name": "hk-67-3",
+      "hotkey_address": "5D5fNLa5jm45zmw9gQiyzbNKdC2dowUNEos2DWUWh64ir6oz",
+      "on_chain_uid": 65,
+      "agent_name": "uid_81",
+      "filename": "uid_81__artifact_b75fad9d-8c6a-419d-9b3e-9cb490ea50f4.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_81__artifact_b75fad9d-8c6a-419d-9b3e-9cb490ea50f4.py",
+      "date": "2026-08-03"
+    },
+    {
+      "hotkey_name": "hk-67-4",
+      "hotkey_address": "5DjppZuF7hF2YUjUoAb6iEVyQGVdmrJoYjJznbJGfmA9Z9Yu",
+      "on_chain_uid": 17,
+      "agent_name": "uid_36",
+      "filename": "uid_36__artifact_01cc1895-f9e5-4eb1-91dd-69e773795cde.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_36__artifact_01cc1895-f9e5-4eb1-91dd-69e773795cde.py",
+      "date": "2026-08-03"
+    },
+    {
+      "hotkey_name": "hk-67-5",
+      "hotkey_address": "5HGofxdSC1fwwFdE5j3ZHpnLjPsgjSNpz8j5DXeus263aDQz",
+      "on_chain_uid": 46,
+      "agent_name": "uid_180",
+      "filename": "uid_180__artifact_ac8c3c1e-3747-48d9-9034-5bd2437be589.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_180__artifact_ac8c3c1e-3747-48d9-9034-5bd2437be589.py",
+      "date": "2026-08-03"
+    },
+    {
+      "hotkey_name": "hk-67-6",
+      "hotkey_address": "5GxXmRLP8WHRJxfeZJN6ho9nu9ZCWoNbaWaqWbF8dd25soff",
+      "on_chain_uid": 60,
+      "agent_name": "uid_74",
+      "filename": "uid_74__artifact_75385029-d699-4425-9150-69e49461a530.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_74__artifact_75385029-d699-4425-9150-69e49461a530.py",
+      "date": "2026-08-03"
+    },
+    {
+      "hotkey_name": "hk-67-7",
+      "hotkey_address": "5D9f8Ri9kcPnmCSXzs5oPhZPsXqgHALCMArrqnGSFxYhgSYL",
+      "on_chain_uid": 195,
+      "agent_name": "uid_152",
+      "filename": "uid_152__artifact_df483f56-ecd8-4f0c-9386-09207cc56b8b.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_152__artifact_df483f56-ecd8-4f0c-9386-09207cc56b8b.py",
+      "date": "2026-08-03"
+    },
+    {
+      "hotkey_name": "hk-67-8",
+      "hotkey_address": "5C8CRzo6nVHY9tNyJ1xBJDzyUU5vSNYHEUouSRkAXbjZB6MN",
+      "on_chain_uid": 177,
+      "agent_name": "uid_190",
+      "filename": "uid_190__artifact_6b46464e-fc73-451f-ba81-3eadc0f8121d.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_190__artifact_6b46464e-fc73-451f-ba81-3eadc0f8121d.py",
+      "date": "2026-08-03"
+    },
+    {
+      "hotkey_name": "hk-67-9",
+      "hotkey_address": "5HQhD4f3XRaUm2u8hz1bzWy7A2YNAKZxfsAVKTyYZQQMfqCP",
+      "on_chain_uid": 40,
+      "agent_name": "uid_79",
+      "filename": "uid_79__artifact_a76832d1-f906-45bd-9aca-492f87d84115.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_79__artifact_a76832d1-f906-45bd-9aca-492f87d84115.py",
+      "date": "2026-08-03"
+    },
+    {
+      "hotkey_name": "hk-67-14",
+      "hotkey_address": "5G9o3Qp9ibFiAduXNq9pK1AcxRQ51iVvssC5DYkfi3TWpeuG",
+      "on_chain_uid": 127,
+      "agent_name": "uid_15",
+      "filename": "uid_15__artifact_16b6a771-11a0-4296-857b-69c84483ec2b.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_15__artifact_16b6a771-11a0-4296-857b-69c84483ec2b.py",
+      "date": "2026-08-03"
+    },
+    {
+      "hotkey_name": "hk-67-17",
+      "hotkey_address": "5CtqhgZgxUCB3c1bY5Ng7W6SFHYR34Cri5H6JtWicNENwnaM",
+      "on_chain_uid": 226,
+      "agent_name": "uid_45",
+      "filename": "uid_45__artifact_97ecc03c-9b28-451c-99a9-6f4930b93ff0.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_45__artifact_97ecc03c-9b28-451c-99a9-6f4930b93ff0.py",
+      "date": "2026-08-03"
+    },
+    {
+      "hotkey_name": "hk-67-20",
+      "hotkey_address": "5CACD5ojXDGRuVjA3o15nFWhuKqM6P31nAddhTwuhQv8mai8",
+      "on_chain_uid": 98,
+      "agent_name": "uid_236",
+      "filename": "uid_236__artifact_f7d308a1-9a72-430c-97db-4675420ce6eb.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_236__artifact_f7d308a1-9a72-430c-97db-4675420ce6eb.py",
+      "date": "2026-08-03"
+    },
+    {
+      "hotkey_name": "hk-67-21",
+      "hotkey_address": "5DLYKSZS2L7gRrq2JatxgJn2TneUQQpsiY89LiLktk6Rn8jq",
+      "on_chain_uid": 105,
+      "agent_name": "uid_48",
+      "filename": "uid_48__artifact_5a9580be-4f8d-4ee5-8b58-ce437603f99e.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_48__artifact_5a9580be-4f8d-4ee5-8b58-ce437603f99e.py",
+      "date": "2026-08-03"
+    },
+    {
+      "hotkey_name": "hk-67-22",
+      "hotkey_address": "5GTogHFaYQQWGcmvVE4xmizpobBSuhC2efLH4PvscNEu5fcm",
+      "on_chain_uid": 92,
+      "agent_name": "uid_102",
+      "filename": "uid_102__artifact_62d6f71d-e9f9-4379-9d11-3b2cd0cd27d8.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_102__artifact_62d6f71d-e9f9-4379-9d11-3b2cd0cd27d8.py",
+      "date": "2026-08-03"
+    },
+    {
+      "hotkey_name": "hk-67-23",
+      "hotkey_address": "5Fn6y1uZGibEW5GtKByE4UCQQCysBk5QaBPJfF2zN5jLYX4H",
+      "on_chain_uid": 44,
+      "agent_name": "uid_27",
+      "filename": "uid_27__artifact_82b39caf-9310-48f7-9f01-b3b4a4605e7b.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_27__artifact_82b39caf-9310-48f7-9f01-b3b4a4605e7b.py",
+      "date": "2026-08-03"
+    },
+    {
+      "hotkey_name": "hk-67-24",
+      "hotkey_address": "5FCTj2DNfMCudQw9YNkQWpgk8zBiJs8TCiWqg9t9BDPatG2z",
+      "on_chain_uid": 227,
+      "agent_name": "uid_119",
+      "filename": "uid_119__artifact_c1726763-bb0c-4a33-a230-f3215b19ba2c.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_119__artifact_c1726763-bb0c-4a33-a230-f3215b19ba2c.py",
+      "date": "2026-08-03"
+    },
+    {
+      "hotkey_name": "hk-67-25",
+      "hotkey_address": "5HmUEZ65n5hfpoANptv8Xqx6eknnmvYbXV9ySCwwbjv5EXk9",
+      "on_chain_uid": 43,
+      "agent_name": "uid_223",
+      "filename": "uid_223__artifact_2aefd284-f397-4dba-9896-6175f4ed0bb8.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_223__artifact_2aefd284-f397-4dba-9896-6175f4ed0bb8.py",
+      "date": "2026-08-03"
+    },
+    {
+      "hotkey_name": "hk-67-26",
+      "hotkey_address": "5FpmGyfU3wfppD9qsBg7e8NawA7J9yZLMuVY81WdnsaJ1U4B",
+      "on_chain_uid": 151,
+      "agent_name": "uid_85",
+      "filename": "uid_85__artifact_2d0f711a-e3c1-4dcc-b0a2-0f3e57db0e82.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_85__artifact_2d0f711a-e3c1-4dcc-b0a2-0f3e57db0e82.py",
+      "date": "2026-08-03"
+    },
+    {
+      "hotkey_name": "hk-67-27",
+      "hotkey_address": "5Gdqiqa2Kj93tAcTPYaWgjbWGyi3FYZ38N4NjTdQ9vYhkVjG",
+      "on_chain_uid": 84,
+      "agent_name": "uid_117",
+      "filename": "uid_117__artifact_5e36c315-0104-4edf-bee5-1c2179ef182e.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_117__artifact_5e36c315-0104-4edf-bee5-1c2179ef182e.py",
+      "date": "2026-08-03"
+    },
+    {
+      "hotkey_name": "hk-67-30",
+      "hotkey_address": "5ELCtSSVcsxPYeFnYe7i2xwjDg3vKLgx7b4c6Cjrv9FhCvtD",
+      "on_chain_uid": 125,
+      "agent_name": "uid_212",
+      "filename": "uid_212__artifact_df44f634-1fbb-4e32-bfc0-16eda679170f.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_212__artifact_df44f634-1fbb-4e32-bfc0-16eda679170f.py",
+      "date": "2026-08-03"
+    },
+    {
+      "hotkey_name": "hk-67-33",
+      "hotkey_address": "5ER9h9Nh5PrcErAsamt9o2fkRY6XrDcxp6yffhUwP4VjAmpM",
+      "on_chain_uid": 182,
+      "agent_name": "uid_232",
+      "filename": "uid_232__artifact_0900ae99-b0e7-4c11-9a66-454e500fc4fd.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_232__artifact_0900ae99-b0e7-4c11-9a66-454e500fc4fd.py",
+      "date": "2026-08-03"
+    },
+    {
+      "hotkey_name": "hk-67-39",
+      "hotkey_address": "5DFdZnet3LDiddZYGQ2VoMQyhc6mJvRmxPvEPXhdDrYGtVQt",
+      "on_chain_uid": 59,
+      "agent_name": "uid_250",
+      "filename": "uid_250__artifact_3134bbb2-abe5-40fa-b5a1-b6b6f8d8ac85.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_250__artifact_3134bbb2-abe5-40fa-b5a1-b6b6f8d8ac85.py",
+      "date": "2026-08-03"
+    },
+    {
+      "hotkey_name": "hk-67-40",
+      "hotkey_address": "5F1DLMkVBjaD3HxF8UrjemCdDfiHpmuZzu4vpz4NaSuGvuWk",
+      "on_chain_uid": 181,
+      "agent_name": "uid_204",
+      "filename": "uid_204__artifact_10d85000-c0ca-415f-bcce-32316370286e.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_204__artifact_10d85000-c0ca-415f-bcce-32316370286e.py",
+      "date": "2026-08-03"
+    },
+    {
+      "hotkey_name": "hk-67-41",
+      "hotkey_address": "5Dt6hhZryXZWC8hGePzg3ugp8NVLqzJhgQFtwUFNMpkiRw34",
+      "on_chain_uid": 10,
+      "agent_name": "uid_245",
+      "filename": "uid_245__artifact_75bbb33c-a247-4381-8bfd-b88c1ffda5a1.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_245__artifact_75bbb33c-a247-4381-8bfd-b88c1ffda5a1.py",
+      "date": "2026-08-03"
+    },
+    {
+      "hotkey_name": "hk-67-42",
+      "hotkey_address": "5EPW6pEkAPx6bryrEyFWtM3Ts4VkJwsYGcbRkvb9HMgnjWwC",
+      "on_chain_uid": 104,
+      "agent_name": "uid_2",
+      "filename": "uid_2__artifact_4b8f7b4c-dfe5-4af4-8ccd-26a9f395bf2d.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_2__artifact_4b8f7b4c-dfe5-4af4-8ccd-26a9f395bf2d.py",
+      "date": "2026-08-03"
+    },
+    {
+      "hotkey_name": "hk-67-43",
+      "hotkey_address": "5GH8REwcYtYMupG17jgbNHQZR5zjwHxVyr9y8V6eNWKCFvyB",
+      "on_chain_uid": 90,
+      "agent_name": "uid_225",
+      "filename": "uid_225__artifact_c2ebe250-cfcb-4302-beac-76f51cccc052.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_225__artifact_c2ebe250-cfcb-4302-beac-76f51cccc052.py",
+      "date": "2026-08-03"
+    },
+    {
+      "hotkey_name": "hk-67-45",
+      "hotkey_address": "5CJb5e9r3RPtGxsAbHh8jQ3pRkhR2QABXy9qWJYJfuFMkJ4C",
+      "on_chain_uid": 172,
+      "agent_name": "uid_241",
+      "filename": "uid_241__artifact_714d86b8-b1cc-4bb1-bdfc-7887e519abe1.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_241__artifact_714d86b8-b1cc-4bb1-bdfc-7887e519abe1.py",
+      "date": "2026-08-03"
+    },
+    {
+      "hotkey_name": "hk-67-46",
+      "hotkey_address": "5GZKnrJjKJGmcz75j8sKEbPfxXmnLXpN4KxNZaGDEf17Sp5q",
+      "on_chain_uid": 162,
+      "agent_name": "uid_143",
+      "filename": "uid_143__artifact_bbf01675-2018-48f8-ac7e-ab98aae0af40.py",
+      "agent_path": "/root/turtle/111/67/submission14/uid_143__artifact_bbf01675-2018-48f8-ac7e-ab98aae0af40.py",
+      "date": "2026-08-03"
+    }
+  ]
+}
