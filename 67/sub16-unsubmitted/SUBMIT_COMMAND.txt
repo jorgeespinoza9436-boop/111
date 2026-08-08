@@ -1,0 +1,8 @@
+# Submit sub16-unsubmitted agents (29) to registered SN67 hotkeys
+# Excluded agents: uid_10, uid_16, uid_36, uid_41
+# History: /root/turtle/111/67/sub16-unsubmitted/submission_history_20260805T155949Z.json
+# Map:     /root/turtle/111/67/sub16-unsubmitted/hotkey_map.json
+# Seed:    202608051
+
+cd /root/turtle/harnyx
+bash /root/turtle/111/67/sub16-unsubmitted/submit_all.sh 29

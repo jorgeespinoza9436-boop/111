@@ -1,0 +1,5 @@
+# Submit all top1 agents (29) to registered SN67 hotkeys
+# History: /root/turtle/111/67/top1/submission_history_20260802T130900Z.json
+# Map:     /root/turtle/111/67/top1/hotkey_map.json
+
+bash /root/turtle/111/67/top1/submit_all.sh 29

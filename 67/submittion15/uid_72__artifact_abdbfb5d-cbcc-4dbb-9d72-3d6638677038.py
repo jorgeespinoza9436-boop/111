@@ -1,0 +1,4843 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import math
+import re
+import time
+from dataclasses import dataclass, replace
+from typing import Any
+from urllib.parse import urlsplit
+
+from harnyx_miner_sdk.api import embed_text, fetch_page, llm_chat, search_web
+from harnyx_miner_sdk.decorators import entrypoint
+from harnyx_miner_sdk.llm import LlmMessage
+from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
+from harnyx_miner_sdk.structured_output import validate_output_against_schema
+
+SEARCH_PROVIDER = "parallel"
+SEARCH_TIMEOUT = 10.0
+FETCH_TIMEOUT = 15.0
+LLM_TIMEOUT = 90.0
+EMBEDDING_TIMEOUT = 120.0
+DEADLINE_NOTICE_SECONDS = 150.0
+BATCHED_RETRIEVAL_PREVIEW_CHARS = 240_000
+VFS_READ_PAGE_CHARS = 80_000
+FOCUSED_OBSERVATION_MEMORY_CHARS = VFS_READ_PAGE_CHARS
+RETRIEVAL_OBSERVATION_CHARS_PER_SOURCE = 4_000
+VFS_SEARCH_PAGE_CHARS = 60_000
+VFS_SIMILARITY_MIN_CHUNKS = 3
+VFS_SIMILARITY_MAX_CHUNKS = 5
+VFS_SIMILARITY_RESULT_CHARS = 45_000
+VFS_LEXICAL_WINDOW_CHARS = 3_600
+VFS_LEXICAL_WINDOW_COUNT = 3
+GPT_OSS_MAX_OUTPUT_TOKENS = 65_536
+OPENROUTER_GEMMA_MAX_OUTPUT_TOKENS = 40_960
+AI_GATEWAY_GEMMA_MAX_OUTPUT_TOKENS = 131_072
+GLM5_MAX_OUTPUT_TOKENS = 131_072
+INKLING_MAX_OUTPUT_TOKENS = 131_072
+
+MODEL_SCHEDULING = "state_aware"
+INVESTIGATION_MODELS = ("glm5", "ai_gateway_gemma", "inkling")
+STATE_AWARE_INVESTIGATION_MODELS = (
+    "openrouter_gemma",
+    "ai_gateway_gemma",
+    "openrouter_gemma_stable",
+    "glm5",
+    "inkling",
+)
+TASK_ANALYSIS_MODELS = ("openrouter_gemma", "ai_gateway_gemma", "openrouter_gemma_stable", "glm5")
+REPAIR_MODELS = (
+    "openrouter_gemma",
+    "ai_gateway_gemma",
+    "openrouter_gemma_stable",
+    "glm5",
+    "inkling",
+)
+AUDIT_REPAIR_MODELS = (
+    "glm5",
+    "inkling",
+    "gpt_oss_cerebras",
+    "ai_gateway_gemma",
+    "openrouter_gemma_stable",
+    "openrouter_gemma",
+)
+SEMANTIC_SWITCH_MODELS = (
+    "glm5",
+    "inkling",
+    "gpt_oss_cerebras",
+    "ai_gateway_gemma",
+    "openrouter_gemma_stable",
+    "openrouter_gemma",
+)
+MODEL_FAMILIES = {
+    "ai_gateway_gemma": "gemma",
+    "openrouter_gemma": "gemma",
+    "openrouter_gemma_prose": "gemma",
+    "openrouter_gemma_stable": "gemma",
+    "glm5": "glm5",
+    "gpt_oss": "gpt_oss",
+    "gpt_oss_cerebras": "gpt_oss",
+    "inkling": "inkling",
+}
+AUDIT_MODELS = (
+    "ai_gateway_gemma",
+    "gpt_oss_cerebras",
+    "openrouter_gemma",
+    "openrouter_gemma_stable",
+    "inkling",
+    "glm5",
+)
+PROVENANCE_AUDIT_MODELS = (
+    "gpt_oss_cerebras",
+    "gpt_oss",
+    "ai_gateway_gemma",
+    "openrouter_gemma_stable",
+    "glm5",
+)
+EVIDENCE_REVIEW_MODELS = INVESTIGATION_MODELS
+EMBEDDING_EXTRA = {
+    "provider": {
+        "only": ["nebius", "deepinfra", "siliconflow"],
+        "allow_fallbacks": True,
+    }
+}
+OPENROUTER_GLM_PROVIDER_PREFERENCES = {
+    "provider": {
+        "only": ["amazon-bedrock"],
+        "allow_fallbacks": True,
+    }
+}
+OPENROUTER_GPT_PROVIDER_PREFERENCES = {
+    "provider": {
+        "only": ["cerebras", "baseten", "deepinfra", "sambanova", "nebius", "coreweave"],
+        "allow_fallbacks": True,
+    }
+}
+OPENROUTER_GPT_CEREBRAS_PROVIDER_PREFERENCES = {
+    "provider": {
+        "only": ["cerebras"],
+        "allow_fallbacks": False,
+    }
+}
+OPENROUTER_GEMMA_PROVIDER_PREFERENCES = {
+    "provider": {
+        "only": ["sambanova"],
+        "allow_fallbacks": False,
+    }
+}
+OPENROUTER_GEMMA_STABLE_PROVIDER_PREFERENCES = {
+    "provider": {
+        "only": ["modelrun"],
+        "allow_fallbacks": False,
+    }
+}
+EXPECTED_ANSWER_SYSTEM = """\
+You are beginning a deep-research task. Before using external sources, write the best expected answer your internal
+knowledge suggests. This is a revisable research hypothesis, not evidence.
+
+Write a concise working hypothesis that names the likely answer and the main uncertainty. Also state the smallest
+verification route: the finite candidate inventory, if one is needed, and the exact external facts that would prove
+or disprove the hypothesis. Name useful sources or pages, but do not produce or guess URLs; retrieval discovers exact
+URLs. This route is a heuristic for investigation, not evidence. For an exhaustive question, put the inventory source
+before per-candidate metric lookups. Be concrete enough that later investigation can prove, revise, or reject the
+answer. Do not invent citations and do not avoid an answer merely because important facts remain uncertain."""
+
+TASK_ANALYSIS_SYSTEM = """\
+Analyze the research task before retrieval. Base the analysis only on the original question and any caller-provided
+output schema. No expected answer, candidate hypothesis, or external evidence is available. Call
+set_research_task_contract exactly once with one concise prose contract under these headings:
+
+Requested result:
+Presuppositions to verify:
+Material interpretations:
+Evidence and proof obligations:
+Source and time scope:
+Response contract:
+
+Requested result states what must be answered, including the entities or fields requested and the quantifier,
+comparison, set operation, or other selection operation. Do not supply the answer.
+
+Presuppositions to verify lists only factual assumptions whose failure could invalidate or materially change the
+answer. A clue that maps a quoted work, event, relationship, or descriptor to an unidentified entity is such a
+presupposition. Write each as an unanswered verification question. Do not treat wording supplied by the question as
+evidence that the premise is true. If no material factual premise is assumed, say so briefly.
+
+Material interpretations uses the ordinary compositional reading of the sentence. Preserve an alternative only when
+the wording supports it about as directly as the primary reading and context does not resolve it. Do not move a
+modifier across a ranking, filtering, or quantifier boundary merely to manufacture another result. Do not invent
+remote alternatives, confuse a formatting preference with a semantic interpretation, or collapse genuinely equal
+readings into one. Inspect inclusive or exclusive thresholds and reference scope when they can materially change the
+answer. If there is only one material reading, state it without manufacturing ambiguity.
+
+Evidence and proof obligations asks for the external operands needed to resolve the requested result, every preserved
+interpretation, and every material presupposition. Do not write a search plan, source description, table schema, or raw
+data wishlist. Do not insert a candidate, number, list member, expected value, or proposition that the question does
+not supply. Arithmetic, set operations, decade membership, threshold comparison, sorting, and other conclusions that
+can be mechanically derived from supported operands do not need external evidence. Exhaustive, unique, universal,
+negative, top-k, and boundary claims need evidence whose visible scope can establish that obligation; ordinary
+existence or identification questions do not automatically require proof that no alternative exists. Prefer a complete
+filtered set over every raw value for every candidate. For intersecting conditions, obtain the most selective complete
+result first and ask later conditions only about survivors. A candidate eliminated by one supported condition needs no
+evidence for later conditions.
+
+Source and time scope records every publisher, page, report, dataset, edition, jurisdiction, date, or historical
+version whose account the question requires. A named source remains part of the task even when another source could
+support the same fact. If none is specified, say so briefly.
+
+Response contract records the reader-facing format and every required output element. Include a caller-provided JSON
+Schema when present, but summarize its required fields instead of copying the schema. Distinguish exact or output-only
+text from ordinary prose. When neither the question nor a caller-provided schema specifies a format, record ordinary
+reader-facing prose or a natural list; do not invent JSON, a schema, or additional output fields. Formatting constraints
+are not evidence questions.
+
+This contract defines what later research must resolve. It is not evidence and must not claim that a presupposition is
+true or that one interpretation has been proven.
+
+Good material-interpretation example for "List contributors in the acknowledgements of reports A, B, and C": use the
+ordinary reading that reports the contributors for each named report. Do not additionally require a union and an
+intersection unless the question asks for a combined or common set.
+
+Bad response contract when the question specifies no format: "Return a JSON object with per_report and combined
+fields." This invents an output contract. Good: "An ordinary reader-facing list that labels distinct interpretations
+only when more than one remains material."""
+
+INVESTIGATION_SYSTEM = """\
+You are a deep-research agent. Develop a claim that answers the original question and give it enough externally
+inspectable support to persuade a skeptical reader.
+
+The research task contract is the shared interpretation of what must be resolved. It is not evidence. Preserve its
+material presuppositions, interpretations, proof obligations, source scope, and response obligations throughout the
+investigation. The expected answer is a useful guess, not evidence and not a task definition. Use it to choose cheap,
+focused searches, but revise or replace it when it conflicts with the task contract or observed sources. Internal
+knowledge may guide research, but every material external premise in the final claim needs observed support.
+Test a material presupposition before relying on the answer that assumes it. When evidence disproves it, correct the
+premise instead of fabricating a direct answer. When the contract preserves multiple plausible result-changing
+interpretations, prefer shared external operands that can resolve all of them. Do not run a separate broad research
+project for each interpretation when the same bounded source records suffice.
+When the question attributes facts to a named source, edition, page, report, or dataset, inspect a direct record from
+that publisher first. Otherwise prefer the organization that produced the fact or another primary document. A direct
+record can establish publisher, dataset, and period provenance even when its accessible rendering omits requested
+rows. In that case, use an archived copy or a transparent reproduction that visibly supplies the rows and identifies
+the same publisher, dataset, and period. Do not continue demanding a direct rendering of every row unless the records
+conflict.
+If a clue-only search does not improve the evidence, do not paraphrase and repeat it. Change the evidence route or
+test the expected-answer candidate directly.
+If a required source's search surface does not expose a complete inventory, use a suitable secondary source to
+discover the finite candidate set. Verify surviving candidates against the required source when its accessible
+records expose them; otherwise the transparent reproduction may support the visible values after a direct record has
+established provenance.
+For an exhaustive question, the expected candidate pool remains unproved. Before finalizing, inspect either a source
+that enumerates the pool or direct evidence for every candidate and plausible boundary case; metric pages for guessed
+candidates alone do not prove that no candidate is missing.
+When a table explicitly ranks rows in descending order by the same numeric metric used by the question's threshold,
+you do not need every later row after the first below-threshold row. Retain the header, every row through that boundary,
+and explain why the established ordering eliminates the remaining lower-ranked rows. This shortcut is valid only when
+the visible header and row order establish that monotonic relationship.
+
+Search snippets are evidence when their visible text directly supports the premise. If later retrieval steps must
+combine that snippet with other facts, retain its smallest decisive lines before moving on; otherwise the full snippet
+may leave active context while remaining available in VFS. Among observed sources with comparable authority and scope,
+preserve the excerpt that states the complete needed premise most directly and compactly. Do not fetch a broader copy
+merely to replace a sufficient snippet. A search result from the named official page counts as inspection when its
+visible text supplies the needed fact; retain that snippet rather than fetching the same page solely because the
+question names it. Use fetch_page only when the snippet lacks necessary context or when inspecting a discovered page
+is the most direct remaining evidence route. fetch_page accepts a full URL, including one discovered inside a search
+result or another page. Do not construct a URL from a guessed site pattern.
+Search and fetch results are saved in VFS. On a long page, locate relevant lines with VFS search before using VFS read
+to expand a small window. A large fetch includes question-ranked context windows in addition to its head/middle/tail
+preview; inspect those windows before searching the page again. Give each VFS search both an exact regex pattern and
+a semantic query. The harness starts with regex and automatically adds embedding results only when regex fails or
+finds nothing. For a table, keep the relevant row together with its title, series labels, year labels, and headers.
+When a search result exposes a source whose title, headings, or table schema match the unresolved evidence need,
+inspect that VFS source before another web search. Search again only after inspection shows that the required fields
+or scope are absent. Discovery is not a reason to keep discovering.
+PDF extraction can place chart values before the heading or labels they belong to. When a title match lacks its data,
+inspect both before and after it rather than assuming the table follows the title. You may reconstruct a flattened
+chart only when the excerpt exposes a complete rectangle: N ordered category labels, M series labels, and exactly M
+groups of N data values after excluding axis ticks. State that mapping explicitly and cross-check it against the page
+heading, totals, shares, or nearby prose. If the complete structure is not visible, do not infer a cell from line order.
+When the question asks about a specific date, edition, or historical version, inspect a result whose title and scope
+match that exact period before broader or current-data pages. Do not revise a period-specific value from a source that
+visibly describes a different period. A current rolling statistical table may revise rows labeled with past dates;
+when the question concerns what was reported for that period, prefer the contemporaneous archived release.
+When inspected sources disagree, resolve the conflict by source scope, authority, date, and fit to the question. If
+one source states the question's identifying conditions and requested value together, preserve that internally
+consistent account. A differently scoped or measured value is a limitation to disclose, not a reason to repeat
+substantially equivalent searches. Once further searches only reproduce the same conflict, finalize the best-supported
+answer and state the discrepancy briefly.
+The task contract guides retrieval; its evidence questions are not a checklist that must remain material. A complete
+filter or supported elimination can make a broader evidence question unnecessary, but it cannot erase another
+material interpretation, presupposition, named-source instruction, or requested output element. An explicit instruction
+in the original question to retrieve or report from a named source, edition, page, report, or dataset remains material
+and cannot be replaced by a different proof route. Before finalizing, check every premise that the current answer and
+its derivation actually depend on against words or table cells visible in the supplied source records. Your memory of
+a source is not visible evidence. If a material row or relationship is absent from the excerpt, locate it with VFS
+search or fetch the discovered page; if it remains unavailable, state the limitation instead of silently supplying it.
+
+Use update_research_state whenever evidence changes the current best answer, the decisive support, or the most
+important unresolved question. This prose state is your working memory and is returned on every turn. Do not turn it
+into a search log. Retain only displayed lines that directly support or contradict a material premise; do not retain a
+source merely for possible later extraction. For a flattened table or chart, retain one continuous range containing
+the data values, ordered category labels, series labels, and title together, even when axis ticks or spacing lie
+between them. Isolated number lines plus a separate title do not preserve the mapping needed to support table claims.
+For a descending ranked table filtered by a numeric threshold, retain one continuous range from the header through
+the first below-threshold row so the qualifying rows and the exhaustive cutoff remain inspectable together.
+
+Continue while a real uncertainty could change the answer. Before finalizing with evidence from a fetched page,
+preserve every decisive excerpt with retain_evidence. When the claim resolves the question and its material premises
+are supported, call ready_to_finalize as the final tool in the response. Its reason explains the derivation and cites
+source references such as [P1] or [S1.2], without encoding line ranges in prose. The harness writes the answer from
+the cited source records. A decisive search snippet may be cited without retention only when finalizing immediately;
+retain it before performing later retrieval that must be combined with it.
+
+Tool failures are observations: correct the call or change approach. Independent search_web and fetch_page calls in
+one response execute concurrently. They must use arguments known before the response and cannot depend on one
+another's results. Other tools execute sequentially in response order. When exact arguments for several independent
+searches, fetches, reads, or evidence retentions over an already known finite candidate set are available, emit them
+together instead of spending one model turn per candidate or premise.
+Alternative phrasings of the same unresolved search are exploratory steps, not independent work: inspect the first
+result before deciding whether another formulation is needed. Do not batch a later fetch or local inspection whose
+arguments depend on unseen results. Emit each distinct operation at most once per response."""
+
+ANSWER_UPDATE_SYSTEM = """\
+Write the complete best current answer to the original question as polished, reader-facing Markdown. Obey any
+explicit output-only or formatting constraint in the original question; otherwise use substantial prose with
+structure proportional to the answer. The expected answer, prior answer, investigator prose, and your internal
+knowledge are not evidence. Use only the supplied source records.
+
+The research task contract defines the requested result, material interpretations, presuppositions, proof obligations,
+source scope, and response contract. It is not evidence. The investigator's current conclusion is the intended answer
+and derivation after research. Use it to revise the prior answer, while checking every external premise against the
+supplied source records. If a material presupposition is disproved, correct it directly rather than answering as though
+it were true. When the task contract preserves multiple plausible result-changing interpretations and the supplied
+records resolve them, answer each interpretation directly and compactly. Do not spend prose arguing that the question
+is ambiguous when clear labels or parallel results can resolve it. Do not add factual claims that are unnecessary to
+establish the answer; for an excluded candidate, state its decisive failing condition rather than unrelated background.
+
+Open with the direct conclusion. Use short descriptive headings when they help navigation, bullets for parallel
+findings, and a Markdown table when several candidates share the same comparison fields. Do not force a heading or
+table onto a short answer. Keep paragraphs focused and make the decisive comparison easy to scan. Do not add a
+references section, bibliography, source dump, raw URL, or quoted evidence appendix.
+
+Resolve the question directly, explain why the conclusion follows, and preserve relevant uncertainty. Place the
+exact internal evidence reference from the supplied record, normally [E1] or [E2], immediately after the factual claim
+it supports. An unretained search snippet may instead have a source reference such as [S1.2]. These references are
+private placeholders that the harness converts to public citation numbers. Never
+invent a reference, alter its spelling, or write a numeric citation marker yourself. A derived claim needs no separate
+reference when all external operands are visibly supported nearby and the derivation is explicit. Name a source
+organization naturally only when it helps explain why the evidence is authoritative. A table-derived value is
+supported only when the supplied text preserves its association with the relevant row and column labels. Never assign
+a value to a year, category, or candidate that the source record does not visibly associate with that value. A
+csv_records field is a mechanical projection of a CSV header onto its selected rows; prefer its named fields over
+counting positions in the raw CSV quote. For each premise, rely on the single most direct source that visibly
+establishes it. Add another source only when the first source cannot establish the whole premise; do not rely on weaker
+duplicates or merely corroborating background. When sources report conflicting measurements, prefer an internally
+consistent source record that establishes the question's identifying conditions and requested value together. Do not
+combine a conflicting measurement from one source with the answer supplied by another; mention a material discrepancy
+briefly only when it affects interpretation. If the question asks what a source explicitly reports, state that
+reported value and compare it directly; do not add a recomputation that answers a different question. When a
+threshold, ranking, ratio, or arithmetic operation decides the answer, show the relevant input
+values and write the arithmetic expression or comparison for every candidate needed to establish the result (for
+example, `105 - 81 = 24`, not only the two scores and the resulting margin). Prefer an exact calculated value over an
+indirect inequality when the supplied operands allow the calculation. When the conclusion is
+exhaustive (for example, only, all, closest, a top-k set, or an intersection), show enough of the candidate comparison
+in the answer to establish that no omitted candidate changes the result. Open with the direct answer, then explain the
+decisive evidence and derivation in natural prose. Do not expose research-process labels such as candidate pool,
+boundary check, proof of completeness, evidence requirement, audit, or research state. For an exhaustive answer,
+identify the finite set naturally, show each qualifying entity's decisive values, and mention only the near misses
+needed to establish the boundary. An inventory source can bound the set, but independently verified candidate pages
+and boundary near misses can do so when no single inventory page is available. Apply strict inequalities literally:
+state the strictly qualifying set first, and describe an equal boundary value only as an excluded case. For an
+identification or constraint question, explicitly show how the answer satisfies every condition in the original
+question, including descriptors and relationships. When the question asks to retrieve a finite set and then filter
+it through multiple conditions, show the materially narrowed set after each decisive filter, not only the final
+candidate's properties.
+
+Good citation placement: `Essendon won 105-81 in 1984. [E1]`
+For a Markdown table, place the source reference in each source-backed row, normally in its final relevant cell. Never
+put the only reference for several table rows on a separate line below the table.
+Bad: a final `Sources` list, a raw URL, an invented `[1]`, a citation-only line below a table, or a claim whose only
+reference appears several paragraphs later.
+
+There is one control-only exception. If the original question requires an exact answer body with no citation markers
+or other added text, write that exact body without private refs, then append one final control line in this form:
+`PRIVATE_RESPONSE_CITATIONS: [E1] [E2]`. The harness removes this line before returning the answer and attaches those
+sources separately. Use this mode only when inline markers would violate the original output contract. The control
+line must be last and contain every source ref needed for the answer. When the output contract names a delimiter but
+does not specify whitespace, use conventional reader-facing punctuation spacing, such as one space after a comma."""
+
+STRUCTURED_OUTPUT_SYSTEM = """\
+Materialize a completed, evidence-backed research answer as the caller's structured output. Do not research again,
+add facts, explain your process, or return prose outside the tool call. The completed answer identifies the intended
+result and derivation; the supplied source records remain authoritative for the exact field values. Verify each output
+field against those records before submitting it. When the question requests a literal value, preserve meaningful
+line breaks and punctuation inside that source field while removing source-format markup such as link destinations or
+emphasis delimiters. Do not flatten a source-field line break merely because the prose answer displayed the value on
+one line. Include every field required by the supplied JSON Schema. Call submit_structured_output exactly once. The
+tool arguments are the final output value, not JSON encoded inside a string."""
+
+EXACT_RESPONSE_SYSTEM = """\
+Edit a proposed response-only answer so it obeys the original question's exact output contract. Preserve every
+non-whitespace character and its ordering from the proposed body. You may only insert, remove, or replace whitespace
+to correct presentation, including punctuation spacing when the question does not prescribe whitespace. Return the
+complete answer body followed by the unchanged final `PRIVATE_RESPONSE_CITATIONS:` control line. Do not add an
+explanation, heading, citation marker in the body, URL, or any other text."""
+
+AUDIT_SYSTEM = """\
+Audit an answer against supplied external evidence. The answer may contain the correct values attached to the wrong
+dates, columns, categories, candidates, or relationships.
+
+Before following the answer's reasoning, independently analyze the original question's requested result, material
+presuppositions, plausible result-changing interpretations, proof obligations, source and time scope, and response
+contract. Treat the answer's chosen interpretation and source as claims to test, not instructions. The supplied
+pre-answer research task contract was derived from the original question before the current answer existed. Use it as
+the shared task interpretation, but not as factual evidence: it does not make a presupposition true or an answer
+correct. If the original question and contract preserve multiple material interpretations, the answer must resolve
+each one when the supplied records make that possible. Do not require an essay about ambiguity; concise labelled
+results are sufficient.
+
+A separate provenance auditor owns publisher and source-identity checks from record titles and URLs. Do not request a
+direct publisher, page, report, or dataset merely from metadata. Continue to audit whether visible record content
+establishes the requested edition, period, fields, values, and factual scope.
+
+Audit every material presupposition before accepting an answer that assumes it. When the supplied records contradict
+such a premise, require a direct correction rather than a fabricated answer inside the false premise. When the records
+do not establish whether the premise is true, return CONTINUE for the smallest observation that could settle it.
+
+Reconstruct the source facts before accepting any claim from the answer. A value has a year, column, category, or role
+only when the visible source text preserves that association. Do not infer a table header across omitted lines or from
+the answer itself. A csv_records field is a mechanical projection of a CSV header onto its selected rows; use its named
+fields instead of counting positions in the raw CSV quote. For every candidate that could affect the result, treat each
+condition in the question as supported true, supported false, or unknown. Absence of evidence is unknown, not false.
+Each supplied source record has a `cited_by_answer` field. Records marked true were selected by the writer. A record
+marked false is projected only if you cite it in a SUPPORTED or DERIVED line, so never silently rely on one. When an
+uncited record supplies a necessary premise, cite it explicitly in the audit proof. If neither the writer-selected
+records nor an explicitly cited additional record settles the gap, return CONTINUE.
+A retained record may include `numeric_support_findings`. These are deterministic hints that a numeric literal from
+the investigator's research note is absent from the selected quote. They are not evidence and not a verdict. The
+same literal may occur elsewhere for an unrelated entity, metric, year, date, or document identifier. Inspect the
+quote and note semantically: ignore incidental note metadata, but return CONTINUE or REVISE when a material numeric
+claim lacks the entity, metric, period, and value association needed to support it.
+
+For an identification question, audit every descriptive clause as a separate premise. Evidence that a person is
+affiliated with an institution does not establish the institution's location, type, or status. If the supplied source
+records do not explicitly establish such a property required by the question, mark it unknown and return CONTINUE.
+When the question identifies an entity indirectly through a quotation, work, event, or relationship, the mapping
+from that clue to the identified person or entity is itself a material premise. Require visible evidence for that
+mapping even when it is familiar or stated as part of the question; evidence for the resulting name alone does not
+establish why it matches the clue.
+Source omission proves absence only when the source visibly represents a complete inventory at the required scope.
+When the question asks for a complete list, all matches, the only match, or a top-N result, completeness is a separate
+material premise. Records for the entities named in the answer prove that they qualify; they do not prove that no
+other entity qualifies. READY requires a visibly complete inventory, a visible ordered cutoff that excludes every
+remaining row, or an explicit source statement establishing that no other match exists. Otherwise emit MISSING for
+the unresolved completeness premise and return CONTINUE.
+A bounded category list presented as the complete relevant section, table, personnel, or roster, with no omission
+marker, establishes both who is listed and who is not listed in that category. Do not demand a separate source
+sentence saying that an unlisted candidate is absent. This does not apply to search results, excerpts with omitted
+rows, or collections whose boundary is not visible.
+For a numeric threshold, a visible ordered cutoff exists when the source heading names that metric, the Rank column
+starts at 1, consecutive displayed rows descend on that metric, and the excerpt continues through the first row below
+the threshold. A table headed as a list or ranking "by" that metric, with a Rank column and matching monotonic values,
+establishes the ordering even when nearby prose does not repeat "highest to lowest." Do not demand later lower-ranked
+rows in that case.
+The selection or ordering of records in the supplied packet is not a source fact. A packet containing only candidates
+from a category does not establish that they belong to that category unless visible source text explicitly labels
+them or supplies the facts from which that membership can be derived. A SUPPORTED line for category membership must
+quote that explicit label or those defining facts; relabeling a list of candidate names as the category is not support.
+A candidate excluded by one supported condition does not need evidence for the other conditions. When a surviving
+candidate has multiple unknown conditions, request only the single cheapest observation that could exclude it or move
+it forward; do not mark later conditions missing until the candidate survives that check. A CONTINUE audit must
+contain exactly one MISSING line, and it must match the one observation named in the verdict.
+Rows separated by a visible `...` are not adjacent. Do not reconstruct ordinal ranks or a ranking cutoff by joining
+the rows on either side; return CONTINUE if omitted rows could change the result.
+A complete comparison on one condition may reduce the candidate set, after which only the survivors need support for
+the remaining conditions. Do not require a full candidate-by-condition matrix when supported elimination establishes
+the same conclusion.
+Do not combine an eligibility condition from one source with a requested value from another source when their
+measurements conflict. If one supplied source record states all identifying conditions and the requested value
+together, preserve that internally consistent account. Treat a differently scoped or measured record as a
+discrepancy, not as an operand for a hybrid answer.
+Never approve or write a replacement that keeps a candidate as the answer while its chosen evidence account makes
+that candidate fail a selection condition. Use a supplied internally consistent account that establishes both
+eligibility and the requested value, or return CONTINUE when no such account is available.
+
+Before deciding, identify only:
+- factual premises asserted by the current answer; and
+- unresolved facts whose truth could change the answer to the original question.
+
+Every entity, attribute, field, comparison, or other output element explicitly requested by the original question is
+a material obligation even when the current answer omits it. An answer cannot make a requested output immaterial by
+leaving it out. Return CONTINUE when the omitted element lacks evidence, or REVISE when the supplied records already
+settle it and the answer only needs to include it.
+
+Do not audit an initial research plan or require facts that are no longer material to the conclusion. Write one short
+line for each material premise or result-changing unknown. Use exactly one of:
+SUPPORTED [evidence ref]: <the visible source words that establish this premise>
+DERIVED [evidence refs]: <the arithmetic or logical derivation from externally supported operands>
+MISSING: <the premise not explicitly established by any supplied source record>
+CONTRADICTED [evidence ref]: <the visible source words that contradict this premise>
+
+Emit a MISSING line only for a real unresolved premise. If nothing is missing, omit MISSING entirely; never write
+`MISSING: none`, `MISSING: not applicable`, or another empty placeholder. A READY verdict must contain no MISSING line.
+Do not combine premises on one line. A source ref without the establishing words is not support. Use only the
+supplied source records; the answer and internal knowledge are not evidence. A contradicted condition for an excluded
+candidate can support the answer's exclusion; it is not itself an answer error. Arithmetic, set operations, decade
+membership, threshold comparisons, and ordering may be DERIVED without another external citation when every external
+operand is SUPPORTED. A DERIVED line must show the calculation or logical step and cite the source refs containing its
+external operands; never use DERIVED to supply a missing external operand. A value that is completely calculable from
+supported external operands is not missing merely because no source states the calculated value verbatim. Mark that
+premise DERIVED, not MISSING, and do not emit both statuses for the same premise.
+A familiar categorical property may also be DERIVED from explicit defining source facts when the classification is
+unambiguous; show those facts instead of requiring the source to use the question's exact label.
+When the question requests a literal value from a rendered page or table, distinguish that visible value from the
+source extractor's Markdown serialization. Link destinations, link brackets, and emphasis delimiters are not visible
+cell text. A line break that remains inside one cell is part of the extracted field value and must not be silently
+flattened when the question requires that exact field.
+
+After all premise lines, emit exactly one verdict:
+VERDICT READY
+VERDICT CONTINUE: <the one most important missing observation>
+VERDICT REVISE: <the specific correction the answer writer must make>
+
+Use READY only if every factual statement agrees with the reconstructed source facts, the conclusion follows, and no
+unknown could change the result. READY and REVISE are invalid if a material premise is MISSING. A source
+contradiction to a factual statement asserted by the current answer requires REVISE, while a contradiction that
+establishes why a candidate is excluded is compatible with READY. Use REVISE only when the supplied evidence settles
+the question but the answer is wrong or unsupported. Describe the correction precisely and cite the source records
+that establish it, but do not write a replacement answer, copy source-format markup, or include a URL. A separate
+reader-facing writer applies the correction and the result is audited again. Use CONTINUE when the evidence cannot
+settle the result."""
+
+PROVENANCE_AUDIT_SYSTEM = """\
+Audit only the publisher and source identity of supplied records available for facts that the original question
+attributes to a named publisher, edition, page, report, or dataset. Use record titles and URLs only. A supplied record
+whose title or URL identifies the named publisher satisfies a publisher-only attribution. Require a particular
+edition, page, report, or dataset in that metadata only when the question names it. Do not require the direct record's
+metadata to expose the requested values, fields, or complete rows; the main evidence audit owns whether supplied source
+text establishes those facts. A secondary publisher's reproduction or calculation cannot establish publisher identity
+by itself, but it may supply factual rows after a separate direct record establishes the required identity. The direct
+record need not be cited by the current answer; its presence in the supplied packet means it was inspected.
+Do not apply the attribution to an auxiliary fact that merely defines the population being considered unless the
+question does so. Do not request measurements the answer does not claim. Do not assess excerpt sufficiency, factual
+correctness, arithmetic, logical completeness, or writing quality; the main evidence audit owns those checks. Emit
+exactly one line. Return `VERDICT PASS` when no named source is required or cited records have direct provenance.
+Otherwise return `VERDICT CONTINUE:` followed by a concrete description of the missing direct source. Do not copy an
+output placeholder."""
+
+
+def _schema(
+    name: str,
+    description: str,
+    properties: dict[str, Any],
+    required: tuple[str, ...],
+) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": list(required),
+                "additionalProperties": False,
+            },
+            "strict": False,
+        },
+    }
+
+
+def _parse_csv_row(line: str) -> list[str] | None:
+    fields: list[str] = []
+    field: list[str] = []
+    in_quotes = False
+    after_quote = False
+    index = 0
+    while index < len(line):
+        character = line[index]
+        if in_quotes:
+            if character != '"':
+                field.append(character)
+            elif index + 1 < len(line) and line[index + 1] == '"':
+                field.append('"')
+                index += 1
+            else:
+                in_quotes = False
+                after_quote = True
+        elif after_quote:
+            if character == ",":
+                fields.append("".join(field))
+                field = []
+                after_quote = False
+            elif character not in " \t":
+                return None
+        elif character == ",":
+            fields.append("".join(field))
+            field = []
+        elif character == '"' and not field:
+            in_quotes = True
+        else:
+            field.append(character)
+        index += 1
+    if in_quotes:
+        return None
+    fields.append("".join(field))
+    return fields
+
+
+SET_RESEARCH_TASK_CONTRACT_TOOL = _schema(
+    "set_research_task_contract",
+    "Record the pre-retrieval interpretation of the research task. This contract defines what later research must "
+    "resolve; it is not evidence and must not contain an answer.",
+    {
+        "contract": {
+            "type": "string",
+            "minLength": 1,
+            "description": (
+                "A concise prose contract covering the requested result, presuppositions to verify, material "
+                "interpretations, evidence and proof obligations, source and time scope, and response contract."
+            ),
+        }
+    },
+    ("contract",),
+)
+TASK_ANALYSIS_TOOLS = [SET_RESEARCH_TASK_CONTRACT_TOOL]
+
+TOOLS = [
+    _schema(
+        "search_web",
+        "Search the web. Full results are retained in VFS and each result receives a source reference.",
+        {
+            "query": {"type": "string", "minLength": 1},
+            "num": {"type": "integer", "minimum": 1, "maximum": 25},
+        },
+        ("query", "num"),
+    ),
+    _schema(
+        "fetch_page",
+        "Fetch one full URL when a search snippet lacks context or a page exposes a promising direct link. "
+        "Full content is retained in VFS and receives a source reference.",
+        {"url": {"type": "string", "minLength": 1}},
+        ("url",),
+    ),
+    _schema(
+        "vfs_read",
+        "Read an inclusive line range from one VFS key. Large ranges are paginated. Bounds accept 1-based line "
+        "numbers or stable line IDs.",
+        {
+            "key": {"type": "string", "minLength": 1},
+            "start_line": {"type": ["string", "integer", "null"]},
+            "end_line": {"type": ["string", "integer", "null"]},
+        },
+        ("key", "start_line", "end_line"),
+    ),
+    _schema(
+        "vfs_list",
+        "List VFS keys, optionally restricted to a literal prefix.",
+        {"prefix": {"type": "string"}},
+        ("prefix",),
+    ),
+    _schema(
+        "vfs_write",
+        "Write or overwrite one VFS file. VFS operations do not create VFS audit entries.",
+        {
+            "key": {"type": "string", "minLength": 1},
+            "content": {"type": "string"},
+        },
+        ("key", "content"),
+    ),
+    _schema(
+        "vfs_delete",
+        "Delete one VFS key.",
+        {"key": {"type": "string", "minLength": 1}},
+        ("key",),
+    ),
+    _schema(
+        "vfs_search",
+        "Search exact keys, wildcard key patterns such as page://*, or * for all VFS files. Supply an exact regex "
+        "pattern and a semantic query for the same information need. The harness starts with regex and adds embedding "
+        "results only when regex fails or finds nothing. Continue paginated regex matches with next_cursor.",
+        {
+            "pattern": {"type": "string", "minLength": 1},
+            "query": {"type": "string", "minLength": 1},
+            "targets": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "minItems": 1,
+            },
+            "cursor": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Match offset returned as next_cursor by a previous identical search.",
+            },
+        },
+        ("pattern", "query", "targets"),
+    ),
+    _schema(
+        "update_research_state",
+        "Replace the prose working memory used on later turns. Call when the best answer, decisive support, "
+        "or most important unresolved question changes.",
+        {
+            "state": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Current best answer, decisive observed source refs, and the next unresolved question.",
+            }
+        },
+        ("state",),
+    ),
+    _schema(
+        "ready_to_finalize",
+        "Propose or confirm finalization after decisive external evidence has been inspected. This is premature when "
+        "an observed search result exposes an uninspected official or primary source for a premise currently supported "
+        "only by a secondary source. Every cited fetched-page source must already have a retained evidence excerpt.",
+        {
+            "reason": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Explain readiness and cite decisive source refs such as [S1.2] or [P1].",
+            }
+        },
+        ("reason",),
+    ),
+]
+
+RETAIN_EVIDENCE_TOOL = _schema(
+    "retain_evidence",
+    "Keep one directly useful, already displayed source excerpt in persistent research memory. "
+    "Each distinct retained span becomes an immutable evidence unit with a harness-assigned reference such as E1; "
+    "later final answers cite that evidence reference instead of the broader source. "
+    "Do not retain a source merely for possible later extraction. For flattened tables, retain one continuous "
+    "range that includes the values, category labels, series labels, and title rather than isolated numeric lines. "
+    "Every date, year, threshold, or other number introduced by the note must also be visible in the selected range; "
+    "numbers already supplied by the original question describe the task and need not be repeated by the source.",
+    {
+        "source": {
+            "type": "string",
+            "minLength": 1,
+            "description": "An observed source reference such as S1.2 or P3, or its exact VFS key.",
+        },
+        "note": {
+            "type": "string",
+            "minLength": 1,
+            "description": "What the visible source text establishes and which part of the question it informs.",
+        },
+        "start_line": {
+            "type": ["string", "integer"],
+            "description": "First displayed line number or stable line ID containing the evidence.",
+        },
+        "end_line": {
+            "type": ["string", "integer"],
+            "description": "Last displayed line number or stable line ID containing the evidence.",
+        },
+    },
+    ("source", "note", "start_line", "end_line"),
+)
+DISCARD_REMAINING_SOURCES_TOOL = _schema(
+    "discard_remaining_sources",
+    "Discard every still-unretained source from the latest retrieval and finish its evidence review.",
+    {
+        "reason": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Why every still-unretained visible source does not materially inform the research.",
+        }
+    },
+    ("reason",),
+)
+EVIDENCE_REVIEW_TOOLS = [RETAIN_EVIDENCE_TOOL, DISCARD_REMAINING_SOURCES_TOOL]
+TOOLS.insert(-1, RETAIN_EVIDENCE_TOOL)
+SEARCH_FIRST_TOOLS = [
+    tool for tool in TOOLS if tool["function"]["name"] == "search_web"
+]
+
+
+@dataclass
+class Source:
+    ref: str
+    key: str
+    title: str
+    url: str
+    content: str
+    receipt_id: str | None
+    result_id: str | None
+    preview_chars: int = 8_000
+
+
+@dataclass
+class CitationPlan:
+    citations: list[CitationRef]
+    source_indices: dict[str, int]
+
+
+class ResearchState:
+    def __init__(self, question: str = "") -> None:
+        self.question = question
+        self.vfs: dict[str, str] = {}
+        self.sources: dict[str, Source] = {}
+        self.line_locations: dict[str, tuple[str, int]] = {}
+        self.focused_lines: dict[str, set[int]] = {}
+        self.pending_focused_lines: dict[str, set[int]] = {}
+        self.focused_line_order: dict[tuple[str, int], None] = {}
+        self.focused_line_chars = 0
+        self.source_slices: dict[str, list[CitationSlice]] = {}
+        self.retained_evidence_slices: dict[str, list[CitationSlice]] = {}
+        self.retrieval_receipts: dict[str, dict[str, Any]] = {}
+        self.retrieval_output_cache: dict[str, dict[str, Any]] = {}
+        self.retrieval_failure_receipts: dict[str, dict[str, Any]] = {}
+        self.vfs_operation_receipts: dict[str, dict[str, Any]] = {}
+        self.retained_evidence: dict[str, dict[str, Any]] = {}
+        self.numeric_support_findings: dict[str, list[dict[str, Any]]] = {}
+        self.next_evidence_index = 1
+        self.document_embeddings: dict[
+            tuple[str, str],
+            list[tuple[dict[str, Any], list[float]]],
+        ] = {}
+        self.review_source_refs: set[str] = set()
+        self.research_task_contract: str | None = None
+        self.research_state = ""
+        self.audit_gap = ""
+        self.audit_packet_signature: str | None = None
+        self.budget_snapshot: dict[str, float] | None = None
+        self.max_observed_budget_step_usd = 0.0
+        self.preferred_models: dict[str, str] = {}
+        self.search_count = 0
+        self.page_count = 0
+
+    @staticmethod
+    def _line_id(key: str, index: int, text: str) -> str:
+        digest = hashlib.sha256(f"{key}\0{index}\0{text}".encode()).hexdigest()[:10]
+        return f"L{digest}"
+
+    def render_lines(
+        self,
+        key: str,
+        indices: list[int] | range | None = None,
+    ) -> list[dict[str, Any]]:
+        lines = self.vfs[key].splitlines() or [""]
+        selected = range(len(lines)) if indices is None else indices
+        output: list[dict[str, Any]] = []
+        for index in selected:
+            if index < 0 or index >= len(lines):
+                continue
+            line_id = self._line_id(key, index, lines[index])
+            self.line_locations[line_id] = (key, index)
+            output.append({"line_id": line_id, "line": index + 1, "text": lines[index]})
+        return output
+
+    def focused_excerpts(self) -> list[dict[str, Any]]:
+        excerpts: list[dict[str, Any]] = []
+        source_by_key = {source.key: source for source in self.sources.values()}
+        seen_lines: set[tuple[str, int, str]] = set()
+        for key, indices in self.focused_lines.items():
+            visible_indices = indices - self.pending_focused_lines.get(key, set())
+            if not visible_indices:
+                continue
+            source_refs = [f"[{source.ref}]" for source in self.sources.values() if source.key == key]
+            identity = source_by_key[key].url if key in source_by_key else key
+            lines: list[dict[str, Any]] = []
+            for line in self.render_lines(key, sorted(visible_indices)):
+                fingerprint = (
+                    identity,
+                    int(line["line"]),
+                    hashlib.sha256(str(line["text"]).encode()).hexdigest(),
+                )
+                if fingerprint in seen_lines:
+                    continue
+                seen_lines.add(fingerprint)
+                lines.append(line)
+            if not lines:
+                continue
+            excerpts.append(
+                {
+                    "vfs_key": key,
+                    "source_refs": source_refs,
+                    "lines": lines,
+                }
+            )
+        return excerpts
+
+    def remember_focused_lines(self, key: str, indices: set[int] | range) -> None:
+        lines = self.vfs[key].splitlines() or [""]
+        valid_indices = sorted({index for index in indices if 0 <= index < len(lines)})
+        focused = self.focused_lines.setdefault(key, set())
+        pending = self.pending_focused_lines.setdefault(key, set())
+        for index in valid_indices:
+            if index in focused:
+                continue
+            focused.add(index)
+            pending.add(index)
+            location = (key, index)
+            self.focused_line_order[location] = None
+            self.focused_line_chars += len(lines[index]) + 80
+        if not focused:
+            self.focused_lines.pop(key, None)
+            self.pending_focused_lines.pop(key, None)
+        while (
+            self.focused_line_chars > FOCUSED_OBSERVATION_MEMORY_CHARS
+            and len(self.focused_line_order) > 1
+        ):
+            old_key, old_index = next(iter(self.focused_line_order))
+            self.forget_focused_lines(old_key, {old_index})
+
+    def forget_focused_lines(
+        self,
+        key: str,
+        indices: set[int] | None = None,
+    ) -> None:
+        focused = self.focused_lines.get(key)
+        if focused is None:
+            return
+        removed = set(focused if indices is None else focused & indices)
+        lines = self.vfs.get(key, "").splitlines() or [""]
+        for index in removed:
+            self.focused_line_order.pop((key, index), None)
+            if 0 <= index < len(lines):
+                self.focused_line_chars -= len(lines[index]) + 80
+        focused.difference_update(removed)
+        pending = self.pending_focused_lines.get(key)
+        if pending is not None:
+            pending.difference_update(removed)
+            if not pending:
+                self.pending_focused_lines.pop(key, None)
+        if not focused:
+            self.focused_lines.pop(key, None)
+        self.focused_line_chars = max(0, self.focused_line_chars)
+
+    def clear_focused_lines(self) -> None:
+        for key in tuple(self.focused_lines):
+            self.forget_focused_lines(key)
+
+    def promote_pending_focused_lines(self) -> None:
+        self.pending_focused_lines.clear()
+
+    def remember_rendered_lines(
+        self,
+        key: str,
+        rendered_lines: list[dict[str, Any]],
+    ) -> None:
+        indices = {
+            int(item["line"]) - 1
+            for item in rendered_lines
+            if isinstance(item, dict) and isinstance(item.get("line"), int)
+        }
+        self.remember_focused_lines(key, indices)
+
+    def pending_review_excerpts(self) -> list[dict[str, Any]]:
+        excerpts: list[dict[str, Any]] = []
+        for ref, source in self.sources.items():
+            if ref not in self.review_source_refs:
+                continue
+            excerpts.append(
+                {
+                    "source_ref": f"[{ref}]",
+                    "vfs_key": source.key,
+                    "title": source.title,
+                    "url": source.url,
+                    "text": self.bounded_preview(
+                        source.key,
+                        max_serialized_chars=source.preview_chars,
+                    ),
+                }
+            )
+        return excerpts
+
+    def preview(self, key: str, max_chars: int = 8_000) -> list[dict[str, Any]]:
+        lines = self.vfs[key].splitlines() or [""]
+        if len(self.vfs[key]) <= max_chars:
+            return self.render_lines(key)
+        budget = max_chars // 3
+        groups: list[list[int]] = [[], [], []]
+        positions = [range(len(lines)), range(len(lines) // 3, len(lines)), range(len(lines) - 1, -1, -1)]
+        for group, position in zip(groups, positions, strict=True):
+            used = 0
+            for index in position:
+                if used and used + len(lines[index]) + 1 > budget:
+                    break
+                group.append(index)
+                used += len(lines[index]) + 1
+            group.sort()
+        selected = sorted(set(groups[0] + groups[1] + groups[2]))
+        return self.render_lines(key, selected)
+
+    def bounded_preview(
+        self,
+        key: str,
+        max_serialized_chars: int,
+    ) -> list[dict[str, Any]]:
+        text_budget = max_serialized_chars
+        preview: list[dict[str, Any]] = []
+        for _attempt in range(4):
+            preview = self.preview(key, max_chars=text_budget)
+            serialized_chars = len(
+                json.dumps(
+                    preview,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+            if serialized_chars <= max_serialized_chars:
+                return preview
+            text_budget = max(
+                100,
+                int(text_budget * max_serialized_chars / serialized_chars * 0.9),
+            )
+        return preview
+
+    def resolve_targets(self, targets: list[str]) -> list[str]:
+        keys: list[str] = []
+        for target in targets:
+            if target == "*":
+                matches = list(self.vfs)
+            elif any(char in target for char in "*?["):
+                pattern = re.compile("^" + re.escape(target).replace(r"\*", ".*").replace(r"\?", ".") + "$")
+                matches = [key for key in self.vfs if pattern.fullmatch(key)]
+            elif target in self.vfs:
+                matches = [target]
+            else:
+                matches = []
+            keys.extend(matches)
+        return list(dict.fromkeys(keys))
+
+    def citation_slices(self, key: str, indices: list[int] | range) -> list[CitationSlice]:
+        content = self.vfs[key]
+        lines = content.splitlines(keepends=True) or [content]
+        selected = sorted({index for index in indices if 0 <= index < len(lines)})
+        if not selected:
+            return []
+
+        offsets = [0]
+        for line in lines:
+            offsets.append(offsets[-1] + len(line))
+
+        groups: list[tuple[int, int]] = []
+        start = previous = selected[0]
+        for index in selected[1:]:
+            if index != previous + 1:
+                groups.append((start, previous + 1))
+                start = index
+            previous = index
+        groups.append((start, previous + 1))
+
+        spans: list[tuple[int, int]] = []
+        for start_line, end_line in groups:
+            start_offset = offsets[start_line]
+            end_offset = offsets[end_line]
+            if end_offset - start_offset < 100 and len(content) >= 100:
+                missing = 100 - (end_offset - start_offset)
+                start_offset = max(0, start_offset - (missing // 2))
+                end_offset = min(len(content), end_offset + missing)
+                start_offset = max(0, end_offset - 100)
+            if spans and start_offset <= spans[-1][1]:
+                spans[-1] = (spans[-1][0], max(spans[-1][1], end_offset))
+            else:
+                spans.append((start_offset, end_offset))
+        return [CitationSlice(start=start, end=end) for start, end in spans if end > start]
+
+    def packet_preview(
+        self,
+        key: str,
+        max_chars: int = 8_000,
+    ) -> tuple[str, list[CitationSlice]]:
+        content = self.vfs[key]
+        if len(content) <= max_chars:
+            return content, [CitationSlice(start=0, end=len(content))]
+
+        segment_chars = max_chars // 3
+        middle_start = max(0, (len(content) - segment_chars) // 2)
+        spans = [
+            (0, segment_chars),
+            (middle_start, middle_start + segment_chars),
+            (len(content) - segment_chars, len(content)),
+        ]
+        quote = "\n\n...\n\n".join(content[start:end] for start, end in spans)
+        slices = [CitationSlice(start=start, end=end) for start, end in spans]
+        return quote, slices
+
+    @staticmethod
+    def cited_line_indices(reason: str, ref: str) -> list[int]:
+        escaped_ref = re.escape(ref)
+        patterns = (
+            rf"\[{escaped_ref}\s*,\s*lines?\s+(\d+)(?:\s*(?:-|to)\s*(\d+))?\]",
+            rf"\[{escaped_ref}\s*,\s*L(\d+)(?:\s*-\s*L?(\d+))?\]",
+            rf"\[{escaped_ref}\]\s*[:,]?\s*lines?\s+(\d+)(?:\s*(?:-|to)\s*(\d+))?",
+            rf"\[{escaped_ref}\]\s*[:,]?\s*L(\d+)(?:\s*-\s*L?(\d+))?",
+            rf"\b{escaped_ref}\b\s*[:,]?\s*lines?\s+(\d+)(?:\s*(?:-|to)\s*(\d+))?",
+            rf"\b{escaped_ref}\b\s*[:,]?\s*L(\d+)(?:\s*-\s*L?(\d+))?",
+        )
+        indices: set[int] = set()
+        for pattern in patterns:
+            for match in re.finditer(pattern, reason, flags=re.IGNORECASE):
+                start = int(match.group(1))
+                end = int(match.group(2) or start)
+                if end < start:
+                    start, end = end, start
+                indices.update(range(max(1, start) - 1, end))
+        for bracket in re.findall(r"\[([^\]]+)\]", reason):
+            if re.search(rf"(?:^|[\s,;]){escaped_ref}(?:$|[\s,;:])", bracket) is None:
+                continue
+            for match in re.finditer(
+                r"\bL(\d+)(?:\s*-\s*L?(\d+))?",
+                bracket,
+                flags=re.IGNORECASE,
+            ):
+                start = int(match.group(1))
+                end = int(match.group(2) or start)
+                if end < start:
+                    start, end = end, start
+                indices.update(range(max(1, start) - 1, end))
+        return sorted(indices)
+
+    def source_evidence_indices(
+        self,
+        key: str,
+        indices: list[int] | range | set[int],
+        *,
+        include_focused: bool = True,
+    ) -> list[int]:
+        lines = self.vfs[key].splitlines() or [""]
+        line_count = len(lines)
+        candidates = set(indices)
+        if include_focused:
+            candidates.update(self.focused_lines.get(key, set()))
+        selected = {index for index in candidates if 0 <= index < line_count}
+        for index in tuple(selected):
+            context = _markdown_table_context(self, key, index)
+            if context is None:
+                continue
+            selected.update(item["line"] - 1 for item in context["header"])
+        if selected:
+            header = _parse_csv_row(lines[0])
+            selected_rows = [_parse_csv_row(lines[index]) for index in selected]
+            if header is None or any(row is None for row in selected_rows):
+                header = []
+                selected_widths = set()
+            else:
+                selected_widths = {len(row) for row in selected_rows if row is not None}
+            textual_fields = sum(bool(re.search(r"[A-Za-z]", field)) for field in header)
+            if len(header) >= 3 and len(header) in selected_widths and textual_fields >= len(header) // 2:
+                selected.add(0)
+        return sorted(selected)
+
+    def structured_csv_records(
+        self,
+        key: str,
+        indices: list[int] | range,
+    ) -> list[dict[str, str]]:
+        lines = self.vfs[key].splitlines()
+        if not lines or 0 not in indices:
+            return []
+        header = _parse_csv_row(lines[0])
+        if header is None:
+            return []
+        if len(header) < 3 or len(set(header)) != len(header):
+            return []
+        records: list[dict[str, str]] = []
+        for index in indices:
+            if index == 0 or not 0 <= index < len(lines):
+                continue
+            row = _parse_csv_row(lines[index])
+            if row is None:
+                return []
+            if len(row) != len(header):
+                return []
+            records.append(dict(zip(header, row, strict=True)))
+        return records
+
+    def source_packet(
+        self,
+        reason: str,
+        *,
+        allow_preview: bool = True,
+        include_structured_csv: bool = False,
+        prefer_retained: bool = True,
+    ) -> list[dict[str, Any]]:
+        mentioned_evidence_refs = list(dict.fromkeys(re.findall(r"\bE\d+\b", reason)))
+        mentioned_refs = list(dict.fromkeys(re.findall(r"\b(S\d+(?:\.\d+)?|P\d+)\b", reason)))
+        refs: list[str] = []
+        for ref in mentioned_refs:
+            if re.fullmatch(r"S\d+", ref):
+                refs.extend(candidate for candidate in self.sources if candidate.startswith(f"{ref}."))
+            else:
+                refs.append(ref)
+        refs.extend(source.ref for source in self.sources.values() if source.key in reason)
+        refs = list(dict.fromkeys(refs))
+        single_source_line_indices: list[int] = []
+        if len(refs) == 1:
+            indices: set[int] = set()
+            for match in re.finditer(
+                r"\b(?:lines?\s+)?L(\d+)(?:\s*-\s*L?(\d+))?",
+                reason,
+                flags=re.IGNORECASE,
+            ):
+                start = int(match.group(1))
+                end = int(match.group(2) or start)
+                if end < start:
+                    start, end = end, start
+                indices.update(range(max(1, start) - 1, end))
+            single_source_line_indices = sorted(indices)
+        line_ids = list(dict.fromkeys(re.findall(r"\bL[0-9a-f]{10}\b", reason)))
+        packet: list[dict[str, Any]] = []
+        for evidence_ref in mentioned_evidence_refs:
+            retained = self.retained_evidence.get(evidence_ref)
+            if retained is not None:
+                packet.append(self.retained_packet_item(retained))
+        for ref in refs:
+            source = self.sources.get(ref)
+            if source is None:
+                continue
+            retained_units = [
+                retained
+                for retained in self.retained_evidence.values()
+                if str(retained.get("source_ref", "")).strip("[]") == ref
+            ]
+            if prefer_retained and retained_units:
+                packet.extend(self.retained_packet_item(retained) for retained in retained_units)
+                continue
+            source_line_ids = [
+                line_id for line_id in line_ids if self.line_locations.get(line_id, (None,))[0] == source.key
+            ]
+            cited_line_indices = sorted(set(self.cited_line_indices(reason, ref)) | set(single_source_line_indices))
+            selected_indices: list[int] | range | None
+            citation_indices: list[int] | range | None
+            if source_line_ids:
+                line_indices = [self.line_locations[line_id][1] for line_id in source_line_ids]
+                evidence_window = set(line_indices)
+                selected_indices = self.source_evidence_indices(
+                    source.key,
+                    evidence_window,
+                    include_focused=False,
+                )
+                citation_indices = selected_indices
+                quote = "\n".join(item["text"] for item in self.render_lines(source.key, selected_indices))
+            elif cited_line_indices:
+                selected = set(cited_line_indices)
+                citation_indices = self.source_evidence_indices(
+                    source.key,
+                    selected,
+                    include_focused=False,
+                )
+                selected_indices = citation_indices
+                quote = "\n".join(
+                    f"{item['line']}: {item['text']}" for item in self.render_lines(source.key, selected_indices)
+                )
+            elif source.key in self.focused_lines:
+                selected_indices = self.source_evidence_indices(
+                    source.key,
+                    self.focused_lines[source.key],
+                )
+                citation_indices = selected_indices
+                quote = "\n".join(item["text"] for item in self.render_lines(source.key, selected_indices))
+            elif not allow_preview:
+                continue
+            else:
+                quote, slices = self.packet_preview(source.key)
+                self.source_slices[ref] = slices
+                selected_indices = None
+                citation_indices = None
+            if include_structured_csv and selected_indices is not None:
+                self.source_slices[ref] = self.citation_slices(
+                    source.key,
+                    citation_indices or selected_indices,
+                )
+            item: dict[str, Any] = {
+                "source_ref": f"[{ref}]",
+                "title": source.title,
+                "url": source.url,
+                "quote": quote,
+            }
+            if selected_indices is not None:
+                csv_records = self.structured_csv_records(source.key, selected_indices)
+                if csv_records:
+                    item["csv_records"] = csv_records
+            packet.append(item)
+        return _merge_source_packets([], packet)
+
+    @staticmethod
+    def retained_packet_item(retained: dict[str, Any]) -> dict[str, Any]:
+        item = {
+            key: value
+            for key, value in retained.items()
+            if key in {
+                "evidence_ref",
+                "source_ref",
+                "title",
+                "url",
+                "quote",
+                "research_note",
+                "csv_records",
+            }
+        }
+        item["origin_source_ref"] = item.pop("source_ref")
+        item["source_ref"] = item.pop("evidence_ref")
+        return item
+
+    def source_for_private_ref(self, ref: str) -> Source | None:
+        retained = self.retained_evidence.get(ref)
+        if retained is not None:
+            source_ref = str(retained.get("source_ref", "")).strip("[]")
+            return self.sources.get(source_ref)
+        return self.sources.get(ref)
+
+    def has_retained_source(self, source_ref: str) -> bool:
+        return any(
+            str(retained.get("source_ref", "")).strip("[]") == source_ref
+            for retained in self.retained_evidence.values()
+        )
+
+    def citation_plan(
+        self,
+        answer: str,
+        fallback_packet: list[dict[str, Any]],
+        final_source_slices: dict[str, list[CitationSlice]],
+        audit: str,
+    ) -> CitationPlan:
+        ref_pattern = r"\b(E\d+|S\d+(?:\.\d+)?|P\d+)\b"
+        audit_refs = list(dict.fromkeys(re.findall(ref_pattern, audit)))
+        answer_refs = list(dict.fromkeys(re.findall(ref_pattern, answer)))
+        mentioned_refs = list(dict.fromkeys([*answer_refs, *audit_refs]))
+        refs: list[str] = []
+        for ref in mentioned_refs:
+            if re.fullmatch(r"S\d+", ref):
+                refs.extend(candidate for candidate in self.sources if candidate.startswith(f"{ref}."))
+            else:
+                refs.append(ref)
+        if not refs:
+            refs = [item["source_ref"][1:-1] for item in fallback_packet]
+        citations: list[CitationRef] = []
+        source_indices: dict[str, int] = {}
+        source_identity_indices: dict[tuple[str, str], int] = {}
+        for ref in refs:
+            retained = self.retained_evidence.get(ref)
+            if retained is not None:
+                source = self.source_for_private_ref(ref)
+                slices = self.retained_evidence_slices.get(ref, [])
+                if source and source.receipt_id and source.result_id and slices:
+                    citations.append(
+                        CitationRef(
+                            receipt_id=source.receipt_id,
+                            result_id=source.result_id,
+                            slices=list(slices),
+                        )
+                    )
+                    source_indices[ref] = len(citations)
+                continue
+
+            source = self.sources.get(ref)
+            if not source or not source.receipt_id or not source.result_id:
+                continue
+            identity = (source.receipt_id, source.result_id)
+            index = source_identity_indices.get(identity)
+            slices = _merge_citation_slices(
+                [],
+                final_source_slices.get(ref, self.source_slices.get(ref, [])),
+            )
+            if index is None:
+                citations.append(
+                    CitationRef(
+                        receipt_id=source.receipt_id,
+                        result_id=source.result_id,
+                        slices=slices,
+                    )
+                )
+                index = len(citations)
+                source_identity_indices[identity] = index
+            else:
+                citation = citations[index - 1]
+                citations[index - 1] = CitationRef(
+                    receipt_id=citation.receipt_id,
+                    result_id=citation.result_id,
+                    slices=_merge_citation_slices(list(citation.slices), slices),
+                )
+            source_indices[ref] = index
+        return CitationPlan(
+            citations=citations,
+            source_indices=source_indices,
+        )
+
+
+def _private_source_refs(answer: str) -> list[str]:
+    return list(dict.fromkeys(re.findall(r"\[(E\d+|S\d+(?:\.\d+)?|P\d+)\]", answer)))
+
+
+def _normalize_grouped_private_refs(answer: str) -> str:
+    ref = r"(?:E\d+|S\d+(?:\.\d+)?|P\d+)"
+    grouped = re.compile(rf"\[({ref}(?:\s*,\s*{ref})+)\]")
+    return grouped.sub(
+        lambda match: "".join(
+            f"[{item}]"
+            for item in re.findall(ref, match.group(1))
+        ),
+        answer,
+    )
+
+
+def _split_private_response_citations(answer: str) -> tuple[str, tuple[str, ...]]:
+    marker = "PRIVATE_RESPONSE_CITATIONS:"
+    if marker not in answer:
+        return answer, ()
+    match = re.search(
+        r"(?m)^PRIVATE_RESPONSE_CITATIONS:\s*"
+        r"(?P<refs>(?:\[(?:E\d+|S\d+(?:\.\d+)?|P\d+)\]\s*)+)$",
+        answer,
+    )
+    if match is None or match.end() != len(answer):
+        raise ValueError(
+            "PRIVATE_RESPONSE_CITATIONS must be the final line and contain only exact private refs"
+        )
+    body = answer[: match.start()].rstrip()
+    if not body:
+        raise ValueError("response-only citation mode requires a non-empty answer body")
+    if _private_source_refs(body):
+        raise ValueError(
+            "response-only citation mode cannot also place private refs in the answer body"
+        )
+    return body, tuple(_private_source_refs(match.group("refs")))
+
+
+def _validate_private_answer_refs(
+    answer: str,
+    allowed_refs: set[str],
+) -> None:
+    _split_private_response_citations(answer)
+    if "[[" in answer or "]]" in answer:
+        raise ValueError("write private source refs such as [P1], not public numeric markers")
+    if re.search(
+        r"(?i)(?:https?://|\bwww\.|(?<!:)//(?=[a-z0-9])|"
+        r"(?<![\w@])(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,63}/[^\s)]*)",
+        answer,
+    ):
+        raise ValueError("do not render raw URLs in the reader-facing answer")
+    if re.search(
+        r"(?im)^\s{0,3}(?:#{1,6}\s*)?(?:sources?|citations?|references?|bibliography|works\s+cited)\s*:?\s*$",
+        answer,
+    ):
+        raise ValueError("do not render a citation or source-list section")
+
+    exact_ref_pattern = re.compile(r"\[(?:E\d+|S\d+(?:\.\d+)?|P\d+)\]")
+    without_exact_refs = exact_ref_pattern.sub("", answer)
+    if re.search(r"\[\s*\d+\s*\]", without_exact_refs):
+        raise ValueError(
+            "write private source refs such as [P1], not numeric citation markers such as [1]"
+        )
+    if re.search(r"\b(?:E\d+|S\d+(?:\.\d+)?|P\d+)\b", without_exact_refs):
+        raise ValueError(
+            "each private source ref must appear alone in brackets, for example [P1]"
+        )
+    refs = _private_source_refs(answer)
+    unknown_refs = [ref for ref in refs if ref not in allowed_refs]
+    if unknown_refs:
+        raise ValueError(f"answer cites unavailable source refs: {', '.join(unknown_refs)}")
+    if allowed_refs and not refs:
+        raise ValueError("answer must place at least one supplied source ref after a supported factual claim")
+
+
+def _render_public_citations(
+    answer: str,
+    plan: CitationPlan,
+) -> tuple[str, list[CitationRef]]:
+    answer_body, response_only_refs = _split_private_response_citations(answer)
+    refs = _private_source_refs(answer)
+    missing_refs = [ref for ref in refs if ref not in plan.source_indices]
+    if missing_refs:
+        raise ValueError(
+            "answer source refs do not have materializable citations: "
+            + ", ".join(missing_refs)
+        )
+    rendered = re.sub(
+        r"\[(E\d+|S\d+(?:\.\d+)?|P\d+)\]",
+        lambda match: f"[[{plan.source_indices[match.group(1)]}]]",
+        answer_body,
+    )
+    marker_indices = [
+        int(value)
+        for value in re.findall(r"\[\[(\d+)]]", rendered)
+    ]
+    invalid_indices = sorted(
+        {
+            index
+            for index in marker_indices
+            if index < 1 or index > len(plan.citations)
+        }
+    )
+    if invalid_indices:
+        raise ValueError(
+            "answer contains citation indices without response citations: "
+            + ", ".join(str(index) for index in invalid_indices)
+        )
+    if plan.citations and not marker_indices and not response_only_refs:
+        raise ValueError("answer has response citations but no inline citation markers")
+
+    used_indices = (
+        list(range(1, len(plan.citations) + 1))
+        if response_only_refs
+        else sorted(set(marker_indices))
+    )
+    compact_indices = {
+        old_index: new_index
+        for new_index, old_index in enumerate(used_indices, start=1)
+    }
+    rendered = re.sub(
+        r"\[\[(\d+)]]",
+        lambda match: f"[[{compact_indices[int(match.group(1))]}]]",
+        rendered,
+    )
+    return (
+        rendered.strip(),
+        [plan.citations[index - 1] for index in used_indices],
+    )
+
+
+def _merge_citation_slices(
+    existing: list[CitationSlice],
+    additional: list[CitationSlice],
+) -> list[CitationSlice]:
+    spans = sorted(
+        (int(item.start), int(item.end)) for item in [*existing, *additional] if int(item.end) > int(item.start)
+    )
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return [CitationSlice(start=start, end=end) for start, end in merged]
+
+
+def _assistant_message(result: Any) -> Any:
+    choices = result.llm.choices
+    if len(choices) != 1:
+        raise RuntimeError(f"expected one LLM choice, received {len(choices)}")
+    return choices[0].message
+
+
+def _assistant_evidence_context(message: Any) -> str:
+    text_parts = [
+        str(part.text)
+        for part in message.content
+        if getattr(part, "text", None)
+    ]
+    return "\n".join(
+        item
+        for item in (str(message.reasoning or "").strip(), *text_parts)
+        if item
+    )
+
+
+def _collect_vfs_keys(value: Any) -> list[str]:
+    keys: list[str] = []
+    if isinstance(value, dict):
+        for field, item in value.items():
+            if field in {"key", "vfs_key"} and isinstance(item, str):
+                keys.append(item)
+            elif field in {"keys", "matched_keys"} and isinstance(item, list):
+                keys.extend(candidate for candidate in item if isinstance(candidate, str))
+            else:
+                keys.extend(_collect_vfs_keys(item))
+    elif isinstance(value, list):
+        for item in value:
+            keys.extend(_collect_vfs_keys(item))
+    return list(dict.fromkeys(keys))
+
+
+def _compact_consumed_tool_results(messages: list[Any]) -> None:
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str) or len(content) < 1_000:
+            continue
+        try:
+            output = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(output, dict):
+            continue
+        receipt: dict[str, Any] = {"ok": output.get("ok", False)}
+        keys = _collect_vfs_keys(output)
+        if keys:
+            receipt["vfs_keys"] = keys
+        if output.get("error_type"):
+            receipt["error_type"] = output["error_type"]
+            receipt["details"] = str(output.get("details", ""))[:1_000]
+        if output.get("audit"):
+            receipt["audit"] = output["audit"]
+        similarity = output.get("similarity")
+        if isinstance(similarity, dict):
+            receipt["similarity"] = {
+                field: similarity[field]
+                for field in ("status", "trigger", "reason")
+                if field in similarity
+            }
+        message["content"] = json.dumps(receipt, ensure_ascii=False)
+
+
+def _compact_consumed_assistant_reasoning(messages: list[Any]) -> None:
+    for index, message in enumerate(messages):
+        if isinstance(message, LlmMessage):
+            if message.role == "assistant" and message.reasoning_details is not None:
+                messages[index] = replace(message, reasoning_details=None)
+            continue
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        message.pop("reasoning", None)
+        message.pop("reasoning_details", None)
+
+
+def _record_retrieval_receipt(
+    state: ResearchState,
+    name: str,
+    args: dict[str, Any],
+    output: dict[str, Any],
+) -> None:
+    if not output.get("ok") or name not in {"search_web", "fetch_page"}:
+        return
+    if name == "search_web":
+        destinations = [str(output["vfs_key"])]
+        source_index = [
+            {
+                "source_ref": item["source_ref"],
+                "vfs_key": item["vfs_key"],
+                "title": item["title"],
+                "url": item["url"],
+            }
+            for item in output.get("results", [])
+            if isinstance(item, dict)
+        ]
+    else:
+        destinations = [
+            str(page["vfs_key"]) for page in output.get("pages", []) if isinstance(page, dict) and page.get("vfs_key")
+        ]
+        source_index = [
+            {
+                "source_ref": item["source_ref"],
+                "vfs_key": item["vfs_key"],
+                "title": item["title"],
+                "url": item["url"],
+            }
+            for item in output.get("pages", [])
+            if isinstance(item, dict)
+        ]
+    signature = _retrieval_signature(name, args)
+    state.retrieval_output_cache[signature] = output
+    receipt = state.retrieval_receipts.setdefault(
+        signature,
+        {
+            "tool": name,
+            "arguments": args,
+            "destinations": [],
+            "sources": [],
+            "calls": 0,
+        },
+    )
+    receipt["calls"] += 1
+    receipt["destinations"] = list(dict.fromkeys([*receipt["destinations"], *destinations]))
+    known_sources = {str(item["source_ref"]): item for item in [*receipt["sources"], *source_index]}
+    receipt["sources"] = list(known_sources.values())
+
+
+def _record_retrieval_failure(
+    state: ResearchState,
+    name: str,
+    args: dict[str, Any],
+    output: dict[str, Any],
+) -> None:
+    if output.get("ok") or name not in {"search_web", "fetch_page"}:
+        return
+    signature = _retrieval_signature(name, args)
+    receipt = state.retrieval_failure_receipts.setdefault(
+        signature,
+        {
+            "tool": name,
+            "arguments": args,
+            "calls": 0,
+        },
+    )
+    receipt["calls"] += 1
+    receipt["error_type"] = output.get("error_type")
+    receipt["details"] = str(output.get("details", ""))[:1_000]
+    if name == "fetch_page":
+        receipt["domain"] = urlsplit(str(args.get("url", ""))).netloc
+
+
+def _retrieval_signature(name: str, args: dict[str, Any]) -> str:
+    return json.dumps(
+        {"tool": name, "arguments": args},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def _record_vfs_operation_receipt(
+    state: ResearchState,
+    name: str,
+    args: dict[str, Any],
+    output: dict[str, Any],
+) -> None:
+    if not output.get("ok") or name not in {"vfs_read", "vfs_search", "vfs_list"}:
+        return
+
+    if name == "vfs_read":
+        lines = output.get("lines", [])
+        outcome = {
+            "returned_line_count": len(lines),
+            "first_line": lines[0].get("line") if lines else None,
+            "last_line": lines[-1].get("line") if lines else None,
+            "truncated": bool(output.get("truncated")),
+        }
+    elif name == "vfs_search":
+        regex = output.get("regex", {})
+        similarity = output.get("similarity", {})
+        outcome = {
+            "regex_total_match_count": regex.get("total_match_count"),
+            "regex_returned_match_count": len(regex.get("matches", [])),
+            "regex_next_cursor": regex.get("next_cursor"),
+            "similarity_status": similarity.get("status"),
+            "similarity_returned_chunk_count": len(similarity.get("chunks", [])),
+        }
+    else:
+        outcome = {"returned_key_count": len(output.get("keys", []))}
+
+    signature = json.dumps(
+        {"tool": name, "arguments": args},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    receipt = state.vfs_operation_receipts.setdefault(
+        signature,
+        {
+            "tool": name,
+            "arguments": args,
+            "calls": 0,
+            "outcome": outcome,
+        },
+    )
+    receipt["calls"] += 1
+    receipt["outcome"] = outcome
+
+
+def _collect_source_refs(value: Any) -> list[str]:
+    refs: list[str] = []
+    if isinstance(value, dict):
+        for field, item in value.items():
+            if field == "source_ref" and isinstance(item, str):
+                refs.append(item.strip().strip("[]"))
+            else:
+                refs.extend(_collect_source_refs(item))
+    elif isinstance(value, list):
+        for item in value:
+            refs.extend(_collect_source_refs(item))
+    return list(dict.fromkeys(refs))
+
+
+def _capture_budget(state: ResearchState, result: Any) -> None:
+    budget = getattr(result, "budget", None)
+    if budget is None:
+        return
+    used_budget = float(budget.session_used_budget_usd)
+    previous_used = (
+        float(state.budget_snapshot["session_used_budget_usd"])
+        if state.budget_snapshot is not None
+        else None
+    )
+    if previous_used is not None and used_budget < previous_used:
+        return
+    if previous_used is not None:
+        state.max_observed_budget_step_usd = max(
+            state.max_observed_budget_step_usd,
+            used_budget - previous_used,
+        )
+    state.budget_snapshot = {
+        "session_hard_limit_usd": round(float(budget.session_hard_limit_usd), 6),
+        "session_used_budget_usd": round(used_budget, 6),
+        "session_hard_remaining_usd": round(
+            max(
+                0.0,
+                float(budget.session_hard_limit_usd) - float(budget.session_used_budget_usd),
+            ),
+            6,
+        ),
+    }
+
+
+def _best_effort_checkpoint_required(
+    state: ResearchState,
+    elapsed_seconds: float,
+) -> bool:
+    if not state.audit_gap:
+        return False
+    if elapsed_seconds >= DEADLINE_NOTICE_SECONDS:
+        return True
+    if state.budget_snapshot is None or state.max_observed_budget_step_usd <= 0:
+        return False
+    remaining = state.budget_snapshot["session_hard_remaining_usd"]
+    # One repair observation normally needs a model decision and another model
+    # turn to consume it. Do not risk the existing answer checkpoint when the
+    # observed budget cannot fund that smallest complete cycle.
+    return remaining <= 2 * state.max_observed_budget_step_usd
+
+
+def _refresh_retrieval_receipt_message(
+    messages: list[Any],
+    state: ResearchState,
+) -> None:
+    marker = "Harness research memory"
+    messages[:] = [
+        message
+        for message in messages
+        if not (
+            isinstance(message, dict)
+            and message.get("role") == "user"
+            and isinstance(message.get("content"), str)
+            and message["content"].startswith(marker)
+        )
+    ]
+    if (
+        not state.research_state
+        and not state.audit_gap
+        and not state.budget_snapshot
+        and not state.retrieval_receipts
+        and not state.retrieval_failure_receipts
+        and not state.vfs_operation_receipts
+        and not state.retained_evidence
+        and not state.focused_lines
+    ):
+        return
+    sections: list[str] = []
+    if state.research_task_contract:
+        sections.append(
+            "Research task contract established before retrieval. It defines the requested result, "
+            "presuppositions, material interpretations, proof obligations, source scope, and response "
+            "contract. It is not evidence. Preserve its task-level obligations while allowing an "
+            "evidence question to become immaterial after supported filtering:\n"
+            + state.research_task_contract
+        )
+    if state.audit_gap:
+        sections.append(
+            "Latest finalization audit. These unresolved gaps override any stale claim in the "
+            "model-authored state that no uncertainty remains. Do not call "
+            "ready_to_finalize again until new evidence resolves them:\n" + state.audit_gap
+        )
+    if state.budget_snapshot:
+        sections.append(
+            "Latest hosted-tool budget snapshot. This is runtime state, not evidence:\n"
+            + json.dumps(state.budget_snapshot, ensure_ascii=False, indent=2)
+            + "\nFinish before the hard remaining amount reaches zero. After observing the "
+            "single result that resolves an audit gap, combine any now-independent "
+            "retain_evidence, update_research_state, and ready_to_finalize calls in the "
+            "same response instead of spending separate turns on each."
+        )
+    if state.research_state:
+        sections.append(
+            "Current model-authored research state. Revise it with update_research_state "
+            "when the answer, support, or next unresolved question changes:\n" + state.research_state
+        )
+    if state.retrieval_receipts:
+        compact_retrieval_receipts = [
+            {
+                key: receipt[key]
+                for key in ("tool", "arguments", "destinations", "calls")
+                if key in receipt
+            }
+            for receipt in state.retrieval_receipts.values()
+        ]
+        sections.append(
+            "Completed external retrieval receipts. These record actions and a compact "
+            "source inventory, not evidence. Each source entry maps a stable source ref "
+            "to the exact VFS key whose text can be re-read instead of repeating a web "
+            "search:\n"
+            + json.dumps(
+                compact_retrieval_receipts,
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        source_inventory_by_url: dict[str, dict[str, Any]] = {}
+        for source in state.sources.values():
+            source_inventory_by_url[source.url] = {
+                "source_ref": f"[{source.ref}]",
+                "vfs_key": source.key,
+                "title": source.title,
+                "url": source.url,
+            }
+        sections.append(
+            "Observed source inventory, deduplicated by exact URL. This is discovery metadata, "
+            "not evidence; inspect or re-read the VFS record when its text is needed:\n"
+            + json.dumps(
+                list(source_inventory_by_url.values()),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    if state.retrieval_failure_receipts:
+        sections.append(
+            "Failed external retrieval receipts. These failures are runtime observations, not "
+            "evidence. Do not silently repeat an identical failed request. A shared domain can "
+            "suggest the same access path is unhealthy, but it does not prove every URL on that "
+            "domain will fail; choose a different route unless a retry has a concrete reason:\n"
+            + json.dumps(
+                list(state.retrieval_failure_receipts.values()),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    if state.vfs_operation_receipts:
+        sections.append(
+            "Completed local VFS inspection operations. These are action history, not "
+            "evidence. Do not repeat the same read or search merely by changing wording. "
+            "When prior local inspections did not expose the missing relationship, change "
+            "the evidence route:\n"
+            + json.dumps(
+                list(state.vfs_operation_receipts.values()),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    if state.retained_evidence:
+        sections.append(
+            "Retained source excerpts selected by your prior reasoning. These are "
+            "external evidence and do not need to be retrieved again. Only each quote "
+            "is source evidence; research_note is your prior interpretation and may be wrong. "
+            "Use the harness-assigned evidence_ref when referring to a retained excerpt:\n"
+            + json.dumps(
+                list(state.retained_evidence.values()),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    focused_excerpts = state.focused_excerpts()
+    if focused_excerpts:
+        sections.append(
+            "Recent unretained VFS observations. VFS remains the full source of truth; "
+            "only one generous read-page of recent raw observations is replayed here. "
+            "Retain lines that support or contradict a material premise. Re-read a VFS "
+            "location when an older unretained observation becomes necessary:\n"
+            + json.dumps(
+                focused_excerpts,
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    messages.insert(
+        2,
+        {
+            "role": "user",
+            "content": f"{marker}:\n\n" + "\n\n".join(sections),
+        },
+    )
+
+
+def _merge_source_packets(
+    retained: list[dict[str, Any]],
+    current: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {str(item["source_ref"]): item for item in retained}
+    for item in current:
+        source_ref = str(item["source_ref"])
+        previous = merged.get(source_ref)
+        if previous is None:
+            merged[source_ref] = item
+            continue
+        previous_quote = str(previous.get("quote", "")).strip()
+        current_quote = str(item.get("quote", "")).strip()
+        if not previous_quote or previous_quote in current_quote:
+            quote = current_quote
+        elif not current_quote or current_quote in previous_quote:
+            quote = previous_quote
+        else:
+            quote = f"{previous_quote}\n\n{current_quote}"
+        merged[source_ref] = {**previous, **item, "quote": quote}
+    return list(merged.values())
+
+
+def _source_packet_signature(packet: list[dict[str, Any]]) -> str:
+    ordered = sorted(
+        packet,
+        key=lambda item: str(item.get("source_ref", "")),
+    )
+    payload = json.dumps(
+        ordered,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _is_retryable_llm_error(error: Exception) -> bool:
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "429",
+            "500",
+            "502",
+            "503",
+            "504",
+            "service unavailable",
+            "timed out",
+            "timeout",
+            "empty_output",
+            "empty output",
+            "tool execution failed",
+            "tool invocation failed",
+        )
+    )
+
+
+async def _call_model(
+    model_name: str,
+    messages: list[Any],
+    tools: list[dict[str, Any]] | None,
+    tool_choice: str,
+    parallel_tool_calls: bool,
+    timeout: float,
+    max_output_tokens: int | None = None,
+) -> Any:
+    if model_name == "glm5":
+        return await llm_chat(
+            provider="openrouter",
+            model="z-ai/glm-5",
+            messages=messages,
+            temperature=0.2,
+            max_output_tokens=max_output_tokens or GLM5_MAX_OUTPUT_TOKENS,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
+            thinking={"enabled": True, "effort": "low"},
+            provider_extra=OPENROUTER_GLM_PROVIDER_PREFERENCES,
+            timeout=timeout,
+        )
+    if model_name in {"gpt_oss", "gpt_oss_cerebras"}:
+        return await llm_chat(
+            provider="openrouter",
+            model="openai/gpt-oss-120b",
+            messages=messages,
+            temperature=0.0,
+            max_output_tokens=max_output_tokens or GPT_OSS_MAX_OUTPUT_TOKENS,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
+            thinking={"enabled": True, "effort": "high"},
+            provider_extra=(
+                OPENROUTER_GPT_CEREBRAS_PROVIDER_PREFERENCES
+                if model_name == "gpt_oss_cerebras"
+                else OPENROUTER_GPT_PROVIDER_PREFERENCES
+            ),
+            timeout=timeout,
+        )
+    if model_name == "openrouter_gemma":
+        return await llm_chat(
+            provider="openrouter",
+            model="google/gemma-4-31b-it",
+            messages=messages,
+            temperature=1.0,
+            max_output_tokens=max_output_tokens or OPENROUTER_GEMMA_MAX_OUTPUT_TOKENS,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
+            thinking={"enabled": True, "effort": "medium"},
+            provider_extra=OPENROUTER_GEMMA_PROVIDER_PREFERENCES,
+            timeout=timeout,
+        )
+    if model_name == "openrouter_gemma_prose":
+        return await llm_chat(
+            provider="openrouter",
+            model="google/gemma-4-31b-it",
+            messages=messages,
+            temperature=1.0,
+            max_output_tokens=max_output_tokens or OPENROUTER_GEMMA_MAX_OUTPUT_TOKENS,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
+            thinking={"enabled": True, "effort": "medium"},
+            provider_extra=OPENROUTER_GEMMA_PROVIDER_PREFERENCES,
+            timeout=timeout,
+        )
+    if model_name == "openrouter_gemma_stable":
+        return await llm_chat(
+            provider="openrouter",
+            model="google/gemma-4-31b-it",
+            messages=messages,
+            temperature=1.0,
+            max_output_tokens=max_output_tokens or OPENROUTER_GEMMA_MAX_OUTPUT_TOKENS,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
+            thinking={"enabled": True, "effort": "medium"},
+            provider_extra=OPENROUTER_GEMMA_STABLE_PROVIDER_PREFERENCES,
+            timeout=timeout,
+        )
+    if model_name == "inkling":
+        return await llm_chat(
+            provider="ai_gateway",
+            model="thinkingmachines/inkling",
+            messages=messages,
+            temperature=1.0,
+            max_output_tokens=max_output_tokens or INKLING_MAX_OUTPUT_TOKENS,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
+            thinking={"enabled": True, "effort": "medium"},
+            timeout=timeout,
+        )
+    if model_name == "ai_gateway_gemma":
+        return await llm_chat(
+            provider="ai_gateway",
+            model="google/gemma-4-31b-it",
+            messages=messages,
+            temperature=1.0,
+            max_output_tokens=max_output_tokens or AI_GATEWAY_GEMMA_MAX_OUTPUT_TOKENS,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
+            thinking={"enabled": True, "effort": "medium"},
+            provider_extra={
+                "providerOptions": {
+                    "gateway": {
+                        "only": ["cerebras"],
+                    }
+                }
+            },
+            timeout=timeout,
+        )
+    raise ValueError(f"unknown model: {model_name}")
+
+
+async def _chat_with_model_fallback(
+    models: tuple[str, ...],
+    messages: list[Any],
+    tools: list[dict[str, Any]] | None,
+    tool_choice: str,
+    parallel_tool_calls: bool,
+    timeout: float,
+    max_output_tokens: int | None = None,
+) -> Any:
+    if not models:
+        raise RuntimeError("no research model was configured")
+
+    raced_models = models[:2]
+    remaining_models = models[2:]
+    tasks = [
+        asyncio.create_task(
+            _call_model(
+                model,
+                messages,
+                tools,
+                tool_choice,
+                parallel_tool_calls,
+                timeout,
+                max_output_tokens,
+            )
+        )
+        for model in raced_models
+    ]
+    errors: list[Exception] = []
+    pending = set(tasks)
+    try:
+        while pending:
+            done, pending = await asyncio.wait(
+                pending,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done:
+                try:
+                    result = task.result()
+                except Exception as error:
+                    errors.append(error)
+                    continue
+                for unfinished in pending:
+                    unfinished.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                return result
+    finally:
+        for unfinished in pending:
+            unfinished.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    non_retryable = next(
+        (error for error in errors if not _is_retryable_llm_error(error)),
+        None,
+    )
+    if non_retryable is not None:
+        raise non_retryable
+
+    for model in remaining_models:
+        try:
+            return await _call_model(
+                model,
+                messages,
+                tools,
+                tool_choice,
+                parallel_tool_calls,
+                timeout,
+                max_output_tokens,
+            )
+        except Exception as error:
+            if not _is_retryable_llm_error(error):
+                raise
+            errors.append(error)
+
+    if not errors:
+        raise RuntimeError("no research model was configured")
+    raise errors[-1]
+
+
+async def _chat_with_sequential_model_fallback(
+    models: tuple[str, ...],
+    messages: list[Any],
+    tools: list[dict[str, Any]] | None,
+    tool_choice: str,
+    parallel_tool_calls: bool,
+    timeout: float,
+    max_output_tokens: int | None = None,
+    scheduler_state: ResearchState | None = None,
+    scheduler_lane: str | None = None,
+) -> Any:
+    if not models:
+        raise RuntimeError("no research model was configured")
+
+    ordered_models = models
+    if scheduler_state is not None and scheduler_lane is not None:
+        preferred_model = scheduler_state.preferred_models.get(scheduler_lane)
+        if preferred_model in models:
+            ordered_models = (
+                preferred_model,
+                *(model for model in models if model != preferred_model),
+            )
+
+    errors: list[Exception] = []
+    for model in ordered_models:
+        try:
+            result = await _call_model(
+                model,
+                messages,
+                tools,
+                tool_choice,
+                parallel_tool_calls,
+                timeout,
+                max_output_tokens,
+            )
+            if scheduler_state is not None and scheduler_lane is not None:
+                scheduler_state.preferred_models[scheduler_lane] = model
+            return result
+        except Exception as error:
+            if not _is_retryable_llm_error(error):
+                raise
+            errors.append(error)
+
+    raise errors[-1]
+
+
+async def _chat_with_scheduling(
+    models: tuple[str, ...],
+    messages: list[Any],
+    tools: list[dict[str, Any]] | None,
+    tool_choice: str,
+    parallel_tool_calls: bool,
+    timeout: float,
+    max_output_tokens: int | None = None,
+    scheduler_state: ResearchState | None = None,
+    scheduler_lane: str | None = None,
+) -> Any:
+    if MODEL_SCHEDULING == "race":
+        return await _chat_with_model_fallback(
+            models,
+            messages,
+            tools,
+            tool_choice,
+            parallel_tool_calls,
+            timeout,
+            max_output_tokens,
+        )
+    if MODEL_SCHEDULING in {"sequential", "state_aware"}:
+        return await _chat_with_sequential_model_fallback(
+            models,
+            messages,
+            tools,
+            tool_choice,
+            parallel_tool_calls,
+            timeout,
+            max_output_tokens,
+            scheduler_state,
+            scheduler_lane,
+        )
+    raise ValueError(f"unknown model scheduling policy: {MODEL_SCHEDULING}")
+
+
+async def _prose_chat_with_retry(
+    messages: list[Any],
+    tool_choice: str,
+    timeout: float,
+) -> Any:
+    return await _chat_with_scheduling(
+        ("glm5", "openrouter_gemma", "gpt_oss"),
+        messages,
+        None,
+        tool_choice,
+        False,
+        timeout,
+    )
+
+
+async def _final_answer_chat_with_retry(
+    messages: list[Any],
+    timeout: float,
+) -> Any:
+    return await _chat_with_scheduling(
+        ("ai_gateway_gemma", "openrouter_gemma_prose", "openrouter_gemma_stable", "glm5"),
+        messages,
+        None,
+        "none",
+        False,
+        timeout,
+    )
+
+
+async def _research_text(system: str, user: str) -> str:
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    result = await _prose_chat_with_retry(messages, "none", LLM_TIMEOUT)
+    text = result.llm.raw_text
+    if not text or not text.strip():
+        raise RuntimeError("research model returned empty prose")
+    return text.strip()
+
+
+async def _answer_text(
+    *,
+    state: ResearchState,
+    question: str,
+    prior_answer: str,
+    task_contract: str,
+    research_state: str,
+    finalization_reason: str,
+    packet: list[dict[str, Any]],
+    audit_correction: str = "",
+) -> str:
+    allowed_refs = {
+        str(item["source_ref"]).strip("[]")
+        for item in packet
+        if isinstance(item, dict) and item.get("source_ref")
+    }
+    messages: list[Any] = [
+        {"role": "system", "content": ANSWER_UPDATE_SYSTEM},
+        {
+            "role": "user",
+            "content": (
+                f"Original question:\n{question}\n\n"
+                f"Prior answer hypothesis:\n{prior_answer}\n\n"
+                f"Research task contract:\n{task_contract}\n\n"
+                f"Investigator's current research state:\n"
+                f"{research_state or '(not updated)'}\n\n"
+                f"Finalization reason:\n{finalization_reason}\n\n"
+                + (
+                    "Required correction from the evidence audit:\n"
+                    f"{audit_correction}\n\n"
+                    if audit_correction
+                    else ""
+                )
+                + "Supplied source records:\n"
+                f"{json.dumps(packet, ensure_ascii=False, indent=2)}"
+            ),
+        },
+    ]
+    for attempt in range(3):
+        result = await _final_answer_chat_with_retry(messages, LLM_TIMEOUT)
+        _capture_budget(state, result)
+        text = result.llm.raw_text
+        if not text or not text.strip():
+            raise RuntimeError("answer writer returned empty prose")
+        text = _normalize_grouped_private_refs(text.strip())
+        try:
+            _validate_private_answer_refs(
+                text,
+                allowed_refs,
+            )
+        except ValueError as error:
+            if attempt == 2:
+                raise
+            messages.extend(
+                [
+                    {"role": "assistant", "content": text},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Output contract error: {error}. Rewrite the complete answer. "
+                            "Use only the exact private source refs present in the supplied "
+                            "records; the harness renders public citation numbers."
+                        ),
+                    },
+                ]
+            )
+            continue
+        answer_body, response_only_refs = _split_private_response_citations(text)
+        if response_only_refs:
+            text = await _polish_exact_response(
+                state=state,
+                question=question,
+                answer_body=answer_body,
+                response_only_refs=response_only_refs,
+                allowed_refs=allowed_refs,
+            )
+        return text
+    raise AssertionError("unreachable")
+
+
+async def _polish_exact_response(
+    *,
+    state: ResearchState,
+    question: str,
+    answer_body: str,
+    response_only_refs: tuple[str, ...],
+    allowed_refs: set[str],
+) -> str:
+    control_line = "PRIVATE_RESPONSE_CITATIONS: " + " ".join(
+        f"[{ref}]" for ref in response_only_refs
+    )
+    messages: list[Any] = [
+        {"role": "system", "content": EXACT_RESPONSE_SYSTEM},
+        {
+            "role": "user",
+            "content": (
+                f"Original question:\n{question}\n\n"
+                f"Proposed answer body:\n{answer_body}\n\n"
+                f"Required unchanged control line:\n{control_line}"
+            ),
+        },
+    ]
+    for attempt in range(3):
+        result = await _chat_with_sequential_model_fallback(
+            ("gpt_oss_cerebras", "glm5", "ai_gateway_gemma"),
+            messages,
+            None,
+            "none",
+            False,
+            LLM_TIMEOUT,
+        )
+        _capture_budget(state, result)
+        polished = _normalize_grouped_private_refs((result.llm.raw_text or "").strip())
+        error: ValueError | None = None
+        try:
+            _validate_private_answer_refs(polished, allowed_refs)
+            polished_body, polished_refs = _split_private_response_citations(polished)
+            if polished_refs != response_only_refs:
+                raise ValueError("the response-only citation refs must remain unchanged")
+            if re.sub(r"\s+", "", polished_body) != re.sub(r"\s+", "", answer_body):
+                raise ValueError(
+                    "exact-response polishing may change whitespace only; every other character "
+                    "must remain unchanged"
+                )
+        except ValueError as caught:
+            error = caught
+        if error is None:
+            return polished
+        if attempt == 2:
+            raise error
+        messages.extend(
+            [
+                {"role": "assistant", "content": polished},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Output contract error: {error}. Return the corrected answer body and "
+                        f"the exact unchanged control line `{control_line}` only."
+                    ),
+                },
+            ]
+        )
+    raise AssertionError("unreachable")
+
+
+def _structured_output_tool(
+    output_schema: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    direct_object = output_schema.get("type") == "object"
+    parameters = (
+        output_schema
+        if direct_object
+        else {
+            "type": "object",
+            "properties": {
+                "output": {
+                    "description": (
+                        "The non-null JSON value that matches the caller's supplied output schema."
+                    )
+                }
+            },
+            "required": ["output"],
+            "additionalProperties": False,
+        }
+    )
+    return (
+        {
+            "type": "function",
+            "function": {
+                "name": "submit_structured_output",
+                "description": (
+                    "Submit the complete final value required by the caller's JSON Schema."
+                ),
+                "parameters": parameters,
+                "strict": False,
+            },
+        },
+        direct_object,
+    )
+
+
+async def _materialize_structured_output(
+    *,
+    question: str,
+    answer: str,
+    task_contract: str,
+    evidence_records: list[dict[str, Any]],
+    output_schema: dict[str, Any],
+) -> Any:
+    tool, direct_object = _structured_output_tool(output_schema)
+    evidence_backed_answer = re.sub(r"\[\[\d+]]", "", answer).strip()
+    messages: list[Any] = [
+        {"role": "system", "content": STRUCTURED_OUTPUT_SYSTEM},
+        {
+            "role": "user",
+            "content": (
+                f"Original question:\n{question}\n\n"
+                "Research task contract. It defines the requested result, material interpretations, "
+                "source/time scope, and response obligations; it is not factual evidence:\n"
+                f"{task_contract}\n\n"
+                f"Completed evidence-backed answer:\n{evidence_backed_answer}\n\n"
+                "Authoritative source records selected by the completed answer and audit:\n"
+                f"{json.dumps(evidence_records, ensure_ascii=False, indent=2)}\n\n"
+                "Required JSON Schema:\n"
+                f"{json.dumps(output_schema, ensure_ascii=False, indent=2)}"
+            ),
+        },
+    ]
+    for attempt in range(3):
+        result = await _chat_with_scheduling(
+            INVESTIGATION_MODELS,
+            messages,
+            [tool],
+            "required",
+            False,
+            LLM_TIMEOUT,
+        )
+        assistant = _assistant_message(result)
+        calls = list(assistant.tool_calls or ())
+        error: ValueError | None = None
+        output: Any = None
+        if len(calls) != 1:
+            error = ValueError(
+                "call submit_structured_output exactly once; "
+                f"received {len(calls)} tool calls"
+            )
+        else:
+            call = calls[0]
+            try:
+                if call.name != "submit_structured_output":
+                    raise ValueError(
+                        f"unexpected tool {call.name}; call submit_structured_output"
+                    )
+                arguments = json.loads(call.arguments)
+                if not isinstance(arguments, dict):
+                    raise ValueError("tool arguments must be a JSON object")
+                if direct_object:
+                    output = arguments
+                else:
+                    if set(arguments) != {"output"}:
+                        raise ValueError(
+                            "non-object output must be submitted in the sole `output` argument"
+                        )
+                    output = arguments["output"]
+                if output is None:
+                    raise ValueError("top-level null is not a valid miner answer")
+                validate_output_against_schema(output, output_schema)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as caught:
+                error = ValueError(str(caught))
+        if error is None:
+            return output
+        if attempt == 2:
+            raise error
+
+        messages.append(assistant.to_input_message())
+        if calls:
+            for call in calls:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": json.dumps(
+                            {
+                                "ok": False,
+                                "error_type": "tool_argument_validation",
+                                "details": str(error),
+                            }
+                        ),
+                    }
+                )
+        else:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"Output contract error: {error}. Call the required tool with "
+                        "the complete schema-conforming value."
+                    ),
+                }
+            )
+    raise AssertionError("unreachable")
+
+
+async def _expected_answer_text(question: str) -> str:
+    messages = [
+        {"role": "system", "content": EXPECTED_ANSWER_SYSTEM},
+        {"role": "user", "content": question},
+    ]
+    try:
+        result = await _call_model(
+            "inkling",
+            messages,
+            None,
+            "none",
+            False,
+            LLM_TIMEOUT,
+        )
+    except Exception as error:
+        if not _is_retryable_llm_error(error):
+            raise
+        result = await _chat_with_scheduling(
+            ("gpt_oss", "openrouter_gemma"),
+            messages,
+            None,
+            "none",
+            False,
+            LLM_TIMEOUT,
+        )
+    text = result.llm.raw_text
+    if not text or not text.strip():
+        raise RuntimeError("research model returned empty prose")
+    return text.strip()
+
+
+async def _research_task_contract_text(
+    question: str,
+    output_schema: dict[str, Any] | None,
+) -> str:
+    messages: list[Any] = [
+        {"role": "system", "content": TASK_ANALYSIS_SYSTEM},
+        {
+            "role": "user",
+            "content": _task_analysis_user_message(question, output_schema),
+        },
+    ]
+    for _attempt in range(160):
+        result = await _chat_with_scheduling(
+            TASK_ANALYSIS_MODELS,
+            messages=messages,
+            tools=TASK_ANALYSIS_TOOLS,
+            tool_choice="required",
+            parallel_tool_calls=False,
+            timeout=LLM_TIMEOUT,
+            max_output_tokens=None,
+        )
+        assistant = _assistant_message(result)
+        calls = list(assistant.tool_calls or ())
+        try:
+            return _research_task_contract_from_calls(calls)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            messages.append(assistant.to_input_message())
+            if calls:
+                for call in calls:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "content": json.dumps(
+                                {
+                                    "ok": False,
+                                    "error_type": "tool_argument_validation",
+                                    "details": str(error),
+                                }
+                            ),
+                        }
+                    )
+            else:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Tool call error: {error}. Call "
+                            "set_research_task_contract exactly once with the complete contract."
+                        ),
+                    }
+                )
+    raise RuntimeError("task analysis did not produce a contract within the generous turn ceiling")
+
+
+def _task_analysis_user_message(
+    question: str,
+    output_schema: dict[str, Any] | None,
+) -> str:
+    message = f"Original question:\n{question}"
+    if output_schema is not None:
+        message += (
+            "\n\nCaller-provided JSON Schema. Treat its required fields and value shapes as part "
+            "of the response contract, not as factual evidence:\n"
+            + json.dumps(output_schema, ensure_ascii=False, indent=2)
+        )
+    return message
+
+
+def _research_task_contract_from_calls(calls: list[Any]) -> str:
+    if len(calls) != 1 or calls[0].name != "set_research_task_contract":
+        raise ValueError(
+            "task analysis must call set_research_task_contract exactly once"
+        )
+    arguments = json.loads(calls[0].arguments)
+    if not isinstance(arguments, dict):
+        raise ValueError("research task contract tool arguments must be an object")
+    if set(arguments) != {"contract"}:
+        raise ValueError(
+            "research task contract tool arguments must contain only `contract`"
+        )
+    task_contract = arguments["contract"]
+    if not isinstance(task_contract, str):
+        raise ValueError("research task contract must be a string")
+    task_contract = task_contract.strip()
+    if not task_contract:
+        raise ValueError("research task contract must not be empty")
+    return task_contract
+
+
+def _parse_audit(text: str) -> tuple[str, str]:
+    matches = list(
+        re.finditer(
+            r"(?m)^VERDICT (READY|CONTINUE|REVISE)"
+            r"(?:(?::[ \t]*|[ \t]+)(.*))?[ \t]*$",
+            text,
+        )
+    )
+    if len(matches) != 1:
+        raise ValueError("audit must contain exactly one VERDICT line")
+    match = matches[0]
+    verdict = match.group(1)
+    inline = (match.group(2) or "").strip()
+    following = text[match.end() :].strip()
+    payload = "\n".join(part for part in (inline, following) if part)
+    if verdict == "REVISE" and not payload:
+        raise ValueError("VERDICT REVISE must include a complete replacement answer")
+    if verdict == "CONTINUE" and not payload:
+        raise ValueError("VERDICT CONTINUE must name the missing observation")
+    return verdict, payload
+
+
+def _parse_provenance_audit(text: str) -> tuple[str, str]:
+    match = re.fullmatch(
+        r"VERDICT (PASS|CONTINUE)(?::[ \t]*(.+))?",
+        text.strip(),
+        flags=re.DOTALL,
+    )
+    if match is None:
+        raise ValueError("provenance audit must contain exactly one VERDICT line")
+    verdict = match.group(1)
+    payload = (match.group(2) or "").strip()
+    if verdict == "PASS" and payload:
+        raise ValueError("VERDICT PASS must not include a payload")
+    if verdict == "CONTINUE" and not payload:
+        raise ValueError("VERDICT CONTINUE must name the missing direct source")
+    return verdict, payload
+
+
+async def _provenance_audit(
+    state: ResearchState,
+    question: str,
+    answer: str,
+    packet: list[dict[str, Any]],
+) -> str:
+    answer_refs = set(_private_source_refs(answer))
+    source_metadata = [
+        {
+            "source_ref": item.get("source_ref"),
+            "title": item.get("title"),
+            "url": item.get("url"),
+            "cited_by_answer": str(item.get("source_ref", "")).strip("[]") in answer_refs,
+        }
+        for item in packet
+    ]
+    messages: list[Any] = [
+        {"role": "system", "content": PROVENANCE_AUDIT_SYSTEM},
+        {
+            "role": "user",
+            "content": (
+                f"Original question:\n{question}\n\n"
+                "Pre-answer research task contract derived from the original question. It is not factual "
+                "evidence. Use its source and time scope when deciding which publisher, edition, page, "
+                "report, or dataset the question requires:\n"
+                f"{state.research_task_contract or '(not recorded)'}\n\n"
+                f"Current answer:\n{answer}\n\n"
+                "Metadata for supplied source records. `cited_by_answer` is context only; an uncited "
+                "direct record remains available to the main evidence audit:\n"
+                f"{json.dumps(source_metadata, ensure_ascii=False, indent=2)}"
+            ),
+        },
+    ]
+    for attempt in range(3):
+        result = await _chat_with_sequential_model_fallback(
+            PROVENANCE_AUDIT_MODELS,
+            messages,
+            None,
+            "none",
+            False,
+            LLM_TIMEOUT,
+        )
+        _capture_budget(state, result)
+        text = (result.llm.raw_text or "").strip()
+        if not text:
+            raise RuntimeError("provenance auditor returned empty output")
+        try:
+            _parse_provenance_audit(text)
+        except ValueError as error:
+            if attempt == 2:
+                raise
+            messages.extend(
+                [
+                    {"role": "assistant", "content": text},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Output contract error: {error}. Return exactly one allowed VERDICT line. "
+                            "Preserve your source-provenance judgment and correct only the output format."
+                        ),
+                    },
+                ]
+            )
+            continue
+        return text
+    raise AssertionError("unreachable")
+
+
+async def _main_audit(
+    state: ResearchState,
+    question: str,
+    answer: str,
+    packet: list[dict[str, Any]],
+) -> str:
+    answer_refs = set(_private_source_refs(answer))
+    audit_packet: list[dict[str, Any]] = []
+    for item in packet:
+        private_ref = str(item.get("source_ref", "")).strip("[]")
+        audit_item = {
+            **item,
+            "cited_by_answer": private_ref in answer_refs,
+        }
+        numeric_findings = state.numeric_support_findings.get(private_ref)
+        if numeric_findings:
+            audit_item["numeric_support_findings"] = numeric_findings
+        audit_packet.append(audit_item)
+    source_inventory = [
+        {
+            "source_ref": f"[{source.ref}]",
+            "title": source.title,
+            "url": source.url,
+        }
+        for source in state.sources.values()
+    ]
+    messages = [
+        {"role": "system", "content": AUDIT_SYSTEM},
+        {
+            "role": "user",
+            "content": (
+                f"Original question:\n{question}\n\n"
+                "Pre-answer research task contract derived from the original question. It is not factual "
+                "evidence. Preserve its task-level obligations while allowing an evidence question to "
+                "become immaterial after supported filtering:\n"
+                f"{state.research_task_contract or '(not recorded)'}\n\n"
+                "Observed source inventory (discovery metadata only; titles and URLs are "
+                "not evidence):\n"
+                f"{json.dumps(source_inventory, ensure_ascii=False, indent=2)}\n\n"
+                f"Supplied source records:\n"
+                f"{json.dumps(audit_packet, ensure_ascii=False, indent=2)}\n\n"
+                f"Current answer:\n{answer}"
+            ),
+        },
+    ]
+    for attempt in range(3):
+        result = await _chat_with_sequential_model_fallback(
+            AUDIT_MODELS,
+            messages,
+            None,
+            "none",
+            False,
+            LLM_TIMEOUT,
+        )
+        _capture_budget(state, result)
+        text = result.llm.raw_text
+        if not text or not text.strip():
+            raise RuntimeError("auditor returned empty output")
+        text = text.strip()
+        try:
+            verdict, payload = _parse_audit(text)
+            if verdict in {"READY", "REVISE"} and re.search(r"(?m)^MISSING:", text):
+                raise ValueError(
+                    f"VERDICT {verdict} is invalid while a material premise is MISSING; "
+                    "a MISSING line must name a real unresolved premise and cannot say none or "
+                    "not applicable. If no premise is missing, preserve the verdict and omit all "
+                    "MISSING lines. Correct only this output-format error; do not introduce a new "
+                    "evidence requirement"
+                )
+        except ValueError as error:
+            if attempt == 2:
+                raise
+            messages.extend(
+                [
+                    {"role": "assistant", "content": text},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Output contract error: {error}. Re-audit from the supplied records. "
+                            "Follow the required premise-line and final VERDICT format exactly; "
+                            "a replacement answer must use only exact supplied private source refs."
+                        ),
+                    },
+                ]
+            )
+            continue
+        return text
+    raise AssertionError("unreachable")
+
+
+async def _audit(
+    state: ResearchState,
+    question: str,
+    answer: str,
+    packet: list[dict[str, Any]],
+) -> str:
+    main_result, provenance_result = await asyncio.gather(
+        _main_audit(state, question, answer, packet),
+        _provenance_audit(state, question, answer, packet),
+        return_exceptions=True,
+    )
+    if isinstance(main_result, BaseException):
+        raise main_result
+    if isinstance(provenance_result, BaseException):
+        raise provenance_result
+
+    main_verdict, main_payload = _parse_audit(main_result)
+    if main_verdict == "REVISE":
+        return main_result
+    provenance_verdict, provenance_payload = _parse_provenance_audit(provenance_result)
+    if provenance_verdict == "PASS":
+        return main_result
+    if main_verdict == "CONTINUE":
+        compact_main_gap = re.sub(r"\s+", " ", main_payload).strip()
+        compact_provenance_gap = re.sub(r"\s+", " ", provenance_payload).strip()
+        combined_gap = (
+            f"Main evidence gap: {compact_main_gap} | "
+            f"Source provenance gap: {compact_provenance_gap}"
+        )
+        return (
+            f"MISSING: {combined_gap}\n\n"
+            f"VERDICT CONTINUE: {combined_gap}"
+        )
+    return f"MISSING: {provenance_payload}\n\nVERDICT CONTINUE: {provenance_payload}"
+
+
+def _result_identity(result: Any, index: int) -> tuple[str | None, str | None]:
+    if index >= len(result.results):
+        return result.receipt_id, None
+    return result.receipt_id, result.results[index].result_id
+
+
+async def _request_search(args: dict[str, Any]) -> Any:
+    query = str(args["query"]).strip()
+    num = int(args.get("num", 10))
+    return await search_web(
+        query,
+        provider=SEARCH_PROVIDER,
+        num=num,
+        timeout=SEARCH_TIMEOUT,
+    )
+
+
+def _materialize_search(
+    state: ResearchState,
+    args: dict[str, Any],
+    result: Any,
+    preview_budget_chars: int | None = None,
+) -> dict[str, Any]:
+    _capture_budget(state, result)
+    state.search_count += 1
+    parent_key = f"search://{state.search_count}"
+    state.vfs[parent_key] = result.response.model_dump_json(indent=2)
+    items: list[dict[str, Any]] = []
+    preview_chars = 8_000
+    if preview_budget_chars is not None:
+        preview_chars = min(
+            preview_chars,
+            max(300, preview_budget_chars // max(1, len(result.response.data))),
+        )
+    for index, item in enumerate(result.response.data):
+        ref = f"S{state.search_count}.{index + 1}"
+        key = f"{parent_key}/result/{index + 1}"
+        content = item.snippet or item.title or ""
+        state.vfs[key] = content
+        receipt_id, result_id = _result_identity(result, index)
+        state.sources[ref] = Source(
+            ref=ref,
+            key=key,
+            title=item.title or item.link,
+            url=item.link,
+            content=content,
+            receipt_id=receipt_id,
+            result_id=result_id,
+            preview_chars=preview_chars,
+        )
+        preview = state.bounded_preview(
+            key,
+            max_serialized_chars=min(
+                preview_chars,
+                RETRIEVAL_OBSERVATION_CHARS_PER_SOURCE,
+            ),
+        )
+        state.remember_rendered_lines(key, preview)
+        items.append(
+            {
+                "source_ref": f"[{ref}]",
+                "vfs_key": key,
+                "title": item.title,
+                "url": item.link,
+                "text": state.bounded_preview(
+                    key,
+                    max_serialized_chars=preview_chars,
+                ),
+            }
+        )
+    return {"ok": True, "vfs_key": parent_key, "results": items}
+
+
+async def _request_fetch(args: dict[str, Any]) -> Any:
+    url = str(args["url"]).strip()
+    if re.search(r"\.(?:xls|xlsx|xlsb)(?:[?#]|$)", url, flags=re.IGNORECASE):
+        raise ValueError(
+            "fetch_page cannot expose spreadsheet binary rows to VFS tools; search the "
+            "same publisher for a CSV, HTML, or plain-text companion"
+        )
+    return await fetch_page(url, provider=SEARCH_PROVIDER, timeout=FETCH_TIMEOUT)
+
+
+def _materialize_fetch(
+    state: ResearchState,
+    result: Any,
+    preview_budget_chars: int | None = None,
+) -> dict[str, Any]:
+    _capture_budget(state, result)
+    state.page_count += 1
+    items: list[dict[str, Any]] = []
+    preview_chars = 8_000
+    if preview_budget_chars is not None:
+        preview_chars = min(
+            preview_chars,
+            max(300, preview_budget_chars // max(1, len(result.response.data))),
+        )
+    for index, item in enumerate(result.response.data):
+        ref = f"P{state.page_count + index}"
+        base_key = f"page://{item.url}"
+        key = base_key
+        if key in state.vfs:
+            key = f"{base_key}#source={ref}"
+        state.vfs[key] = item.content
+        receipt_id, result_id = _result_identity(result, index)
+        state.sources[ref] = Source(
+            ref=ref,
+            key=key,
+            title=item.title or item.url,
+            url=item.url,
+            content=item.content,
+            receipt_id=receipt_id,
+            result_id=result_id,
+            preview_chars=preview_chars,
+        )
+        item_payload = {
+            "source_ref": f"[{ref}]",
+            "vfs_key": key,
+            "title": item.title,
+            "url": item.url,
+        }
+        observed_lines: list[dict[str, Any]] = []
+        if len(item.content) > preview_chars:
+            lexical_context = _execute_lexical_context(
+                state,
+                {"query": state.question, "targets": [key]},
+            )
+            item_payload["question_context"] = {
+                "instruction": (
+                    "These are the long page regions most relevant to the original question. Inspect them before "
+                    "issuing another page search or read."
+                ),
+                "windows": lexical_context["windows"],
+            }
+            for window in lexical_context["windows"]:
+                observed_lines.extend(window.get("lines", []))
+        replay_preview = state.bounded_preview(
+            key,
+            max_serialized_chars=min(
+                preview_chars,
+                RETRIEVAL_OBSERVATION_CHARS_PER_SOURCE,
+            ),
+        )
+        observed_lines.extend(replay_preview)
+        state.remember_rendered_lines(key, observed_lines)
+        item_payload["text"] = state.bounded_preview(
+            key,
+            max_serialized_chars=preview_chars,
+        )
+        items.append(item_payload)
+    state.page_count += max(0, len(result.response.data) - 1)
+    return {"ok": True, "pages": items}
+
+
+async def _execute_search(
+    state: ResearchState,
+    args: dict[str, Any],
+    preview_budget_chars: int | None = None,
+) -> dict[str, Any]:
+    return _materialize_search(
+        state,
+        args,
+        await _request_search(args),
+        preview_budget_chars,
+    )
+
+
+async def _execute_fetch(
+    state: ResearchState,
+    args: dict[str, Any],
+    preview_budget_chars: int | None = None,
+) -> dict[str, Any]:
+    return _materialize_fetch(
+        state,
+        await _request_fetch(args),
+        preview_budget_chars,
+    )
+
+
+def _execute_read(
+    state: ResearchState,
+    args: dict[str, Any],
+    *,
+    remember_focused: bool = True,
+) -> dict[str, Any]:
+    key = str(args["key"])
+    if key not in state.vfs:
+        raise ValueError(f"unknown VFS key: {key}")
+
+    lines = state.vfs[key].splitlines() or [""]
+
+    def resolve_bound(value: Any, default: int) -> int:
+        text = "" if value is None else str(value).strip()
+        if value is None or text.lower() in {"", "null", "none"}:
+            return default
+        location = state.line_locations.get(text)
+        if location is not None:
+            if location[0] != key:
+                raise ValueError(f"line ID {value} belongs to {location[0]}, not {key}")
+            return location[1]
+        line_number_match = re.fullmatch(r"L?(\d+)", text, flags=re.IGNORECASE)
+        if line_number_match is None:
+            raise ValueError(f"unknown line bound: {value}; use a displayed line ID or 1-based line number")
+        return max(0, int(line_number_match.group(1)) - 1)
+
+    start = resolve_bound(args.get("start_line"), 0)
+    end = resolve_bound(args.get("end_line"), len(lines) - 1)
+    if start >= len(lines):
+        raise ValueError(f"start_line is beyond the file; {key} has {len(lines)} lines")
+    if end < start:
+        raise ValueError("end_line must not precede start_line")
+    requested_end = min(len(lines) - 1, end)
+    selected_indices: list[int] = []
+    response_chars = 0
+    for index in range(start, requested_end + 1):
+        estimated_chars = len(lines[index]) + 80
+        if selected_indices and response_chars + estimated_chars > VFS_READ_PAGE_CHARS:
+            break
+        selected_indices.append(index)
+        response_chars += estimated_chars
+    selected = selected_indices
+    source_refs = [f"[{source.ref}]" for source in state.sources.values() if source.key == key]
+    next_index = selected[-1] + 1 if selected else start
+    truncated = next_index <= requested_end
+    next_line_id = None
+    if truncated:
+        next_line_id = state._line_id(key, next_index, lines[next_index])
+        state.line_locations[next_line_id] = (key, next_index)
+    if remember_focused:
+        state.remember_focused_lines(key, selected)
+    return {
+        "ok": True,
+        "key": key,
+        "source_refs": source_refs,
+        "lines": state.render_lines(key, selected),
+        "truncated": truncated,
+        "next_start_line": next_index + 1 if truncated else None,
+        "next_start_line_id": next_line_id,
+    }
+
+
+def _execute_list(state: ResearchState, args: dict[str, Any]) -> dict[str, Any]:
+    prefix = str(args["prefix"])
+    keys = [key for key in state.vfs if key.startswith(prefix)]
+    return {"ok": True, "keys": keys}
+
+
+def _execute_write(state: ResearchState, args: dict[str, Any]) -> dict[str, Any]:
+    key = str(args["key"])
+    if key == "*":
+        raise ValueError("'*' cannot be a VFS key")
+    source_refs = [source.ref for source in state.sources.values() if source.key == key]
+    if source_refs:
+        raise ValueError(
+            f"{key} is immutable citation source content for {', '.join(source_refs)}; "
+            "write research notes to a different VFS key"
+        )
+    state.forget_focused_lines(key)
+    state.vfs[key] = str(args["content"])
+    return {"ok": True, "key": key, "chars": len(state.vfs[key])}
+
+
+def _execute_delete(state: ResearchState, args: dict[str, Any]) -> dict[str, Any]:
+    key = str(args["key"])
+    source_refs = [source.ref for source in state.sources.values() if source.key == key]
+    if source_refs:
+        raise ValueError(
+            f"{key} is immutable citation source content for {', '.join(source_refs)} "
+            "and cannot be deleted"
+        )
+    existed = key in state.vfs
+    state.forget_focused_lines(key)
+    state.vfs.pop(key, None)
+    return {"ok": True, "key": key, "deleted": existed}
+
+
+def _numeric_literals(text: str) -> set[str]:
+    literals: set[str] = set()
+    for match in re.finditer(r"(?<![\w.])\d+(?:[,.]\d+)*%?", text):
+        prefix = text[: match.start()].rstrip()
+        if prefix.endswith(("<", ">")):
+            continue
+        if re.search(
+            r"(?:above|below|greater than|less than|lower than|more than|threshold(?: of)?)\s*$",
+            prefix,
+            flags=re.IGNORECASE,
+        ):
+            continue
+        raw = match.group(0)
+        digits = re.sub(r"\D", "", raw)
+        if len(digits) < 2 and not any(marker in raw for marker in (",", ".", "%")):
+            continue
+        literals.add(raw.rstrip("%").replace(",", ""))
+    return literals
+
+
+def _numeric_support_findings(
+    state: ResearchState,
+    source: Source,
+    note: str,
+    selected_lines: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    claim_text = re.sub(
+        (
+            r"\blines?\s+(?:L[0-9a-f]{10}|\d+)"
+            r"(?:\s*(?:-|to|through)\s*(?:L[0-9a-f]{10}|\d+))?"
+            r"(?:\s*\(L[0-9a-f]{10}\))?"
+        ),
+        "",
+        note,
+        flags=re.IGNORECASE,
+    )
+    note_numbers = _numeric_literals(claim_text) - _numeric_literals(state.question)
+    selected_numbers = _numeric_literals(
+        "\n".join(str(item["text"]) for item in selected_lines)
+    )
+    missing = note_numbers - selected_numbers
+    if not missing:
+        return []
+
+    source_lines = state.vfs[source.key].splitlines() or [""]
+    findings: list[dict[str, Any]] = []
+    for number in sorted(missing):
+        matching_indices = [
+            index
+            for index, line in enumerate(source_lines)
+            if number in _numeric_literals(line)
+        ]
+        locations = [
+            {
+                "line": index + 1,
+                "line_id": state._line_id(source.key, index, source_lines[index]),
+            }
+            for index in matching_indices[:3]
+        ]
+        findings.append(
+            {
+                "numeric_literal": number,
+                "selected_quote_contains_literal": False,
+                "same_literal_locations_elsewhere": locations,
+                "source_title_contains_literal": number in _numeric_literals(source.title),
+            }
+        )
+    return findings
+
+
+def _execute_retain_evidence(
+    state: ResearchState,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    source_identifier = str(args["source"]).strip().strip("[]")
+    source = state.sources.get(source_identifier)
+    if source is None:
+        source = next(
+            (candidate for candidate in state.sources.values() if candidate.key == source_identifier),
+            None,
+        )
+    if source is None:
+        if source_identifier in state.vfs and re.fullmatch(r"search://\d+", source_identifier):
+            raise ValueError(
+                f"{args['source']} is a search-result container, not a citable source; "
+                "use the displayed [Sx.y] source reference or search://N/result/y child key "
+                "that contains the supporting text"
+            )
+        raise ValueError(f"unknown source reference or VFS key: {args['source']}")
+    start_line = args.get("start_line")
+    end_line = args.get("end_line")
+    if start_line is None or end_line is None:
+        raise ValueError("start_line and end_line are required")
+    read_output = _execute_read(
+        state,
+        {
+            "key": source.key,
+            "start_line": start_line,
+            "end_line": end_line,
+        },
+        remember_focused=False,
+    )
+    note = str(args["note"]).strip()
+    numeric_findings = _numeric_support_findings(state, source, note, read_output["lines"])
+    line_ids = " ".join(str(item["line_id"]) for item in read_output["lines"])
+    previous_slices = list(state.source_slices.get(source.ref, []))
+
+    packet = state.source_packet(
+        f"{source.ref} {line_ids}",
+        allow_preview=False,
+        include_structured_csv=True,
+        prefer_retained=False,
+    )
+    if not packet:
+        raise RuntimeError(f"could not build evidence packet for source {source.ref}")
+    state.source_slices[source.ref] = _merge_citation_slices(
+        previous_slices,
+        list(state.source_slices.get(source.ref, [])),
+    )
+    retained = packet[0]
+    retained["research_note"] = note
+    retained_indices = {
+        state.line_locations[str(item["line_id"])][1]
+        for item in read_output["lines"]
+        if str(item["line_id"]) in state.line_locations
+    }
+    retained_slices = state.citation_slices(source.key, retained_indices)
+    retained_signature = tuple((item.start, item.end) for item in retained_slices)
+    for evidence_ref, existing in state.retained_evidence.items():
+        if str(existing.get("source_ref", "")).strip("[]") != source.ref:
+            continue
+        existing_signature = tuple(
+            (item.start, item.end)
+            for item in state.retained_evidence_slices.get(evidence_ref, [])
+        )
+        if (
+            retained_signature == existing_signature
+            and str(existing.get("research_note", "")).strip() == note
+        ):
+            return {"ok": True, "evidence_ref": f"[{evidence_ref}]", "already_retained": True}
+
+    evidence_ref = f"E{state.next_evidence_index}"
+    state.next_evidence_index += 1
+    retained["evidence_ref"] = f"[{evidence_ref}]"
+    state.retained_evidence[evidence_ref] = retained
+    state.retained_evidence_slices[evidence_ref] = retained_slices
+    if numeric_findings:
+        state.numeric_support_findings[evidence_ref] = numeric_findings
+    state.forget_focused_lines(source.key, retained_indices)
+    return {"ok": True, "evidence_ref": f"[{evidence_ref}]"}
+
+
+def _execute_discard_remaining_sources(
+    state: ResearchState,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    reason = str(args["reason"]).strip()
+    if not reason:
+        raise ValueError("reason must not be blank")
+    discarded_refs = set(state.review_source_refs)
+    discarded_source_count = len(discarded_refs)
+    state.review_source_refs.clear()
+    retained_keys = {
+        source.key
+        for retained in state.retained_evidence.values()
+        if (source := state.source_for_private_ref(str(retained.get("evidence_ref", "")).strip("[]")))
+    }
+    for ref in discarded_refs:
+        source = state.sources.get(ref)
+        if source is not None and source.key not in retained_keys:
+            state.forget_focused_lines(source.key)
+    return {"ok": True, "discarded_source_count": discarded_source_count}
+
+
+def _markdown_table_context(
+    state: ResearchState,
+    key: str,
+    match_index: int,
+) -> dict[str, Any] | None:
+    lines = state.vfs[key].splitlines() or [""]
+    separator_index: int | None = None
+    for index in range(match_index, 0, -1):
+        if re.fullmatch(r"\s*\|(?:\s*:?-+:?\s*\|)+\s*", lines[index]):
+            separator_index = index
+            break
+        if index < match_index and lines[index].lstrip().startswith("#"):
+            break
+    if separator_index is None:
+        return None
+
+    header_index = separator_index - 1
+    end_index = separator_index
+    for index in range(separator_index + 1, len(lines)):
+        if not lines[index].lstrip().startswith("|"):
+            break
+        end_index = index
+    return {
+        "start_line": header_index + 1,
+        "end_line": end_index + 1,
+        "header": state.render_lines(key, range(header_index, separator_index + 1)),
+    }
+
+
+def _execute_regex(state: ResearchState, args: dict[str, Any]) -> dict[str, Any]:
+    pattern = re.compile(str(args["pattern"]))
+    keys = state.resolve_targets([str(item) for item in args["targets"]])
+    cursor_value = args.get("cursor")
+    cursor = 0 if cursor_value is None else int(cursor_value)
+    if cursor < 0:
+        raise ValueError("cursor must be at least zero")
+    raw_matches: list[tuple[str, dict[str, Any]]] = []
+    for key in keys:
+        for item in state.render_lines(key):
+            if pattern.search(item["text"]):
+                raw_matches.append((key, item))
+
+    matches: list[dict[str, Any]] = []
+    page_chars = 0
+    for key, item in raw_matches[cursor:]:
+        match = {"key": key, **item}
+        source_refs = [f"[{source.ref}]" for source in state.sources.values() if source.key == key]
+        if source_refs:
+            match["source_refs"] = source_refs
+        table_context: dict[str, Any] | None = None
+        csv_records = state.structured_csv_records(
+            key,
+            [0, item["line"] - 1],
+        )
+        if csv_records:
+            match.pop("text")
+            match["csv_record"] = csv_records[0]
+        else:
+            table_context = _markdown_table_context(
+                state,
+                key,
+                item["line"] - 1,
+            )
+            if table_context is not None:
+                match["table"] = table_context
+        focused_indices = {item["line"] - 1}
+        if table_context is not None:
+            focused_indices.update(
+                int(header_line["line"]) - 1
+                for header_line in table_context["header"]
+            )
+        if source_refs:
+            state.remember_focused_lines(key, focused_indices)
+        matches.append(match)
+        page_chars += len(json.dumps(match, ensure_ascii=False, separators=(",", ":")))
+        if page_chars >= VFS_SEARCH_PAGE_CHARS:
+            break
+
+    next_offset = cursor + len(matches)
+    next_cursor = next_offset if next_offset < len(raw_matches) else None
+    return {
+        "ok": True,
+        "matched_keys": keys,
+        "total_match_count": len(raw_matches),
+        "cursor": cursor,
+        "matches": matches,
+        "next_cursor": next_cursor,
+    }
+
+
+def _chunks(state: ResearchState, keys: list[str]) -> list[dict[str, Any]]:
+    chunks: list[dict[str, Any]] = []
+    for key in keys:
+        content = state.vfs[key]
+        start = 0
+        index = 0
+        while start < len(content):
+            end = min(len(content), start + 3_000)
+            chunks.append(
+                {
+                    "key": key,
+                    "chunk": index,
+                    "start": start,
+                    "end": end,
+                    "text": content[start:end],
+                }
+            )
+            if end == len(content):
+                break
+            start = end - 300
+            index += 1
+    return chunks
+
+
+_LEXICAL_WORD_RE = re.compile(r"[a-z0-9][a-z0-9'.\-]{2,}")
+_LONG_QUOTED_PHRASE_RE = re.compile(r'"([^"]{24,})"|(?<![a-z0-9])\'([^\']{24,})\'', re.IGNORECASE)
+_LEXICAL_STOP_WORDS = frozenset(
+    "the and for with from that this have has was were are is been its their which what when where who how many much "
+    "according also into over under between during against about after before while other more most than".split()
+)
+
+
+def _lexical_terms(text: str) -> set[str]:
+    return {
+        word
+        for word in _LEXICAL_WORD_RE.findall(text.casefold())
+        if word not in _LEXICAL_STOP_WORDS
+    }
+
+
+def _long_quoted_phrases(text: str) -> list[str]:
+    return [
+        next(group for group in match.groups() if group is not None).strip()
+        for match in _LONG_QUOTED_PHRASE_RE.finditer(text)
+    ]
+
+
+def _exact_phrase_windows(text: str, phrases: list[str]) -> list[tuple[int, int, str]]:
+    windows: list[tuple[int, int, str]] = []
+    lowered = text.casefold()
+    leading_chars = (VFS_LEXICAL_WINDOW_CHARS * 3) // 4
+    for phrase in phrases:
+        search_from = 0
+        normalized_phrase = phrase.casefold()
+        while True:
+            match_start = lowered.find(normalized_phrase, search_from)
+            if match_start < 0:
+                break
+            start = max(0, match_start - leading_chars)
+            end = min(len(text), start + VFS_LEXICAL_WINDOW_CHARS)
+            start = max(0, end - VFS_LEXICAL_WINDOW_CHARS)
+            if not any(start < existing_end and existing_start < end for existing_start, existing_end, _ in windows):
+                windows.append((start, end, phrase))
+            search_from = match_start + len(normalized_phrase)
+    return windows
+
+
+def _lexical_windows(text: str, terms: set[str]) -> list[tuple[int, int, int]]:
+    if not text or not terms:
+        return []
+    if len(text) <= VFS_LEXICAL_WINDOW_CHARS:
+        return [(0, len(text), sum(term in text.casefold() for term in terms))]
+
+    step = max(600, VFS_LEXICAL_WINDOW_CHARS // 3)
+    lowered = text.lower()
+    scored: list[tuple[int, int]] = []
+    start = 0
+    while start < len(text):
+        window = lowered[start : start + VFS_LEXICAL_WINDOW_CHARS]
+        scored.append((sum(term in window for term in terms), start))
+        if start + VFS_LEXICAL_WINDOW_CHARS >= len(text):
+            break
+        start += step
+    scored.sort(key=lambda item: (-item[0], item[1]))
+
+    selected: list[tuple[int, int, int]] = []
+    for matched_term_count, start in scored:
+        if len(selected) >= VFS_LEXICAL_WINDOW_COUNT:
+            break
+        end = min(len(text), start + VFS_LEXICAL_WINDOW_CHARS)
+        if any(start < selected_end and selected_start < end for selected_start, selected_end, _ in selected):
+            continue
+        if selected and matched_term_count == 0:
+            continue
+        selected.append((start, end, matched_term_count))
+    return sorted(selected)
+
+
+def _execute_lexical_context(state: ResearchState, args: dict[str, Any]) -> dict[str, Any]:
+    keys = state.resolve_targets([str(item) for item in args["targets"]])
+    terms = _lexical_terms(f"{state.question}\n{args['query']}")
+    phrases = _long_quoted_phrases(state.question)
+    windows: list[dict[str, Any]] = []
+    for key in keys:
+        content = state.vfs[key]
+        selected: list[tuple[int, int, int, str | None]] = [
+            (start, end, len(terms), phrase)
+            for start, end, phrase in _exact_phrase_windows(content, phrases)
+        ]
+        for start, end, matched_term_count in _lexical_windows(content, terms):
+            if any(
+                start < selected_end and selected_start < end
+                for selected_start, selected_end, _, _ in selected
+            ):
+                continue
+            selected.append((start, end, matched_term_count, None))
+        for start, end, matched_term_count, exact_phrase in selected:
+            start_line = content[:start].count("\n")
+            end_line = content[:end].count("\n") + 1
+            windows.append(
+                {
+                    "key": key,
+                    "start": start,
+                    "end": end,
+                    "matched_term_count": matched_term_count,
+                    "exact_phrase": exact_phrase,
+                    "lines": state.render_lines(key, range(start_line, end_line)),
+                }
+            )
+    windows.sort(
+        key=lambda item: (
+            item["exact_phrase"] is None,
+            -int(item["matched_term_count"]),
+            str(item["key"]),
+            int(item["start"]),
+        )
+    )
+    return {"ok": True, "matched_keys": keys, "windows": windows[:VFS_LEXICAL_WINDOW_COUNT]}
+
+
+def _cosine(left: list[float], right: list[float]) -> float:
+    numerator = sum(a * b for a, b in zip(left, right, strict=True))
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    return numerator / (left_norm * right_norm) if left_norm and right_norm else 0.0
+
+
+async def _execute_similarity(state: ResearchState, args: dict[str, Any]) -> dict[str, Any]:
+    keys = state.resolve_targets([str(item) for item in args["targets"]])
+    embedded_chunks: list[tuple[dict[str, Any], list[float]]] = []
+    missing_chunks: list[dict[str, Any]] = []
+    missing_cache_keys: list[tuple[str, str]] = []
+    missing_chunk_counts: list[int] = []
+    for key in keys:
+        cache_key = (key, hashlib.sha256(state.vfs[key].encode()).hexdigest())
+        cached = state.document_embeddings.get(cache_key)
+        if cached is not None:
+            embedded_chunks.extend(cached)
+            continue
+        chunks = _chunks(state, [key])
+        missing_cache_keys.append(cache_key)
+        missing_chunk_counts.append(len(chunks))
+        missing_chunks.extend(chunks)
+
+    if not embedded_chunks and not missing_chunks:
+        return {"ok": True, "matched_keys": keys, "chunks": []}
+    query_result = await embed_text(
+        str(args["query"]),
+        provider="openrouter",
+        model="qwen/qwen3-embedding-8b",
+        input_type="query",
+        provider_extra=EMBEDDING_EXTRA,
+        timeout=EMBEDDING_TIMEOUT,
+    )
+    if missing_chunks:
+        document_result = await embed_text(
+            [chunk["text"] for chunk in missing_chunks],
+            provider="openrouter",
+            model="qwen/qwen3-embedding-8b",
+            input_type="document",
+            provider_extra=EMBEDDING_EXTRA,
+            timeout=EMBEDDING_TIMEOUT,
+        )
+        vectors = [item.embedding for item in sorted(document_result.response.data, key=lambda item: item.index)]
+        if len(vectors) != len(missing_chunks):
+            raise RuntimeError(
+                f"embedding result count mismatch: expected {len(missing_chunks)}, received {len(vectors)}"
+            )
+        offset = 0
+        for cache_key, chunk_count in zip(missing_cache_keys, missing_chunk_counts, strict=True):
+            cached = list(
+                zip(
+                    missing_chunks[offset : offset + chunk_count],
+                    vectors[offset : offset + chunk_count],
+                    strict=True,
+                )
+            )
+            state.document_embeddings[cache_key] = cached
+            embedded_chunks.extend(cached)
+            offset += chunk_count
+
+    query_vector = query_result.response.data[0].embedding
+    scored = [
+        {**chunk, "score": _cosine(query_vector, vector)}
+        for chunk, vector in embedded_chunks
+    ]
+    scored.sort(key=lambda item: item["score"], reverse=True)
+    output: list[dict[str, Any]] = []
+    output_chars = 0
+    for item in scored[:VFS_SIMILARITY_MAX_CHUNKS]:
+        key = item["key"]
+        content_before = state.vfs[key][: item["start"]]
+        start_line = content_before.count("\n")
+        line_count = item["text"].count("\n") + 1
+        result_item = {
+            "key": key,
+            "chunk": item["chunk"],
+            "score": item["score"],
+            "lines": state.render_lines(key, range(start_line, start_line + line_count)),
+        }
+        source_refs = [f"[{source.ref}]" for source in state.sources.values() if source.key == key]
+        if source_refs:
+            result_item["source_refs"] = source_refs
+        result_chars = len(
+            json.dumps(
+                result_item,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+        if (
+            len(output) >= VFS_SIMILARITY_MIN_CHUNKS
+            and output_chars + result_chars > VFS_SIMILARITY_RESULT_CHARS
+        ):
+            break
+        if source_refs:
+            state.remember_focused_lines(
+                key,
+                range(start_line, start_line + line_count),
+            )
+        output.append(result_item)
+        output_chars += result_chars
+    return {"ok": True, "matched_keys": keys, "chunks": output}
+
+
+async def _execute_vfs_search(
+    state: ResearchState,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    regex_result: dict[str, Any] | None = None
+    regex_error: str | None = None
+    try:
+        regex_result = _execute_regex(state, args)
+    except (TypeError, ValueError, re.error) as error:
+        regex_error = str(error)
+
+    similarity_trigger: str | None = None
+    if regex_result is None:
+        similarity_trigger = "regex_error"
+    elif int(regex_result["total_match_count"]) == 0:
+        similarity_trigger = "no_regex_matches"
+
+    similarity_result: dict[str, Any] | None = None
+    similarity_error: str | None = None
+    if similarity_trigger is not None:
+        try:
+            similarity_result = await _execute_similarity(state, args)
+        except Exception as error:
+            similarity_error = str(error)
+
+    if regex_result is None and similarity_result is None:
+        raise RuntimeError(
+            "both VFS search methods failed: "
+            f"regex={regex_error or 'unknown'}; similarity={similarity_error or 'unknown'}"
+        )
+
+    output: dict[str, Any] = {
+        "ok": True,
+        "similarity": {
+            "status": "not_run",
+            "reason": "regex_returned_matches_on_first_search",
+        },
+    }
+    if regex_result is not None:
+        output["regex"] = {
+            key: value
+            for key, value in regex_result.items()
+            if key not in {"ok", "matched_keys"}
+        }
+    if regex_error is not None:
+        output["regex_error"] = regex_error
+    if similarity_result is not None:
+        output["similarity"] = {"status": "completed", "trigger": similarity_trigger}
+        output["similarity"].update(
+            {
+                key: value
+                for key, value in similarity_result.items()
+                if key not in {"ok", "matched_keys"}
+            }
+        )
+    if similarity_error is not None:
+        output["similarity"] = {
+            "status": "failed",
+            "trigger": similarity_trigger,
+            "error": similarity_error,
+        }
+    return output
+
+
+async def _execute_tool(
+    state: ResearchState,
+    name: str,
+    args: dict[str, Any],
+    preview_budget_chars: int | None = None,
+) -> dict[str, Any]:
+    if name in {"search_web", "fetch_page"}:
+        cached = state.retrieval_output_cache.get(_retrieval_signature(name, args))
+        if cached is not None:
+            return {**cached, "cached": True}
+    if name == "search_web":
+        return await _execute_search(state, args, preview_budget_chars)
+    if name == "fetch_page":
+        return await _execute_fetch(state, args, preview_budget_chars)
+    if name == "vfs_read":
+        return _execute_read(state, args)
+    if name == "vfs_list":
+        return _execute_list(state, args)
+    if name == "vfs_write":
+        return _execute_write(state, args)
+    if name == "vfs_delete":
+        return _execute_delete(state, args)
+    if name == "retain_evidence":
+        return _execute_retain_evidence(state, args)
+    if name == "discard_remaining_sources":
+        return _execute_discard_remaining_sources(state, args)
+    if name == "vfs_search":
+        return await _execute_vfs_search(state, args)
+    if name == "update_research_state":
+        research_state = str(args["state"]).strip()
+        if not research_state:
+            raise ValueError("state must not be blank")
+        state.research_state = research_state
+        return {"ok": True}
+    raise ValueError(f"unknown tool: {name}")
+
+
+async def _execute_retrieval_batch(
+    state: ResearchState,
+    requests: list[tuple[int, str, dict[str, Any]]],
+    preview_budget_chars: int | None,
+) -> dict[int, dict[str, Any] | BaseException]:
+    outputs: dict[int, dict[str, Any] | BaseException] = {}
+    pending: list[tuple[int, str, dict[str, Any]]] = []
+    tasks: list[Any] = []
+    for call_index, name, args in requests:
+        cached = state.retrieval_output_cache.get(_retrieval_signature(name, args))
+        if cached is not None:
+            outputs[call_index] = {**cached, "cached": True}
+            continue
+        pending.append((call_index, name, args))
+        tasks.append(
+            _request_search(args)
+            if name == "search_web"
+            else _request_fetch(args)
+        )
+
+    raw_results = (
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if tasks
+        else ()
+    )
+    for (call_index, name, args), result in zip(pending, raw_results, strict=True):
+        if isinstance(result, BaseException):
+            outputs[call_index] = result
+            continue
+        outputs[call_index] = (
+            _materialize_search(
+                state,
+                args,
+                result,
+                preview_budget_chars,
+            )
+            if name == "search_web"
+            else _materialize_fetch(
+                state,
+                result,
+                preview_budget_chars,
+            )
+        )
+    return outputs
+
+
+def _deduplicate_tool_calls(calls: list[Any]) -> tuple[list[Any], int]:
+    unique_calls: list[Any] = []
+    seen: set[tuple[str, str]] = set()
+    for call in calls:
+        try:
+            arguments = json.dumps(
+                json.loads(call.arguments),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except json.JSONDecodeError:
+            arguments = call.arguments
+        signature = (call.name, arguments)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        unique_calls.append(call)
+    return unique_calls, len(calls) - len(unique_calls)
+
+
+async def _finalize_answer(
+    *,
+    state: ResearchState,
+    question: str,
+    current_answer: str,
+    reason: str,
+    assistant_context: str,
+    last_packet: list[dict[str, Any]],
+    final_source_slices: dict[str, list[CitationSlice]],
+) -> tuple[str, list[dict[str, Any]]]:
+    finalization_context = "\n\n".join(
+        value
+        for value in (
+            state.research_state.strip(),
+            reason.strip(),
+            assistant_context.strip(),
+        )
+        if value
+    )
+    packet = state.source_packet(
+        finalization_context,
+        include_structured_csv=True,
+    )
+    if not packet:
+        raise ValueError(
+            "final answer must mention at least one observed source reference such as S1.2 or P1"
+        )
+    unretained_page_refs = [
+        str(item.get("origin_source_ref", item["source_ref"]))
+        for item in packet
+        if str(item.get("origin_source_ref", item["source_ref"])).strip("[]").startswith("P")
+        and not state.has_retained_source(
+            str(item.get("origin_source_ref", item["source_ref"])).strip("[]")
+        )
+    ]
+    if unretained_page_refs:
+        raise ValueError(
+            "fetched-page evidence must be preserved before finalization; call retain_evidence "
+            f"for each decisive excerpt from {', '.join(unretained_page_refs)}, then retry"
+        )
+    for item in packet:
+        ref = str(item["source_ref"])[1:-1]
+        if ref in state.retained_evidence:
+            continue
+        selected_slices = state.source_slices.get(ref, [])
+        final_source_slices[ref] = _merge_citation_slices(
+            final_source_slices.get(ref, []),
+            list(selected_slices),
+        )
+    precise_refs = {str(item["source_ref"]) for item in [*last_packet, *packet]}
+    retained_packet = [
+        state.retained_packet_item(item)
+        for item in state.retained_evidence.values()
+        if str(item["evidence_ref"]) not in precise_refs
+    ]
+    merged_packet = _merge_source_packets(last_packet, retained_packet)
+    merged_packet = _merge_source_packets(merged_packet, packet)
+    merged_packet = [
+        item
+        for item in merged_packet
+        if (
+            (source := state.source_for_private_ref(str(item["source_ref"]).strip("[]")))
+            and source.receipt_id
+            and source.result_id
+        )
+    ]
+    if not merged_packet:
+        raise ValueError(
+            "none of the selected source records can be materialized as response citations"
+        )
+    if (
+        state.audit_gap
+        and state.audit_packet_signature == _source_packet_signature(merged_packet)
+    ):
+        raise ValueError(
+            "the previous audit requested new external evidence, but the source packet is "
+            "unchanged. Inspect a new source or a new decisive span from an existing VFS "
+            "record before finalizing again; changing only the prose research state cannot "
+            "resolve an evidence gap"
+        )
+    answer = await _answer_text(
+        state=state,
+        question=question,
+        prior_answer=current_answer,
+        task_contract=state.research_task_contract or "",
+        research_state=state.research_state,
+        finalization_reason=reason,
+        packet=merged_packet,
+    )
+    return answer, merged_packet
+
+
+def _render_answer_checkpoint(
+    state: ResearchState,
+    answer: str,
+    packet: list[dict[str, Any]],
+    final_source_slices: dict[str, list[CitationSlice]],
+    audit: str,
+) -> tuple[str, list[CitationRef], list[dict[str, Any]], str]:
+    plan = state.citation_plan(
+        answer,
+        packet,
+        final_source_slices,
+        audit,
+    )
+    rendered_answer, citations = _render_public_citations(answer, plan)
+    selected_records = [
+        item
+        for item in packet
+        if str(item.get("source_ref", "")).strip("[]") in plan.source_indices
+    ]
+    return (
+        rendered_answer,
+        citations,
+        selected_records,
+        state.research_task_contract or "",
+    )
+
+
+def _research_progress_signature(state: ResearchState) -> tuple[Any, ...]:
+    source_observations: set[tuple[str, str]] = set()
+    key_identities: dict[str, str] = {}
+    for source in state.sources.values():
+        identity = source.url or source.key
+        key_identities[source.key] = identity
+        content = state.vfs.get(source.key, source.content)
+        source_observations.add(
+            (identity, hashlib.sha256(content.encode()).hexdigest())
+        )
+
+    focused_observations: set[tuple[str, str]] = set()
+    for key, indices in state.focused_lines.items():
+        lines = state.vfs.get(key, "").splitlines() or [""]
+        identity = key_identities.get(key, key)
+        for index in indices:
+            if 0 <= index < len(lines):
+                focused_observations.add(
+                    (
+                        identity,
+                        hashlib.sha256(lines[index].encode()).hexdigest(),
+                    )
+                )
+
+    return (
+        state.research_task_contract,
+        tuple(sorted(source_observations)),
+        tuple(sorted(focused_observations)),
+        tuple(sorted(state.retained_evidence)),
+        state.research_state,
+        state.audit_gap,
+    )
+
+
+def _models_after_semantic_failure(
+    models: tuple[str, ...],
+    previous_model: str | None,
+) -> tuple[str, ...]:
+    previous_family = MODEL_FAMILIES.get(previous_model or "")
+    if previous_family is None:
+        return models
+    different_family = tuple(
+        model for model in models if MODEL_FAMILIES.get(model) != previous_family
+    )
+    same_family = tuple(
+        model for model in models if MODEL_FAMILIES.get(model) == previous_family
+    )
+    return different_family + same_family
+
+
+def _investigation_models(
+    state: ResearchState,
+    deadline_notice_sent: bool,
+    switch_reason: str,
+) -> tuple[str, ...]:
+    if state.audit_gap:
+        return AUDIT_REPAIR_MODELS
+    if MODEL_SCHEDULING != "state_aware":
+        return INVESTIGATION_MODELS
+    if switch_reason:
+        return _models_after_semantic_failure(
+            SEMANTIC_SWITCH_MODELS,
+            state.preferred_models.get("investigation"),
+        )
+    if deadline_notice_sent:
+        return REPAIR_MODELS
+    return STATE_AWARE_INVESTIGATION_MODELS
+
+
+def _task_analysis_models(
+    deadline_notice_sent: bool,
+    switch_reason: str,
+) -> tuple[str, ...]:
+    if MODEL_SCHEDULING == "state_aware" and (deadline_notice_sent or switch_reason):
+        return REPAIR_MODELS
+    return TASK_ANALYSIS_MODELS
+
+
+async def _investigate(
+    question: str,
+    expected_answer: str,
+    task_contract: str,
+    output_schema: dict[str, Any] | None,
+) -> tuple[str, list[CitationRef], list[dict[str, Any]], str]:
+    investigation_started_at = time.monotonic()
+    deadline_notice_sent = False
+    state = ResearchState(question)
+    state.research_task_contract = task_contract
+    state.research_state = (
+        f"Current best answer hypothesis:\n{expected_answer}\n"
+        "Observed support: none yet.\n"
+        "Most important unresolved question: test the hypothesis against external evidence."
+    )
+    current_answer = expected_answer
+    messages: list[Any] = [
+        {"role": "system", "content": INVESTIGATION_SYSTEM},
+        {
+            "role": "user",
+            "content": (f"Original question:\n{question}\n\nExpected answer hypothesis:\n{expected_answer}"),
+        },
+    ]
+    last_packet: list[dict[str, Any]] = []
+    final_source_slices: dict[str, list[CitationSlice]] = {}
+    final_audit = ""
+    answer_checkpoint_available = False
+    switch_reason = ""
+    previous_call_signatures: tuple[str, ...] = ()
+
+    for _turn in range(160):
+        if (
+            not deadline_notice_sent
+            and time.monotonic() - investigation_started_at >= DEADLINE_NOTICE_SECONDS
+        ):
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "The external runtime has about 150 seconds remaining. Preserve answer quality. "
+                        "If the observed evidence can support the answer, retain any needed excerpts and call "
+                        "ready_to_finalize now. If one decisive uncertainty remains, perform only the single "
+                        "operation most likely to resolve it, then finalize. Do not restart broad research."
+                    ),
+                }
+            )
+            deadline_notice_sent = True
+        if answer_checkpoint_available and _best_effort_checkpoint_required(
+            state,
+            time.monotonic() - investigation_started_at,
+        ):
+            return _render_answer_checkpoint(
+                state,
+                current_answer,
+                last_packet,
+                final_source_slices,
+                final_audit,
+            )
+        _refresh_retrieval_receipt_message(messages, state)
+        question_supplies_url = re.search(r"https?://", question, flags=re.IGNORECASE)
+        if state.search_count == 0 and state.page_count == 0 and not question_supplies_url:
+            available_tools = SEARCH_FIRST_TOOLS
+        else:
+            available_tools = TOOLS
+        available_models = _investigation_models(
+            state,
+            deadline_notice_sent,
+            switch_reason,
+        )
+        scheduler_lane = "audit_repair" if state.audit_gap else "investigation"
+        if switch_reason and available_models:
+            # Make the requested family change effective despite sticky-success ordering.
+            state.preferred_models[scheduler_lane] = available_models[0]
+        try:
+            result = await _chat_with_scheduling(
+                available_models,
+                messages=messages,
+                tools=available_tools,
+                tool_choice="required",
+                parallel_tool_calls=True,
+                timeout=LLM_TIMEOUT,
+                max_output_tokens=None,
+                scheduler_state=state,
+                scheduler_lane=scheduler_lane,
+            )
+        except Exception:
+            if answer_checkpoint_available and state.audit_gap:
+                return _render_answer_checkpoint(
+                    state,
+                    current_answer,
+                    last_packet,
+                    final_source_slices,
+                    final_audit,
+                )
+            raise
+        _capture_budget(state, result)
+        # The current model has consumed the latest raw tool response. Keep the
+        # source in VFS and its stable location in the receipts; later turns can
+        # re-read it explicitly instead of carrying the raw response indefinitely.
+        state.clear_focused_lines()
+        _compact_consumed_assistant_reasoning(messages)
+        _compact_consumed_tool_results(messages)
+        assistant = _assistant_message(result)
+        raw_calls = list(assistant.tool_calls or ())
+        calls, duplicate_call_count = _deduplicate_tool_calls(raw_calls)
+        if not calls:
+            prose = (result.llm.raw_text or "").strip()
+            messages.extend(
+                [
+                    assistant.to_input_message(),
+                    {
+                        "role": "user",
+                        "content": (
+                            "The previous response did not contain the required tool call"
+                            + ("; its prose was not accepted as final output" if prose else "")
+                            + ". Use a tool. Call ready_to_finalize only when inspected sources "
+                            "support the answer."
+                        ),
+                    },
+                ]
+            )
+            switch_reason = (
+                "The previous model returned no tool call. Choose the smallest valid operation "
+                "that advances the investigation, or call ready_to_finalize with the supported "
+                "finalization reason."
+            )
+            continue
+        assistant_input = replace(
+            assistant,
+            tool_calls=tuple(calls),
+        ).to_input_message()
+        messages.append(assistant_input)
+        ready_requested = False
+        audit_ready = False
+        progress_before = _research_progress_signature(state)
+        turn_call_signatures: list[str] = []
+        turn_failure_signatures: list[str] = []
+        retrieval_call_count = sum(call.name in {"search_web", "fetch_page"} for call in calls)
+        retrieval_preview_budget = (
+            BATCHED_RETRIEVAL_PREVIEW_CHARS // retrieval_call_count if retrieval_call_count else None
+        )
+        retrieval_requests: list[tuple[int, str, dict[str, Any]]] = []
+        for candidate_index, candidate_call in enumerate(calls):
+            if candidate_call.name not in {"search_web", "fetch_page"}:
+                continue
+            try:
+                candidate_args = json.loads(candidate_call.arguments)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate_args, dict):
+                retrieval_requests.append(
+                    (candidate_index, candidate_call.name, candidate_args)
+                )
+        retrieval_outputs = await _execute_retrieval_batch(
+            state,
+            retrieval_requests,
+            retrieval_preview_budget,
+        )
+        for call_index, call in enumerate(calls):
+            args: dict[str, Any] = {}
+            call_signature = json.dumps(
+                {"tool": call.name, "raw_arguments": call.arguments},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            try:
+                args = json.loads(call.arguments)
+                if not isinstance(args, dict):
+                    raise ValueError("tool arguments must be a JSON object")
+                call_signature = json.dumps(
+                    {"tool": call.name, "arguments": args},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                if call.name == "ready_to_finalize":
+                    if turn_failure_signatures:
+                        raise ValueError(
+                            "cannot finalize in the same response after an earlier tool call "
+                            "failed; inspect that tool feedback, correct the failed operation, "
+                            "and retry finalization"
+                        )
+                    incompatible_calls = [
+                        candidate.name
+                        for candidate in calls
+                        if candidate.name not in {"update_research_state", "retain_evidence", "ready_to_finalize"}
+                    ]
+                    if incompatible_calls:
+                        raise ValueError(
+                            "ready_to_finalize may only accompany update_research_state and retain_evidence; "
+                            f"also received {', '.join(incompatible_calls)}"
+                        )
+                    if call_index != len(calls) - 1:
+                        raise ValueError("ready_to_finalize must be the final call in the response")
+                    reason = str(args["reason"])
+                    current_answer, last_packet = await _finalize_answer(
+                        state=state,
+                        question=question,
+                        current_answer=current_answer,
+                        reason=reason,
+                        assistant_context=_assistant_evidence_context(assistant),
+                        last_packet=last_packet,
+                        final_source_slices=final_source_slices,
+                    )
+                    answer_checkpoint_available = True
+                    final_audit = ""
+                    ready_requested = True
+                    audit_ready = True
+                    output = {
+                        "ok": True,
+                        "answer_checkpoint": current_answer,
+                    }
+                elif call.name == "discard_remaining_sources":
+                    if call_index != len(calls) - 1:
+                        raise ValueError("discard_remaining_sources must be the last call in the response")
+                    output = await _execute_tool(
+                        state,
+                        call.name,
+                        args,
+                        retrieval_preview_budget,
+                    )
+                else:
+                    retrieval_output = retrieval_outputs.get(call_index)
+                    if isinstance(retrieval_output, BaseException):
+                        raise retrieval_output
+                    output = (
+                        retrieval_output
+                        if retrieval_output is not None
+                        else await _execute_tool(
+                            state,
+                            call.name,
+                            args,
+                            retrieval_preview_budget,
+                        )
+                    )
+                    _record_retrieval_receipt(state, call.name, args, output)
+                    _record_vfs_operation_receipt(state, call.name, args, output)
+            except Exception as error:
+                output = {
+                    "ok": False,
+                    "error_type": (
+                        "tool_argument_validation"
+                        if isinstance(error, (KeyError, TypeError, ValueError, json.JSONDecodeError))
+                        else "tool_execution"
+                    ),
+                    "details": str(error),
+                }
+                _record_retrieval_failure(state, call.name, args, output)
+            turn_call_signatures.append(call_signature)
+            if not output.get("ok"):
+                turn_failure_signatures.append(
+                    json.dumps(
+                        {
+                            "tool": call.name,
+                            "error_type": output.get("error_type"),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": json.dumps(output, ensure_ascii=False),
+                }
+            )
+        if duplicate_call_count:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"The previous response repeated {duplicate_call_count} exact tool "
+                        "calls. The harness executed each distinct call once. Continue from "
+                        "those results without repeating an identical call."
+                    ),
+                }
+            )
+        if ready_requested:
+            final_audit = await _audit(
+                state,
+                question,
+                current_answer,
+                last_packet,
+            )
+            verdict, audit_payload = _parse_audit(final_audit)
+            while verdict == "REVISE":
+                current_answer = await _answer_text(
+                    state=state,
+                    question=question,
+                    prior_answer=current_answer,
+                    task_contract=state.research_task_contract or "",
+                    research_state=state.research_state,
+                    finalization_reason=reason,
+                    packet=last_packet,
+                    audit_correction=audit_payload,
+                )
+                final_audit = await _audit(
+                    state,
+                    question,
+                    current_answer,
+                    last_packet,
+                )
+                verdict, audit_payload = _parse_audit(final_audit)
+            if verdict == "CONTINUE":
+                state.audit_gap = audit_payload
+                state.audit_packet_signature = _source_packet_signature(last_packet)
+                state.clear_focused_lines()
+                audit_ready = False
+                messages = [
+                    {"role": "system", "content": INVESTIGATION_SYSTEM},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Original question:\n{question}\n\n"
+                            "The finalization audit found unresolved evidence gaps:\n"
+                            f"{audit_payload}\n\n"
+                            "The harness will preserve the existing VFS, source references, "
+                            "retained evidence, retrieval receipts, and research state. Resolve "
+                            "these exact gaps with the smallest useful independent observations, update the "
+                            "research state if the answer changes, then finalize. Do not restart "
+                            "the investigation or repeat already supported premises."
+                        ),
+                    }
+                ]
+            else:
+                state.audit_gap = ""
+                state.audit_packet_signature = None
+                audit_ready = True
+        if MODEL_SCHEDULING == "state_aware" and not ready_requested:
+            progress_after = _research_progress_signature(state)
+            current_calls = tuple(turn_call_signatures)
+            current_failures = tuple(turn_failure_signatures)
+            next_switch_reason = ""
+            if current_failures:
+                next_switch_reason = (
+                    "The previous model's tool call failed. Read the detailed tool feedback, correct "
+                    "that exact operation or choose a different valid operation, and advance the "
+                    "investigation without repeating the failure."
+                )
+            elif (
+                current_calls
+                and current_calls == previous_call_signatures
+                and progress_after == progress_before
+            ):
+                next_switch_reason = (
+                    "The previous model repeated the same operations without adding evidence or changing "
+                    "the research state. Choose a different evidence route."
+                )
+            elif current_calls and not current_failures and progress_after == progress_before:
+                next_switch_reason = (
+                    "The previous operations succeeded mechanically but produced no new retained evidence, "
+                    "source coverage, inspected lines, or research-state change. Choose the smallest different "
+                    "operation that can resolve the current uncertainty."
+                )
+            if next_switch_reason:
+                messages.append({"role": "user", "content": next_switch_reason})
+            switch_reason = next_switch_reason
+            previous_call_signatures = current_calls
+        if ready_requested and audit_ready:
+            return _render_answer_checkpoint(
+                state,
+                current_answer,
+                last_packet,
+                final_source_slices,
+                final_audit,
+            )
+
+    raise RuntimeError("investigation did not finalize within the generous 160-turn ceiling")
+
+
+async def _hv16_base_query(query: Query) -> Response:
+    expected_result, task_contract_result = await asyncio.gather(
+        _expected_answer_text(query.text),
+        _research_task_contract_text(query.text, query.output_schema),
+        return_exceptions=True,
+    )
+    if isinstance(expected_result, BaseException):
+        error = expected_result
+        if not _is_retryable_llm_error(error):
+            raise error
+        expected_answer = (
+            "No expected-answer hypothesis was available because its model call "
+            "failed. Investigate the original question directly and construct a "
+            "revisable answer from observed external evidence."
+        )
+    else:
+        expected_answer = expected_result
+    if isinstance(task_contract_result, BaseException):
+        raise task_contract_result
+    answer, citations, evidence_records, research_task_contract = await _investigate(
+        query.text,
+        expected_answer,
+        task_contract_result,
+        query.output_schema,
+    )
+    if query.output_schema is not None:
+        output = await _materialize_structured_output(
+            question=query.text,
+            answer=answer,
+            task_contract=research_task_contract,
+            evidence_records=evidence_records,
+            output_schema=query.output_schema,
+        )
+        return Response(output=output, citations=citations)
+    return Response(text=answer, citations=citations)
+
+
+# === Harnyx v16 mechanism: claim-risk + coverage-gap verification patch ===
+# Runs strictly after the base pipeline above has produced its answer. It
+# never alters the base retrieval/synthesis control flow; it adds a new,
+# independent second-pass verification loop with its own fresh retrieval,
+# its own evidence-support judgment, and conditional cite-or-hedge/fill
+# synthesis edits. Fully fail-open: any error or time pressure returns the
+# base answer unchanged.
+import time as _hv16_time
+
+_HV16_LLM_PROVIDER = "openrouter"
+_HV16_LLM_MODEL = "google/gemma-4-31b-it"
+_HV16_SEARCH_PROVIDER = "parallel"
+_HV16_BASE_ELAPSED_SKIP_S = 175.0
+_HV16_MECH_BUDGET_S = 42.0
+
+
+def _hv16_extract_json_object(raw: str | None) -> dict | None:
+    import json as _hv16_json
+    import re as _hv16_re
+
+    if not raw:
+        return None
+    cleaned = _hv16_re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=_hv16_re.I | _hv16_re.M).strip()
+    try:
+        return _hv16_json.loads(cleaned)
+    except Exception:
+        match = _hv16_re.search(r"\{.*\}", cleaned, _hv16_re.S)
+        if not match:
+            return None
+        try:
+            return _hv16_json.loads(match.group(0))
+        except Exception:
+            return None
+
+
+async def _hv16_identify_gaps(question: str, answer_text: str) -> dict:
+    try:
+        result = await llm_chat(
+            provider=_HV16_LLM_PROVIDER,
+            model=_HV16_LLM_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a strict answer-quality auditor. Read the question and the "
+                        "drafted answer only.\n"
+                        "List at most 2 specific, load-bearing, time-sensitive, or otherwise "
+                        "non-obvious factual claims in the answer that need independent "
+                        "verification (risky_claims).\n"
+                        "List at most 1 concrete element the question explicitly asks for that "
+                        "the answer does not address at all (missing_elements).\n"
+                        "Use short exact phrases copied or closely paraphrased from the answer "
+                        "or question, not full sentences of commentary.\n"
+                        "Return JSON only: {\"risky_claims\": [\"...\"], "
+                        "\"missing_elements\": [\"...\"]}. Use empty arrays when none apply."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"Question:\n{question}\n\nAnswer:\n{answer_text[:6000]}",
+                },
+            ],
+            tools=None,
+            temperature=0.0,
+            max_output_tokens=350,
+            timeout=14.0,
+        )
+        raw = getattr(getattr(result, "response", None), "raw_text", None)
+        parsed = _hv16_extract_json_object(raw)
+        if not isinstance(parsed, dict):
+            return {"risky_claims": [], "missing_elements": []}
+        risky = parsed.get("risky_claims")
+        missing = parsed.get("missing_elements")
+        risky = [str(c).strip() for c in risky if str(c).strip()][:2] if isinstance(risky, list) else []
+        missing = [str(c).strip() for c in missing if str(c).strip()][:1] if isinstance(missing, list) else []
+        return {"risky_claims": risky, "missing_elements": missing}
+    except Exception:
+        return {"risky_claims": [], "missing_elements": []}
+
+
+async def _hv16_fresh_search_digest(query_text: str):
+    try:
+        search_result = await search_web(
+            query_text[:300],
+            provider=_HV16_SEARCH_PROVIDER,
+            num=5,
+            timeout=12.0,
+        )
+    except Exception:
+        return None, []
+    results = list(getattr(search_result.response, "data", None) or [])
+    digest_lines = []
+    for idx, item in enumerate(results[:5]):
+        snippet = (getattr(item, "snippet", None) or "").strip()
+        title = (getattr(item, "title", None) or "").strip()
+        if snippet or title:
+            digest_lines.append(f"[{idx}] {title} :: {snippet[:400]}")
+    if not digest_lines:
+        return None, []
+    return search_result, digest_lines
+
+
+async def _hv16_verify_claim(claim: str):
+    search_result, digest_lines = await _hv16_fresh_search_digest(claim)
+    if search_result is None:
+        return "unclear", None
+    try:
+        judged = await llm_chat(
+            provider=_HV16_LLM_PROVIDER,
+            model=_HV16_LLM_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You check whether search snippets support or contradict a claim.\n"
+                        "Return JSON only: {\"status\": \"supported\"|\"contradicted\"|"
+                        "\"unclear\", \"best_index\": <int or null>}. best_index is the "
+                        "index of the single snippet that most directly supports or "
+                        "contradicts the claim, else null."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"Claim:\n{claim}\n\nSnippets:\n" + "\n".join(digest_lines),
+                },
+            ],
+            tools=None,
+            temperature=0.0,
+            max_output_tokens=120,
+            timeout=12.0,
+        )
+        raw = getattr(getattr(judged, "response", None), "raw_text", None)
+        parsed = _hv16_extract_json_object(raw)
+    except Exception:
+        parsed = None
+    status = "unclear"
+    best_index = None
+    if isinstance(parsed, dict):
+        candidate_status = parsed.get("status")
+        if candidate_status in ("supported", "contradicted", "unclear"):
+            status = candidate_status
+        candidate_index = parsed.get("best_index")
+        if isinstance(candidate_index, int) and 0 <= candidate_index < len(digest_lines):
+            best_index = candidate_index
+    citation_ref = None
+    if status == "supported" and best_index is not None:
+        try:
+            result_items = list(search_result.results)
+            if 0 <= best_index < len(result_items):
+                dto = result_items[best_index]
+                citation_ref = CitationRef(receipt_id=search_result.receipt_id, result_id=dto.result_id)
+        except Exception:
+            citation_ref = None
+    return status, citation_ref
+
+
+async def _hv16_rewrite_without_claim(question: str, answer_text: str, claim: str) -> str | None:
+    try:
+        result = await llm_chat(
+            provider=_HV16_LLM_PROVIDER,
+            model=_HV16_LLM_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You lightly edit an answer for factual hygiene. Remove or hedge only "
+                        "the single specified claim because it is unsupported or contradicted; "
+                        "keep every other sentence and fact untouched and do not add any new "
+                        "facts. Return the full corrected answer as plain text with no preamble."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Question:\n{question}\n\nCurrent answer:\n{answer_text[:8000]}\n\n"
+                        f"Unsupported or contradicted claim to remove or hedge:\n{claim}"
+                    ),
+                },
+            ],
+            tools=None,
+            temperature=0.1,
+            max_output_tokens=1200,
+            timeout=16.0,
+        )
+        text = (getattr(getattr(result, "response", None), "raw_text", None) or "").strip()
+        return text or None
+    except Exception:
+        return None
+
+
+async def _hv16_fill_missing_element(question: str, answer_text: str, missing_element: str):
+    search_result, digest_lines = await _hv16_fresh_search_digest(f"{question} {missing_element}")
+    if search_result is None:
+        return None, None
+    try:
+        result = await llm_chat(
+            provider=_HV16_LLM_PROVIDER,
+            model=_HV16_LLM_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You write at most one short factual sentence that directly answers a "
+                        "missing element of the question, using only the given snippets as "
+                        "evidence. Never invent facts not present in the snippets.\n"
+                        "Return JSON only: {\"sentence\": \"...\" or null, \"best_index\": "
+                        "<int or null>}. Use null for both fields if the snippets do not "
+                        "clearly answer the missing element."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Question:\n{question}\n\nMissing element:\n{missing_element}\n\n"
+                        f"Snippets:\n" + "\n".join(digest_lines)
+                    ),
+                },
+            ],
+            tools=None,
+            temperature=0.1,
+            max_output_tokens=200,
+            timeout=14.0,
+        )
+        raw = getattr(getattr(result, "response", None), "raw_text", None)
+        parsed = _hv16_extract_json_object(raw)
+    except Exception:
+        parsed = None
+    if not isinstance(parsed, dict):
+        return None, None
+    sentence = parsed.get("sentence")
+    best_index = parsed.get("best_index")
+    if not isinstance(sentence, str) or not sentence.strip():
+        return None, None
+    if not isinstance(best_index, int) or not (0 <= best_index < len(digest_lines)):
+        return None, None
+    citation_ref = None
+    try:
+        result_items = list(search_result.results)
+        if 0 <= best_index < len(result_items):
+            dto = result_items[best_index]
+            citation_ref = CitationRef(receipt_id=search_result.receipt_id, result_id=dto.result_id)
+    except Exception:
+        citation_ref = None
+    if citation_ref is None:
+        return None, None
+    return sentence.strip(), citation_ref
+
+
+async def _hv16_verification_patch(query_text: str, response: "Response") -> "Response":
+    """MECHANISM: claim-risk + coverage-gap audit -> fresh targeted retrieval ->
+    cite-or-hedge / cite-and-fill patch.
+
+    This is a genuinely new verification + tool-use + synthesis stage layered
+    on top of the base pipeline's answer: it independently re-checks the
+    riskiest claims in the drafted answer and the most obvious missing
+    query-required element against freshly retrieved evidence, then either
+    attaches a newly retrieved and properly linked citation, edits the answer
+    to remove/hedge a contradicted or unverifiable claim, or appends one
+    grounded, cited sentence to close a coverage gap. The base pipeline never
+    performs this second-pass, evidence-seeking verification loop.
+    """
+    mech_started = _hv16_time.monotonic()
+    if response.text is None:
+        return response
+    answer_text = response.text
+    if not answer_text.strip():
+        return response
+    mech_deadline = mech_started + _HV16_MECH_BUDGET_S
+    try:
+        gaps = await _hv16_identify_gaps(query_text, answer_text)
+    except Exception:
+        return response
+    risky_claims = gaps.get("risky_claims") or []
+    missing_elements = gaps.get("missing_elements") or []
+    if not risky_claims and not missing_elements:
+        return response
+
+    citations = list(response.citations or [])
+    existing_keys = {(citation.receipt_id, citation.result_id) for citation in citations}
+    changed = False
+
+    for claim in risky_claims:
+        if _hv16_time.monotonic() > mech_deadline:
+            break
+        try:
+            status, citation_ref = await _hv16_verify_claim(claim)
+        except Exception:
+            continue
+        if status == "supported" and citation_ref is not None:
+            key = (citation_ref.receipt_id, citation_ref.result_id)
+            if key not in existing_keys:
+                citations.append(citation_ref)
+                existing_keys.add(key)
+                changed = True
+        elif status == "contradicted":
+            try:
+                rewritten = await _hv16_rewrite_without_claim(query_text, answer_text, claim)
+            except Exception:
+                rewritten = None
+            if rewritten and rewritten.strip() and rewritten.strip() != answer_text.strip():
+                answer_text = rewritten.strip()
+                changed = True
+
+    for missing_element in missing_elements:
+        if _hv16_time.monotonic() > mech_deadline:
+            break
+        try:
+            sentence, citation_ref = await _hv16_fill_missing_element(query_text, answer_text, missing_element)
+        except Exception:
+            sentence, citation_ref = None, None
+        if sentence and citation_ref is not None:
+            key = (citation_ref.receipt_id, citation_ref.result_id)
+            if key not in existing_keys:
+                answer_text = answer_text.rstrip() + "\n\n" + sentence
+                citations.append(citation_ref)
+                existing_keys.add(key)
+                changed = True
+
+    if not changed:
+        return response
+    try:
+        return Response(text=answer_text, output=None, citations=citations or None)
+    except Exception:
+        return response
+
+
+@entrypoint('query')
+async def query(query: Query) -> Response:
+    _hv16_call_started = _hv16_time.monotonic()
+    response = await _hv16_base_query(query)
+    try:
+        base_elapsed = _hv16_time.monotonic() - _hv16_call_started
+        if base_elapsed > _HV16_BASE_ELAPSED_SKIP_S:
+            return response
+        return await _hv16_verification_patch(query.text, response)
+    except Exception:
+        return response

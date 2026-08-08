@@ -85,65 +85,50 @@ TOOLS = [
     },
 ]
 
-LOOP_SYSTEM_PROMPT = (
-    "You are an elite research analyst answering a multi-constraint factual "
-    "question. Your answer will be judged pairwise against a strong reference "
-    "answer: factual claims only earn credit when backed by cited tool results, "
-    "and missing any element of the question is a coverage failure.\n\n"
-    "You have search_web and fetch_page tools. Work candidate-by-candidate and "
-    "constraint-by-constraint: verify every load-bearing fact (names, dates, "
-    "counts, figures) with a tool result before asserting it — do not trust "
-    "memory for verifiable specifics. Tool results are numbered like [7].\n\n"
-    "CITATION RULE: in the final answer, put the source number in brackets "
-    "immediately after EVERY factual claim — for qualifying entities AND for "
-    "excluded ones (e.g. 'completed in 2017 [4]', 'only 13 storeys [9]'). A "
-    "claim without a bracket is treated as uncited. Do not cite sources that do "
-    "not support the claim.\n\n"
-    "FINAL ANSWER SHAPE: open with the direct answer (the qualifying entities / "
-    "number / verdict) in the first sentence or list, in exactly the format the "
-    "question requests — sentence one is never a remark about evidence quality. "
-    "Then a short 'Proof of completeness' section: candidate pool, each "
-    "constraint applied, per-entity specifics — one line per qualifying entity "
-    "with its qualifying attribute cited, and one line per rejected candidate "
-    "with its cited exclusion reason. Dense factual prose; no meta-commentary; "
-    "never say the evidence is insufficient. Only when a figure exists solely "
-    "inside a queryable database and nowhere in published sources, state the "
-    "exact dataset + filters needed instead of inventing the number.\n\n"
-    "PROVENANCE CONFIDENCE: when the question names a specific source but your "
-    "verified facts come from other authoritative sources, state the facts "
-    "confidently and treat the other sources as corroboration — never open "
-    "with, or dwell on, the named source being absent from your results.\n\n"
-    "SOURCE AUTHORITY: when the question names a source ('according to the United "
-    "Nations', 'per Forbes', 'according to Box Office Mojo/IMDb/the World Bank'), "
-    "cite the PRIMARY source itself (un.org / data.un.org, forbes.com, "
-    "boxofficemojo.com, imdb.com, data.worldbank.org) and PREFER it over "
-    "aggregators, mirrors, or news reports (populationpyramid.net, database.earth, "
-    "worldometers, secondhand articles). Copy that source's exact figures and dates "
-    "verbatim — if it dates an event (e.g. a population milestone) to a specific "
-    "month/year, use that, not a news outlet's earlier estimate.\n\n"
-    "OUTPUT DIRECTIVES: obey literal formatting instructions mechanically. "
-    "'without the word \"X\"' (or 'omit/excluding the word X') means DELETE the word "
-    "X from each title/name you output — it is NOT a filter that removes items "
-    "containing X. 'in alphabetical/chronological order' means sort the final list; "
-    "'comma-separated' means join with commas. Emit exactly the requested shape.\n\n"
-    "SELF-CONSISTENCY: before finishing, confirm the opening answer names "
-    "exactly the entities your own cited sentences support; if the body "
-    "establishes a different set, rewrite the opening to match it. Verify no claim "
-    "contradicts the text of its own cited source.\n\n"
-    "Do not call a tool and write the final answer in the same turn. When every "
-    "constraint is either verified or best-effort-covered, write the final "
-    "answer with inline citations."
-)
+LOOP_SYSTEM_PROMPT = """# Elite Research Analyst Instructions
+
+You are an elite research analyst answering a multi-constraint factual question. Your answer will be judged pairwise against a strong reference answer: factual claims only earn credit when backed by cited tool results, and missing any element of the question is a coverage failure.
+
+## Tools
+
+You have `search_web` and `fetch_page` tools. Work candidate-by-candidate and constraint-by-constraint: verify every load-bearing fact (names, dates, counts, figures) with a tool result before asserting it — do not trust memory for verifiable specifics. Every tool result is numbered like `[7]`.
+
+## Citations
+
+In the final answer, put the source number in brackets immediately after **every** factual claim — for qualifying entities AND for excluded ones (e.g. `completed in 2017 [4]`, `only 13 storeys [9]`). A claim without a bracket is treated as uncited. Do not cite sources that do not support the claim.
+
+## Final Answer Shape
+
+Open with the direct answer (the qualifying entities / number / verdict) in the first sentence or list, in exactly the format the question requests — sentence one is never a remark about evidence quality. Then a short **Proof of completeness** section: candidate pool, each constraint applied, per-entity specifics — one line per qualifying entity with its qualifying attribute cited, and one line per rejected candidate with its cited exclusion reason. Dense factual prose; no meta-commentary; never say the evidence is insufficient. Only when a figure exists solely inside a queryable database and nowhere in published sources, state the exact dataset + filters needed instead of inventing the number.
+
+## Provenance Confidence
+
+When the question names a specific source but your verified facts come from other authoritative sources, state the facts confidently and treat the other sources as corroboration — never open with, or dwell on, the named source being absent from your results.
+
+## Source Authority
+
+When the question names a source (`according to the United Nations`, `per Forbes`, `according to Box Office Mojo/IMDb/the World Bank`), cite the PRIMARY source itself (un.org / data.un.org, forbes.com, boxofficemojo.com, imdb.com, data.worldbank.org) and PREFER it over aggregators, mirrors, or news reports (populationpyramid.net, database.earth, worldometers, secondhand articles). Copy that source's exact figures and dates verbatim — if it dates an event (e.g. a population milestone) to a specific month/year, use that, not a news outlet's earlier estimate.
+
+## Output Directives
+
+Obey literal formatting instructions mechanically. `without the word "X"` (or `omit/excluding the word X`) means DELETE the word X from each title/name you output — it is NOT a filter that removes items containing X. `in alphabetical/chronological order` means sort the final list; `comma-separated` means join with commas. Emit exactly the requested shape.
+
+## Self-Consistency
+
+
+Before finishing, confirm the opening answer names exactly the entities your own cited sentences support; if the body establishes a different set, rewrite the opening to match it. Verify no claim contradicts the text of its own cited source.
+
+Do not call a tool and write the final answer in the same turn. When every constraint is either verified or best-effort-covered, write the final answer with inline citations.
+"""
 
 
 def _force_commit_message(remaining: float) -> str:
-    return (
-        f"TIME LIMIT: about {int(remaining)} seconds remain. Stop researching "
-        "now. Using ONLY the numbered tool results above plus the briefing, "
-        "write your best final answer with inline [n] citations in the required "
-        "shape. A partial but cited and fully-covering answer scores far better "
-        "than a refusal — never refuse."
-    )
+    return f"""## Time Limit
+
+About {int(remaining)} seconds remain. **Stop researching now.**
+
+Using ONLY the numbered tool results above plus the briefing, write your best final answer with inline `[n]` citations in the required shape. A partial but cited and fully-covering answer scores far better than a refusal — never refuse.
+"""
 
 
 # --- (C) finalizer guard: never surface a mid-research scratch line as the answer ---
@@ -413,8 +398,9 @@ async def _build_briefing(question: str) -> tuple[str, str]:
         draft = raw[: marker.start()]
     draft = re.sub(r"^DRAFT\s*:\s*", "", draft).strip()
     briefing = (
-        "RESEARCH BRIEFING (from prior analysis; verify uncertain values, "
-        "correct it where tool evidence disagrees):\n" + raw.strip()
+        "## Research Briefing\n\n"
+        "From prior analysis; verify uncertain values, "
+        "correct it where tool evidence disagrees:\n\n" + raw.strip()
     )
     return draft, briefing
 
@@ -462,17 +448,14 @@ def _enum_directive(question: str) -> str:
     """Extra instruction for set questions only; empty for single-fact ones."""
     if not _enum_is_set_question(question):
         return ""
-    return (
-        "SET-COMPLETENESS REQUIREMENT: this question asks for a SET, so an answer naming one "
-        "qualifying item from an unchecked pool scores as WRONG, not partial.\n"
-        "1. Enumerate the full candidate pool the evidence supports, test EVERY candidate against "
-        "each stated criterion, and list every one that qualifies with its own citation per "
-        "criterion.\n"
-        "2. Name the prominent near-miss candidates you excluded and the criterion each fails.\n"
-        "3. Do NOT write 'the only', 'the sole', or 'the single' unless you enumerated and checked "
-        "the whole pool. If the evidence covers only part of it, still commit: give every "
-        "qualifying candidate found and say the roster may be incomplete."
-    )
+    return """## Set-Completeness Requirement
+
+This question asks for a **SET**, so an answer naming one qualifying item from an unchecked pool scores as **WRONG**, not partial.
+
+1. Enumerate the full candidate pool the evidence supports, test **EVERY** candidate against each stated criterion, and list every one that qualifies with its own citation per criterion.
+2. Name the prominent near-miss candidates you excluded and the criterion each fails.
+3. Do NOT write `the only`, `the sole`, or `the single` unless you enumerated and checked the whole pool. If the evidence covers only part of it, still commit: give every qualifying candidate found and say the roster may be incomplete.
+"""
 
 
 async def _research_loop(
@@ -673,7 +656,7 @@ async def _verify_and_patch(
     try:
         raw = await _plain_chat(
             PATCH_MODEL,
-            system="You are a strict answer auditor. Output JSON only.",
+            system="# Strict Answer Auditor\n\nYou are a strict answer auditor. **Output JSON only.**",
             user=check_user,
             max_tokens=700,
             timeout=PATCH_TIMEOUT,
@@ -695,11 +678,12 @@ async def _verify_and_patch(
         {
             "role": "system",
             "content": (
+                "## Audit Gaps\n\n"
                 "AUDIT FOUND GAPS in your final answer:\n- "
                 + "\n- ".join(issues[:6])
-                + "\nYou may use at most 2 more tool calls to close the most "
-                "important gaps, then rewrite the COMPLETE final answer with "
-                "inline [n] citations in the required shape."
+                + "\n\nYou may use at most **2** more tool calls to close the most "
+                "important gaps, then rewrite the **COMPLETE** final answer with "
+                "inline `[n]` citations in the required shape."
             ),
         }
     )
@@ -768,8 +752,9 @@ async def _last_resort(question: str) -> str:
         return await _plain_chat(
             FALLBACK_MODEL,
             system=(
-                "Expert researcher. Give your best definitive answer with "
-                "concrete entities, numbers and dates. Never refuse."
+                "# Expert Researcher\n\n"
+                "Give your best definitive answer with concrete entities, numbers and dates. "
+                "**Never refuse.**"
             ),
             user=question,
             max_tokens=1600,
@@ -790,7 +775,7 @@ async def _structured_output(question: str, answer: str, schema) -> object | Non
         try:
             raw = await _plain_chat(
                 model,
-                system="You output strictly valid JSON matching the given schema.",
+                system="# JSON Output\n\nYou output strictly valid JSON matching the given schema.",
                 user=user,
                 max_tokens=2400,
                 timeout=50.0,

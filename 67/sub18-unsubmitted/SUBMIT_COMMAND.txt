@@ -1,0 +1,8 @@
+# Submit sub18-unsubmitted agents (10 of 26 registered hotkeys)
+# Excluded agents: uid_14, uid_26, uid_43, uid_53
+# History: /root/turtle/111/67/sub18-unsubmitted/submission_history_20260807T140301Z.json
+# Map:     /root/turtle/111/67/sub18-unsubmitted/hotkey_map.json
+# Seed:    20260807091
+
+cd /root/turtle/harnyx
+bash /root/turtle/111/67/sub18-unsubmitted/submit_all.sh 10
