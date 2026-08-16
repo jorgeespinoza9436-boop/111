@@ -1,4 +1,0 @@
-# Submit sub16-submitted agents (10)
-# History: /root/turtle/111/67/sub16-submitted/submission_history.json
-cd /root/turtle/harnyx
-bash /root/turtle/111/67/sub16-submitted/submit_all.sh 10

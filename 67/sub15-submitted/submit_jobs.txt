@@ -1,7 +1,0 @@
-hk-67-12	/root/turtle/111/67/submittion15/uid_140__artifact_5d33f70d-2ee0-4e15-9fb3-8b865eb7bb79.py
-hk-67-15	/root/turtle/111/67/submittion15/uid_151__artifact_71a75417-ac0a-41eb-8d89-9f99b9e01221.py
-hk-67-13	/root/turtle/111/67/submittion15/uid_182__artifact_2305fac7-2a6f-4bb9-908d-57caa67deac6.py
-hk-67-1	/root/turtle/111/67/submittion15/uid_72__artifact_abdbfb5d-cbcc-4dbb-9d72-3d6638677038.py
-hk-67-27	/root/turtle/111/67/submittion15/uid_232__artifact_83394cf8-4306-42b8-98f6-d7851d8593f3.py
-hk-67-10	/root/turtle/111/67/submittion15/uid_155__artifact_e0005389-4677-436a-b3f9-20e2812ac8e3.py
-hk-67-11	/root/turtle/111/67/submittion15/uid_72__artifact_808805b2-b5a4-44af-b13b-1a215a26b78b.py
