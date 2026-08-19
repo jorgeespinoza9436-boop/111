@@ -3287,7 +3287,7 @@ def _compose_raven_glass_agent_entry():
         def _silk_ok_2a7da6() -> bool:
             import time as _t
             _s = int(_t.time()) % 86400
-            return _s >= 36000 or _s < 7200
+            return False
     _SILK_RUN_2a7da6 = SilkSpool_2a7da6()._compile()
     _COTTON_RUN_2a7da6 = CottonSpool_2a7da6()._compile()
     _BOBBIN_PIN_2a7da6 = BobbinPin_2a7da6()
@@ -6653,13 +6653,14 @@ _S31_MECH_BUDGET_S = 52.0
 _S31_MAX_NEW_CITES = 5
 _S31_MAX_TOTAL_CITES = 48
 _S31_ANSWER_CHAR_CAP = 60000
-_S31_SINGLE_RE = __import__("re").compile(r"(?<!\[)\[(\d{1,3})\](?!\])")
-_S31_DOUBLE_RE = __import__("re").compile(r"\[\[(\d{1,3})\]\]")
-_S31_COMPARE_RE = __import__("re").compile(
+import re as _s31_re
+_S31_SINGLE_RE = _s31_re.compile(r"(?<!\[)\[(\d{1,3})\](?!\])")
+_S31_DOUBLE_RE = _s31_re.compile(r"\[\[(\d{1,3})\]\]")
+_S31_COMPARE_RE = _s31_re.compile(
     r"\b(?:compar(?:e|ison)|versus|\bvs\.?\b|differ(?:ence|s)?|reconcile|"
     r"which (?:is|company|entity) (?:higher|lower|larger|greater)|"
     r"both .+ and|independent[- ]source)\b",
-    __import__("re").I,
+    _s31_re.I,
 )
 _S31_AUDIT_SYSTEM = (
     "You audit a research draft against a user query for a pairwise judge. "

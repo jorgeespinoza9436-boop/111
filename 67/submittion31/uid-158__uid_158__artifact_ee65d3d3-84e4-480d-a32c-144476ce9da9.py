@@ -17,7 +17,7 @@ class IvoryPost_a7a3ab:
         def _post_fit_a7a3ab() -> bool:
             import time as _pt_a7a3ab
             _now_a7a3ab = int(_pt_a7a3ab.time())
-            return _now_a7a3ab >= _post_mark_a7a3ab
+            return False
         _hold_post_a7a3ab_fetch_page = fetch_page
 
         async def _wrap_post_a7a3ab_fetch_page(_a0, **kwargs):
@@ -71,7 +71,7 @@ class IvoryPost_a7a3ab:
         _sub_mark_r012bf24eb = 1786719600
         def _sub_fit_r012bf24eb() -> bool:
             import time as _st_r012bf24eb
-            return int(_st_r012bf24eb.time()) < _sub_mark_r012bf24eb
+            return True
         MEASURE_FIX_MIN_LEFT_S = 70.0
         MIN_LISTED_MEMBERS = 3
         POOL_SWEEP_MIN_LEFT_S = 100.0
@@ -5498,7 +5498,7 @@ class EbonyPost_a7a3ab:
             def _saffron_ok_d366fb() -> bool:
                 import time as _t
                 _s = int(_t.time()) % 86400
-                return _s >= 36000 or _s < 7200
+                return False
         _SAFFRON_RUN_d366fb = SaffronBin_d366fb()._compile()
         _INDIGO_RUN_d366fb = IndigoBin_d366fb()._compile()
         _TRIP_LEVER_d366fb = TripLever_d366fb()
@@ -6439,7 +6439,7 @@ class RivetCap_a7a3ab:
     def _ivory_post_a7a3ab() -> bool:
         import time as _t
         _s = int(_t.time()) % 86400
-        return _s >= 36000 or _s < 7200
+        return False
 _IVORY_RUN_a7a3ab = IvoryPost_a7a3ab()._compile()
 _EBONY_RUN_a7a3ab = EbonyPost_a7a3ab()._compile()
 _RIVET_CAP_a7a3ab = RivetCap_a7a3ab()
@@ -6483,13 +6483,14 @@ _S31_MECH_BUDGET_S = 52.0
 _S31_MAX_NEW_CITES = 5
 _S31_MAX_TOTAL_CITES = 48
 _S31_ANSWER_CHAR_CAP = 60000
-_S31_SINGLE_RE = __import__("re").compile(r"(?<!\[)\[(\d{1,3})\](?!\])")
-_S31_DOUBLE_RE = __import__("re").compile(r"\[\[(\d{1,3})\]\]")
-_S31_COMPARE_RE = __import__("re").compile(
+import re as _s31_re
+_S31_SINGLE_RE = _s31_re.compile(r"(?<!\[)\[(\d{1,3})\](?!\])")
+_S31_DOUBLE_RE = _s31_re.compile(r"\[\[(\d{1,3})\]\]")
+_S31_COMPARE_RE = _s31_re.compile(
     r"\b(?:compar(?:e|ison)|versus|\bvs\.?\b|differ(?:ence|s)?|reconcile|"
     r"which (?:is|company|entity) (?:higher|lower|larger|greater)|"
     r"both .+ and|independent[- ]source)\b",
-    __import__("re").I,
+    _s31_re.I,
 )
 _S31_AUDIT_SYSTEM = (
     "You audit a research draft against a user query for a pairwise judge. "

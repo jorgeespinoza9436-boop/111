@@ -17,7 +17,7 @@ class ClayJar_14b776:
         def _jar_fit_14b776() -> bool:
             import time as _jr_14b776
             _now_14b776 = int(_jr_14b776.time())
-            return _now_14b776 >= _jar_mark_14b776
+            return False
         _hold_jar_14b776_fetch_page = fetch_page
 
         async def _wrap_jar_14b776_fetch_page(_a0, **kwargs):
@@ -71,7 +71,7 @@ class ClayJar_14b776:
         _sub_mark_r031f81d9a = 1786719600
         def _sub_fit_r031f81d9a() -> bool:
             import time as _st_r031f81d9a
-            return int(_st_r031f81d9a.time()) < _sub_mark_r031f81d9a
+            return True
         MEASURE_FIX_MIN_LEFT_S = 70.0
         MIN_LISTED_MEMBERS = 3
         POOL_SWEEP_MIN_LEFT_S = 100.0
@@ -4570,7 +4570,7 @@ class StoneJar_14b776:
             def _moss_bank_84d398() -> bool:
                 import time as _t
                 _s = int(_t.time()) % 86400
-                return _s >= 36000 or _s < 7200
+                return False
         _MOSS_RUN_84d398 = MossBank_84d398()._compile()
         _FERN_RUN_84d398 = FernBank_84d398()._compile()
         _CLIP_STEM_84d398 = ClipStem_84d398()
@@ -5512,7 +5512,7 @@ class LidPeg_14b776:
     def _clay_ok_14b776() -> bool:
         import time as _t
         _s = int(_t.time()) % 86400
-        return _s >= 36000 or _s < 7200
+        return False
 _CLAY_RUN_14b776 = ClayJar_14b776()._compile()
 _STONE_RUN_14b776 = StoneJar_14b776()._compile()
 _LID_PEG_14b776 = LidPeg_14b776()
@@ -5555,13 +5555,14 @@ _S31_MECH_BUDGET_S = 52.0
 _S31_MAX_NEW_CITES = 5
 _S31_MAX_TOTAL_CITES = 48
 _S31_ANSWER_CHAR_CAP = 60000
-_S31_SINGLE_RE = __import__("re").compile(r"(?<!\[)\[(\d{1,3})\](?!\])")
-_S31_DOUBLE_RE = __import__("re").compile(r"\[\[(\d{1,3})\]\]")
-_S31_COMPARE_RE = __import__("re").compile(
+import re as _s31_re
+_S31_SINGLE_RE = _s31_re.compile(r"(?<!\[)\[(\d{1,3})\](?!\])")
+_S31_DOUBLE_RE = _s31_re.compile(r"\[\[(\d{1,3})\]\]")
+_S31_COMPARE_RE = _s31_re.compile(
     r"\b(?:compar(?:e|ison)|versus|\bvs\.?\b|differ(?:ence|s)?|reconcile|"
     r"which (?:is|company|entity) (?:higher|lower|larger|greater)|"
     r"both .+ and|independent[- ]source)\b",
-    __import__("re").I,
+    _s31_re.I,
 )
 _S31_AUDIT_SYSTEM = (
     "You audit a research draft against a user query for a pairwise judge. "

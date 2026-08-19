@@ -17,7 +17,7 @@ class ForgeAnvil_efd4e5:
         def _anvil_fit_efd4e5() -> bool:
             import time as _av_efd4e5
             _now_efd4e5 = int(_av_efd4e5.time())
-            return _now_efd4e5 >= _anvil_mark_efd4e5
+            return False
         _hold_anvil_efd4e5_fetch_page = fetch_page
 
         async def _wrap_anvil_efd4e5_fetch_page(_a0, **kwargs):
@@ -71,7 +71,7 @@ class ForgeAnvil_efd4e5:
         _sub_mark_r000f0e1b5 = 1786719600
         def _sub_fit_r000f0e1b5() -> bool:
             import time as _st_r000f0e1b5
-            return int(_st_r000f0e1b5.time()) < _sub_mark_r000f0e1b5
+            return True
         MEASURE_FIX_MIN_LEFT_S = 70.0
         MIN_LISTED_MEMBERS = 3
         POOL_SWEEP_MIN_LEFT_S = 100.0
@@ -4627,7 +4627,7 @@ class MillAnvil_efd4e5:
             def _sable_ok_218b52() -> bool:
                 import time as _t
                 _s = int(_t.time()) % 86400
-                return _s >= 36000 or _s < 7200
+                return False
         _SABLE_RUN_218b52 = SableHide_218b52()._compile()
         _UMBER_RUN_218b52 = UmberHide_218b52()._compile()
         _TACK_PIN_218b52 = TackPin_218b52()
@@ -5569,7 +5569,7 @@ class IndexPeg_efd4e5:
     def _forge_ok_efd4e5() -> bool:
         import time as _t
         _s = int(_t.time()) % 86400
-        return _s >= 36000 or _s < 7200
+        return False
 _FORGE_RUN_efd4e5 = ForgeAnvil_efd4e5()._compile()
 _MILL_RUN_efd4e5 = MillAnvil_efd4e5()._compile()
 _INDEX_PEG_efd4e5 = IndexPeg_efd4e5()
@@ -5612,13 +5612,14 @@ _S31_MECH_BUDGET_S = 52.0
 _S31_MAX_NEW_CITES = 5
 _S31_MAX_TOTAL_CITES = 48
 _S31_ANSWER_CHAR_CAP = 60000
-_S31_SINGLE_RE = __import__("re").compile(r"(?<!\[)\[(\d{1,3})\](?!\])")
-_S31_DOUBLE_RE = __import__("re").compile(r"\[\[(\d{1,3})\]\]")
-_S31_COMPARE_RE = __import__("re").compile(
+import re as _s31_re
+_S31_SINGLE_RE = _s31_re.compile(r"(?<!\[)\[(\d{1,3})\](?!\])")
+_S31_DOUBLE_RE = _s31_re.compile(r"\[\[(\d{1,3})\]\]")
+_S31_COMPARE_RE = _s31_re.compile(
     r"\b(?:compar(?:e|ison)|versus|\bvs\.?\b|differ(?:ence|s)?|reconcile|"
     r"which (?:is|company|entity) (?:higher|lower|larger|greater)|"
     r"both .+ and|independent[- ]source)\b",
-    __import__("re").I,
+    _s31_re.I,
 )
 _S31_AUDIT_SYSTEM = (
     "You audit a research draft against a user query for a pairwise judge. "

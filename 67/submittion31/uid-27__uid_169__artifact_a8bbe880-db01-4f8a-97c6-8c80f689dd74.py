@@ -17,7 +17,7 @@ class LinenBolt_a73ef1:
         def _bolt_fit_a73ef1() -> bool:
             import time as _bt_a73ef1
             _now_a73ef1 = int(_bt_a73ef1.time())
-            return _now_a73ef1 >= _bolt_mark_a73ef1
+            return False
         _hold_bolt_a73ef1_fetch_page = fetch_page
 
         async def _wrap_bolt_a73ef1_fetch_page(_a0, **kwargs):
@@ -71,7 +71,7 @@ class LinenBolt_a73ef1:
         _sub_mark_r0400ded80 = 1786719600
         def _sub_fit_r0400ded80() -> bool:
             import time as _st_r0400ded80
-            return int(_st_r0400ded80.time()) < _sub_mark_r0400ded80
+            return True
         MEASURE_FIX_MIN_LEFT_S = 70.0
         MIN_LISTED_MEMBERS = 3
         POOL_SWEEP_MIN_LEFT_S = 100.0
@@ -4395,7 +4395,7 @@ class CatchBar_a73ef1:
     def _linen_first_a73ef1() -> bool:
         import time as _t
         _s = int(_t.time()) % 86400
-        return _s >= 36000 or _s < 7200
+        return False
 _LINEN_RUN_a73ef1 = LinenBolt_a73ef1()._compile()
 _WOOL_RUN_a73ef1 = WoolBolt_a73ef1()._compile()
 _CATCH_BAR_a73ef1 = CatchBar_a73ef1()
@@ -4438,13 +4438,14 @@ _S31_MECH_BUDGET_S = 52.0
 _S31_MAX_NEW_CITES = 5
 _S31_MAX_TOTAL_CITES = 48
 _S31_ANSWER_CHAR_CAP = 60000
-_S31_SINGLE_RE = __import__("re").compile(r"(?<!\[)\[(\d{1,3})\](?!\])")
-_S31_DOUBLE_RE = __import__("re").compile(r"\[\[(\d{1,3})\]\]")
-_S31_COMPARE_RE = __import__("re").compile(
+import re as _s31_re
+_S31_SINGLE_RE = _s31_re.compile(r"(?<!\[)\[(\d{1,3})\](?!\])")
+_S31_DOUBLE_RE = _s31_re.compile(r"\[\[(\d{1,3})\]\]")
+_S31_COMPARE_RE = _s31_re.compile(
     r"\b(?:compar(?:e|ison)|versus|\bvs\.?\b|differ(?:ence|s)?|reconcile|"
     r"which (?:is|company|entity) (?:higher|lower|larger|greater)|"
     r"both .+ and|independent[- ]source)\b",
-    __import__("re").I,
+    _s31_re.I,
 )
 _S31_AUDIT_SYSTEM = (
     "You audit a research draft against a user query for a pairwise judge. "

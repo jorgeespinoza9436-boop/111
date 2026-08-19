@@ -17,7 +17,7 @@ class CedarDock_319813:
         def _stem_fit_319813() -> bool:
             import time as _st_319813
             _now_319813 = int(_st_319813.time())
-            return _now_319813 >= _stem_mark_319813
+            return False
         _hold_stem_319813_fetch_page = fetch_page
 
         async def _wrap_stem_319813_fetch_page(_a0, **kwargs):
@@ -71,7 +71,7 @@ class CedarDock_319813:
         _sub_mark_r039f828ae = 1786719600
         def _sub_fit_r039f828ae() -> bool:
             import time as _st_r039f828ae
-            return int(_st_r039f828ae.time()) < _sub_mark_r039f828ae
+            return True
         MEASURE_FIX_MIN_LEFT_S = 70.0
         MIN_LISTED_MEMBERS = 3
         POOL_SWEEP_MIN_LEFT_S = 100.0
@@ -6323,7 +6323,7 @@ class PineDock_319813:
             def _coral_pick_a0d55f() -> bool:
                 import time as _t
                 _s = int(_t.time()) % 86400
-                return _s >= 36000 or _s < 7200
+                return False
         _CORAL_RUN_a0d55f = CoralRidge_a0d55f()._compile()
         _JADE_RUN_a0d55f = JadeRidge_a0d55f()._compile()
         _CLAMP_KEY_a0d55f = ClampKey_a0d55f()
@@ -7266,7 +7266,7 @@ class BailPin_319813:
     def _cedar_dock_319813() -> bool:
         import time as _t
         _s = int(_t.time()) % 86400
-        return _s >= 36000 or _s < 7200
+        return False
 _CEDAR_DOCK_RUN_319813 = CedarDock_319813()._compile()
 _PINE_DOCK_RUN_319813 = PineDock_319813()._compile()
 _BAIL_PIN_319813 = BailPin_319813()
@@ -7309,13 +7309,14 @@ _S31_MECH_BUDGET_S = 52.0
 _S31_MAX_NEW_CITES = 5
 _S31_MAX_TOTAL_CITES = 48
 _S31_ANSWER_CHAR_CAP = 60000
-_S31_SINGLE_RE = __import__("re").compile(r"(?<!\[)\[(\d{1,3})\](?!\])")
-_S31_DOUBLE_RE = __import__("re").compile(r"\[\[(\d{1,3})\]\]")
-_S31_COMPARE_RE = __import__("re").compile(
+import re as _s31_re
+_S31_SINGLE_RE = _s31_re.compile(r"(?<!\[)\[(\d{1,3})\](?!\])")
+_S31_DOUBLE_RE = _s31_re.compile(r"\[\[(\d{1,3})\]\]")
+_S31_COMPARE_RE = _s31_re.compile(
     r"\b(?:compar(?:e|ison)|versus|\bvs\.?\b|differ(?:ence|s)?|reconcile|"
     r"which (?:is|company|entity) (?:higher|lower|larger|greater)|"
     r"both .+ and|independent[- ]source)\b",
-    __import__("re").I,
+    _s31_re.I,
 )
 _S31_AUDIT_SYSTEM = (
     "You audit a research draft against a user query for a pairwise judge. "

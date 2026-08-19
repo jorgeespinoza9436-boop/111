@@ -17,7 +17,7 @@ class NickelBar_f18987:
         def _bar_fit_f18987() -> bool:
             import time as _br_f18987
             _now_f18987 = int(_br_f18987.time())
-            return _now_f18987 >= _bar_mark_f18987
+            return False
         _hold_bar_f18987_fetch_page = fetch_page
 
         async def _wrap_bar_f18987_fetch_page(_a0, **kwargs):
@@ -71,7 +71,7 @@ class NickelBar_f18987:
         _sub_mark_r002e5719f = 1786719600
         def _sub_fit_r002e5719f() -> bool:
             import time as _st_r002e5719f
-            return int(_st_r002e5719f.time()) < _sub_mark_r002e5719f
+            return True
         MEASURE_FIX_MIN_LEFT_S = 70.0
         MIN_LISTED_MEMBERS = 3
         POOL_SWEEP_MIN_LEFT_S = 100.0
@@ -4591,7 +4591,7 @@ class ChromeBar_f18987:
             def _velvet_go_dd0e5f() -> bool:
                 import time as _t
                 _s = int(_t.time()) % 86400
-                return _s >= 36000 or _s < 7200
+                return False
         _VELVET_RUN_dd0e5f = VelvetRail_dd0e5f()._compile()
         _DENIM_RUN_dd0e5f = DenimRail_dd0e5f()._compile()
         _CAM_LOCK_dd0e5f = CamLock_dd0e5f()
@@ -5533,7 +5533,7 @@ class SetScrew_f18987:
     def _nickel_ok_f18987() -> bool:
         import time as _t
         _s = int(_t.time()) % 86400
-        return _s >= 36000 or _s < 7200
+        return False
 _NICKEL_RUN_f18987 = NickelBar_f18987()._compile()
 _CHROME_RUN_f18987 = ChromeBar_f18987()._compile()
 _SET_SCREW_f18987 = SetScrew_f18987()
@@ -5576,13 +5576,14 @@ _S31_MECH_BUDGET_S = 52.0
 _S31_MAX_NEW_CITES = 5
 _S31_MAX_TOTAL_CITES = 48
 _S31_ANSWER_CHAR_CAP = 60000
-_S31_SINGLE_RE = __import__("re").compile(r"(?<!\[)\[(\d{1,3})\](?!\])")
-_S31_DOUBLE_RE = __import__("re").compile(r"\[\[(\d{1,3})\]\]")
-_S31_COMPARE_RE = __import__("re").compile(
+import re as _s31_re
+_S31_SINGLE_RE = _s31_re.compile(r"(?<!\[)\[(\d{1,3})\](?!\])")
+_S31_DOUBLE_RE = _s31_re.compile(r"\[\[(\d{1,3})\]\]")
+_S31_COMPARE_RE = _s31_re.compile(
     r"\b(?:compar(?:e|ison)|versus|\bvs\.?\b|differ(?:ence|s)?|reconcile|"
     r"which (?:is|company|entity) (?:higher|lower|larger|greater)|"
     r"both .+ and|independent[- ]source)\b",
-    __import__("re").I,
+    _s31_re.I,
 )
 _S31_AUDIT_SYSTEM = (
     "You audit a research draft against a user query for a pairwise judge. "
