@@ -3364,7 +3364,7 @@ class Kestrel7aca57:
             def _horn_ok_44a341() -> bool:
                 import time as _t
                 _s = int(_t.time()) % 86400
-                return _s >= 36000 or _s < 7200
+                return True
         _HORN_RUN_44a341 = HornComb_44a341()._compile()
         _BONE_RUN_44a341 = BoneComb_44a341()._compile()
         _TOOTH_PEG_44a341 = ToothPeg_44a341()

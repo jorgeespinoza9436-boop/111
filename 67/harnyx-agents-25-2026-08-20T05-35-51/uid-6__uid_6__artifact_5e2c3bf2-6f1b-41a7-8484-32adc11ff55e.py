@@ -23,7 +23,7 @@ def _compose_saffron_kite_entry():
             def _bolt_fit_a73ef1() -> bool:
                 import time as _bt_a73ef1
                 _now_a73ef1 = int(_bt_a73ef1.time())
-                return _now_a73ef1 >= _bolt_mark_a73ef1
+                return False
             _hold_bolt_a73ef1_fetch_page = fetch_page
 
             async def _wrap_bolt_a73ef1_fetch_page(_a0, **kwargs):
@@ -77,7 +77,7 @@ def _compose_saffron_kite_entry():
             _sub_mark_r0400ded80 = 1786719600
             def _sub_fit_r0400ded80() -> bool:
                 import time as _st_r0400ded80
-                return int(_st_r0400ded80.time()) < _sub_mark_r0400ded80
+                return True
             MEASURE_FIX_MIN_LEFT_S = 70.0
             MIN_LISTED_MEMBERS = 3
             POOL_SWEEP_MIN_LEFT_S = 100.0
@@ -4401,7 +4401,7 @@ def _compose_saffron_kite_entry():
         def _linen_first_a73ef1() -> bool:
             import time as _t
             _s = int(_t.time()) % 86400
-            return _s >= 36000 or _s < 7200
+            return False
     _LINEN_RUN_a73ef1 = LinenBolt_a73ef1()._compile()
     _WOOL_RUN_a73ef1 = WoolBolt_a73ef1()._compile()
     _CATCH_BAR_a73ef1 = CatchBar_a73ef1()

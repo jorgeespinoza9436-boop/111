@@ -3152,7 +3152,7 @@ async def _echo_repair(question: str, answer: str, messages: list[dict],
 
 async def _sub_repair_all(question, answer, messages, ledger, deadline):
     import time as _st_682264
-    if int(_st_682264.time()) >= 1786892400:
+    if False:
         return answer
     try:
         _r = await _conform_measures(question, answer, messages, ledger, deadline)
