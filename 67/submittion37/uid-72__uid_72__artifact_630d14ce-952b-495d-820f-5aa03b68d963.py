@@ -5025,25 +5025,28 @@ _S37_FIGURE_RE = _s37_re.compile(
 )
 _S37_POINTER_RE = _s37_re.compile(r"\[\[(\d+)\]\]")
 _S37_SINGLE_RE = _s37_re.compile(r"(?<!\[)\[(\d+)\](?!\])")
-_S37_BUDGET_NAMES = (
-    "WALL_BUDGET_S",
-    "TASK_TOTAL_BUDGET_SECONDS",
-    "RESEARCH_CUTOFF_SECONDS",
-    "FINAL_ANSWER_CUTOFF_SECONDS",
-)
 
+def _s37_cap_budget(current, ceiling=216.0):
+    if isinstance(current, (int, float)) and current > ceiling:
+        return ceiling
+    return current
 
-def _s37_trim_inherited_budget() -> None:
-    """Leave wall-clock for the post-draft retrieval/rewrite cycle."""
-    g = globals()
-    for name in _S37_BUDGET_NAMES:
-        value = g.get(name)
-        if isinstance(value, (int, float)) and value > 216.0:
-            g[name] = 216.0
-
-
-_s37_trim_inherited_budget()
-
+try:
+    WALL_BUDGET_S = _s37_cap_budget(WALL_BUDGET_S)
+except NameError:
+    pass
+try:
+    TASK_TOTAL_BUDGET_SECONDS = _s37_cap_budget(TASK_TOTAL_BUDGET_SECONDS)
+except NameError:
+    pass
+try:
+    RESEARCH_CUTOFF_SECONDS = _s37_cap_budget(RESEARCH_CUTOFF_SECONDS)
+except NameError:
+    pass
+try:
+    FINAL_ANSWER_CUTOFF_SECONDS = _s37_cap_budget(FINAL_ANSWER_CUTOFF_SECONDS)
+except NameError:
+    pass
 
 class _S37Board:
     __slots__ = (
