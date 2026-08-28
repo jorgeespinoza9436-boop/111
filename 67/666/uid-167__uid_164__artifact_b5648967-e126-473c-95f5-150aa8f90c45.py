@@ -10966,4 +10966,886 @@ def _compose_beryl_vector_agent_entry():
 
 
     def _w5_point_repair(response):
-        'Rewrite surviving `[n]` evidence numbers into `[[position]]` pointers.\n\n    The platform reads `[[k]]` as a pointer to citations[k-1] and reads a bare\n    `[n]` as ordinary answer content, so a prose answer whose markers were never\n    rewritten ships with zero valid citations however good its evidence is.\n\n    The base builds its citation array by walking the answer and appending one\n    ref per evidence number in first-appearance order, so the k-th distinct\n    marker is citations[k-1]. That identity holds only when no number was dropped\n    on the way, which is exactly what the count check tests; when the counts\n    disagree the text is left alone, because a pointer that resolves to unrelate
+        'Rewrite surviving `[n]` evidence numbers into `[[position]]` pointers.\n\n    The platform reads `[[k]]` as a pointer to citations[k-1] and reads a bare\n    `[n]` as ordinary answer content, so a prose answer whose markers were never\n    rewritten ships with zero valid citations however good its evidence is.\n\n    The base builds its citation array by walking the answer and appending one\n    ref per evidence number in first-appearance order, so the k-th distinct\n    marker is citations[k-1]. That identity holds only when no number was dropped\n    on the way, which is exactly what the count check tests; when the counts\n    disagree the text is left alone, because a pointer that resolves to unrelated\n    evidence reads as a defect while a bare `[n]` reads as ordinary prose.\n    '
+        text = getattr(response, "text", None)
+        if not text or _W5_DBL_RE.search(text):
+            return response
+        citations = list(getattr(response, "citations", None) or [])
+        if not citations:
+            return response
+        numbers = _w5_distinct_markers(text)
+        if not numbers or len(numbers) != len(citations):
+            return response
+        position = {}
+        for i, n in enumerate(numbers):
+            position[n] = i + 1
+
+        def _point(match):
+            pieces = []
+            for chunk in match.group(1).split(","):
+                piece = chunk.strip()
+                if piece.isdigit() and int(piece) in position:
+                    pieces.append("[[" + str(position[int(piece)]) + "]]")
+                else:
+                    return match.group(0)
+            return "".join(pieces)
+
+        repaired = _W5_SGL_RE.sub(_point, text)
+        if repaired == text:
+            return response
+        try:
+            return Response(text=repaired, citations=citations)
+        except Exception:
+            return response
+
+
+
+
+    import re as _sc_re
+
+    # process narration, anywhere in the document (f2.0 checked only the leading paragraph)
+    _SC_NARRATION = _sc_re.compile(
+        r"^\s*(?:"
+        r"I(?:'ll|'m| will| need| have| can| am| should| would)\b"
+        r"|Let me\b|Let's\b|Now (?:I|let|to)\b|Next,? I\b|First,? I\b"
+        r"|Based on (?:the|my|what) [^.]{0,60}\b(?:I|we) (?:can|have|will|need)\b"
+        r"|(?:To|In order to) (?:confirm|verify|check|answer)[^.]{0,80}\bI\b"
+        r")", _sc_re.IGNORECASE)
+
+    # scaffold headings that belong to the agent's own bookkeeping
+    _SC_SCAFFOLD = _sc_re.compile(
+        r"^\s*(?:#{1,4}\s*|\*\*\s*)"
+        r"(?:VERIFY|VERIFICATION|PROOF|PLAN|SCRATCH(?:PAD)?|DRAFT|AUDIT|NOTES?|"
+        r"CANDIDATES?|CANDIDATE POOL|EVIDENCE LEDGER|WORKING)"
+        r"\s*(?:\*\*)?\s*:?\s*$", _sc_re.IGNORECASE)
+
+    # SDK/tool identifiers must never reach the judge
+    _SC_TOOLS = _sc_re.compile(
+        r"\b(?:page_grep|fetch_page|read_page|retain_evidence|web_search|search_web|"
+        r"llm_chat|embed_text|tooling_info|test_tool)\b")
+
+    _SC_TABLE_ROW = _sc_re.compile(r"^\s*\|.*\|\s*$")
+    # a bookkeeping table, not an answer table
+    _SC_DUMP_HEADER = _sc_re.compile(r"\|\s*(?:candidate|constraint|check|hypothesis|status)\b",
+                                     _sc_re.IGNORECASE)
+    _SC_MIN_TABLE_ROWS = 8
+    _SC_MIN_KEEP_CHARS = 300
+    _SC_MIN_KEEP_RATIO = 0.25
+
+
+    def _sc_blocks(text):
+        """Split into paragraph blocks, keeping table runs together."""
+        lines = text.split("\n")
+        out, cur = [], []
+        for line in lines:
+            if line.strip() == "":
+                if cur:
+                    out.append(cur)
+                    cur = []
+                out.append(None)
+            else:
+                cur.append(line)
+        if cur:
+            out.append(cur)
+        return out
+
+
+    def _sc_is_dump_table(block):
+        rows = [ln for ln in block if _SC_TABLE_ROW.match(ln)]
+        if len(rows) < 3 or len(rows) != len(block):
+            return False
+        if _SC_DUMP_HEADER.search(rows[0]):
+            return True
+        body = [r for r in rows[1:] if not set(r.replace("|", "").strip()) <= set("-: ")]
+        return len(body) >= _SC_MIN_TABLE_ROWS
+
+
+    def _sc_scrub_tools(block):
+        """Drop sentences that name an SDK tool; keep the rest of the line."""
+        out = []
+        for line in block:
+            if not _SC_TOOLS.search(line):
+                out.append(line)
+                continue
+            parts = _sc_re.split(r"(?<=[.!?])\s+", line)
+            kept = [p for p in parts if not _SC_TOOLS.search(p)]
+            rebuilt = " ".join(kept).strip()
+            rebuilt = _sc_re.sub(r"\s*\(\s*\)", "", rebuilt)
+            rebuilt = _sc_re.sub(r"\s*,\s*(?=[.;])", "", rebuilt)
+            if rebuilt:
+                out.append(rebuilt)
+        return out
+
+
+    def sc_clean(text):
+        """Return `text` with agent bookkeeping removed, or `text` unchanged if unsafe."""
+        if not text or not text.strip():
+            return text
+        kept = []
+        for block in _sc_blocks(text):
+            if block is None:
+                if kept and kept[-1] is not None:
+                    kept.append(None)
+                continue
+            if len(block) == 1 and _SC_SCAFFOLD.match(block[0]):
+                continue
+            if _sc_is_dump_table(block):
+                continue
+            body = [ln for ln in block if not _SC_NARRATION.match(ln)]
+            if not body:
+                continue
+            body = _sc_scrub_tools(body)
+            if not body:
+                continue
+            kept.append(body)
+        while kept and kept[-1] is None:
+            kept.pop()
+        while kept and kept[0] is None:
+            kept.pop(0)
+        out = "\n\n".join("\n".join(b) for b in kept if b is not None).strip()
+        if len(out) < _SC_MIN_KEEP_CHARS or len(out) < _SC_MIN_KEEP_RATIO * len(text):
+            return text
+        return out
+
+
+    def _w5_form_fix(response):
+        """Strip agent bookkeeping from a text answer, keeping citations and note intact."""
+        try:
+            original = getattr(response, "text", None)
+            if not isinstance(original, str) or not original.strip():
+                return response
+            repaired = sc_clean(original)
+            if not repaired or repaired == original:
+                return response
+            held = getattr(response, "citations", None)
+            carried = getattr(response, "note", None)
+            if carried:
+                try:
+                    return Response(text=repaired, citations=held or None, note=carried)
+                except Exception:
+                    pass
+            return Response(text=repaired, citations=held or None)
+        except Exception:
+            return response
+
+
+    async def query(query: Query) -> Response:
+        """w5 entrypoint: run the base, then anchor and repair what it returned."""
+        previous_wall = None
+        if _W5_WALL_TRIM is not None:
+            try:
+                previous_wall = WALL_BUDGET_S
+            except NameError:
+                previous_wall = None
+            if previous_wall is not None:
+                WALL_BUDGET_S = min(previous_wall, _W5_WALL_TRIM)
+        deadline = _w5_clock() + _W5_TOTAL_BUDGET_S
+        question = getattr(query, "text", "") or ""
+        schema = getattr(query, "output_schema", None)
+        try:
+            response = await _w5_base_query(query)
+        finally:
+            if previous_wall is not None:
+                WALL_BUDGET_S = previous_wall
+        if schema is not None:
+            try:
+                response = await _w5_anchor_board(question, schema, response, deadline)
+            except Exception:
+                pass
+        elif _W5_DO_POINTERS:
+            try:
+                response = _w5_point_repair(response)
+            except Exception:
+                pass
+        if schema is None:
+            response = _w5_form_fix(response)
+        return response
+    # --- w5 source-anchor board (end) ---
+
+    return query
+
+_beryl_vector_agent_query_entry = _compose_beryl_vector_agent_entry()
+
+
+_BALANCED_ROUTER_SEED = "7cbf2d79cbeb46b926563027"
+
+
+def _balanced_route_label(query: Query) -> str:
+    text = (getattr(query, "text", "") or "").strip()
+    schema = getattr(query, "output_schema", None)
+    property_count = 0
+    required_count = 0
+    schema_type = "none"
+    if isinstance(schema, dict):
+        properties = schema.get("properties")
+        required = schema.get("required")
+        property_count = len(properties) if isinstance(properties, dict) else 0
+        required_count = len(required) if isinstance(required, list) else 0
+        raw_schema_type = schema.get("type")
+        schema_type = raw_schema_type if isinstance(raw_schema_type, str) else "dict"
+    elif schema is not None:
+        schema_type = "schema"
+
+    import hashlib as _balanced_hashlib
+
+    payload = (
+        _BALANCED_ROUTER_SEED
+        + "|"
+        + schema_type
+        + "|"
+        + str(property_count)
+        + "|"
+        + str(required_count)
+        + "|"
+        + text[:512]
+        + "|"
+        + text[-256:]
+    ).encode("utf-8", "ignore")
+    bucket = int.from_bytes(_balanced_hashlib.sha256(payload).digest()[:8], "big") % 3
+    if bucket == 0:
+        return "OrchidHarborAgent"
+    if bucket == 1:
+        return "JuniperRiverAgent"
+    return "BerylVectorAgent"
+
+
+class OrchidHarborAgent:
+    async def __call__(self, query: Query) -> Response:
+        return await _orchid_harbor_agent_query_entry(query)
+
+
+class JuniperRiverAgent:
+    async def __call__(self, query: Query) -> Response:
+        return await _juniper_river_agent_query_entry(query)
+
+
+class BerylVectorAgent:
+    async def __call__(self, query: Query) -> Response:
+        return await _beryl_vector_agent_query_entry(query)
+
+
+_BALANCED_PRIMARY_AGENT = OrchidHarborAgent()
+_BALANCED_SECONDARY_AGENT = JuniperRiverAgent()
+_BALANCED_TERTIARY_AGENT = BerylVectorAgent()
+_CANDIDATE_BRANCH_CLASS_NAMES = (
+    "OrchidHarborAgent",
+    "JuniperRiverAgent",
+    "BerylVectorAgent",
+)
+_CANDIDATE_ROUTE_FUNCTION = "_balanced_route_label"
+
+
+async def _h666_base_query(query: Query) -> Response:
+    selected = _balanced_route_label(query)
+    if selected == "OrchidHarborAgent":
+        branch = _BALANCED_PRIMARY_AGENT
+    elif selected == "JuniperRiverAgent":
+        branch = _BALANCED_SECONDARY_AGENT
+    else:
+        branch = _BALANCED_TERTIARY_AGENT
+    return await branch(query)
+
+
+# --- h666 claim-conflict ledger (begin) ---
+# Ordinary-path architecture added relative to the baseline agent:
+#   baseline research -> draft answer
+#   -> claim-conflict ledger audit (required elements, unsupported claims,
+#      comparison/period-basis gaps, official-vs-independent conflict,
+#      unverified named premises, incomplete pools)
+#   -> if that ledger says a query-required research fact is still open,
+#      re-enter retrieval on targeted official/primary and independent
+#      contemporaneous sources, then regenerate the answer from the new board
+#   -> otherwise keep the draft (pointer hygiene only)
+#
+# The ledger condition is the research-role gate. It reads whether the draft
+# already establishes every query-required fact from evidence. True means
+# fresh retrieval plus a rewritten answer; False means the extra corpus would
+# not change which researched claims are returned. Timeout/exception paths
+# only fail open and are not this gate.
+import asyncio as _h666_asyncio
+import json as _h666_json
+import re as _h666_re
+from time import monotonic as _h666_monotonic
+
+from harnyx_miner_sdk.api import fetch_page as _h666_fetch_page
+from harnyx_miner_sdk.api import llm_chat as _h666_llm_chat
+from harnyx_miner_sdk.api import search_web as _h666_search_web
+from harnyx_miner_sdk.decorators import entrypoint
+from harnyx_miner_sdk.query import CitationRef as _h666_CitationRef
+from harnyx_miner_sdk.query import CitationSlice as _h666_CitationSlice
+from harnyx_miner_sdk.query import Query, Response
+from harnyx_miner_sdk.query import Query as _h666_Query
+from harnyx_miner_sdk.query import Response as _h666_Response
+
+_H666_LLM_PROVIDER = "openrouter"
+_H666_LLM_MODELS = ("openai/gpt-oss-120b", "z-ai/glm-5.2")
+_H666_SEARCH_PROVIDERS = ("parallel", "exa", "desearch")
+_H666_CHAT_TIMEOUT_S = 12.0
+_H666_SEARCH_TIMEOUT_S = 12.0
+_H666_FETCH_TIMEOUT_S = 14.0
+_H666_ANSWER_CAP = 60000
+_H666_NOTE_CAP = 8000
+_H666_MAX_CITES = 32
+_H666_SKIP_AFTER_S = 252.0
+_H666_POINTER_RE = _h666_re.compile(r"\[\[(\d+)\]\]")
+_H666_SINGLE_RE = _h666_re.compile(r"(?<!\[)\[(\d+)\](?!\])")
+_H666_FENCE_RE = _h666_re.compile(r"^```(?:json)?\s*|\s*```$", _h666_re.I | _h666_re.M)
+
+
+class _H666Ledger:
+    """Intermediate audit result that decides whether to re-enter retrieval."""
+
+    __slots__ = (
+        "missing_elements",
+        "unsupported_claims",
+        "comparison_gap",
+        "pool_incomplete",
+        "source_conflict",
+        "false_premise",
+        "period_basis_mismatch",
+        "targeted_queries",
+        "note_hint",
+    )
+
+    def __init__(self, payload: dict | None = None) -> None:
+        data = payload if isinstance(payload, dict) else {}
+        self.missing_elements = _h666_str_list(data.get("missing_elements"), 4)
+        self.unsupported_claims = _h666_str_list(data.get("unsupported_claims"), 4)
+        self.comparison_gap = bool(data.get("comparison_gap"))
+        self.pool_incomplete = bool(data.get("pool_incomplete"))
+        self.source_conflict = bool(data.get("source_conflict"))
+        self.false_premise = bool(data.get("false_premise"))
+        self.period_basis_mismatch = bool(data.get("period_basis_mismatch"))
+        self.targeted_queries = _h666_str_list(data.get("targeted_queries"), 4)
+        self.note_hint = ""
+        hint = data.get("note_hint")
+        if isinstance(hint, str):
+            self.note_hint = " ".join(hint.split()).strip()[:400]
+
+    def requires_fresh_retrieval_and_rewrite(self) -> bool:
+        """Research-role condition for the cross-stage cycle.
+
+        Values read: the audit flags and open-claim lists about the draft's
+        coverage of the user question (missing required elements, unsupported
+        load-bearing facts, one-sided comparisons, unaligned period/basis,
+        unresolved official-vs-independent conflict, unverified named premise,
+        or an unenumerated set/pool).
+
+        Decision: True re-enters retrieval and regenerates the answer from the
+        new official/independent board. False keeps the existing answer because
+        extra retrieval would not change the query-required researched claims.
+        """
+
+        return bool(
+            self.missing_elements
+            or self.unsupported_claims
+            or self.comparison_gap
+            or self.pool_incomplete
+            or self.source_conflict
+            or self.false_premise
+            or self.period_basis_mismatch
+        )
+
+    def open_claims(self) -> list[str]:
+        items = list(self.missing_elements) + list(self.unsupported_claims)
+        if self.comparison_gap:
+            items.append("both compared sides plus reconciled conclusion")
+        if self.period_basis_mismatch:
+            items.append("aligned reporting period and basis")
+        if self.source_conflict:
+            items.append("official versus independent residual difference")
+        if self.false_premise:
+            items.append("named premise existence or status correction")
+        if self.pool_incomplete:
+            items.append("complete in-scope pool and decisive exclusions")
+        return items[:8]
+
+
+def _h666_str_list(value, cap: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        text = " ".join(item.split()).strip()
+        if text:
+            out.append(text[:240])
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _h666_parse_json(text: str | None) -> dict | None:
+    if not isinstance(text, str) or not text.strip():
+        return None
+    raw = _H666_FENCE_RE.sub("", text.strip()).strip()
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        parsed = _h666_json.loads(raw[start : end + 1])
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _h666_choice_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            text = getattr(item, "text", None)
+            if text is None and isinstance(item, dict):
+                text = item.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+        return "\n".join(parts)
+    text = getattr(content, "text", None)
+    return text if isinstance(text, str) else ""
+
+
+def _h666_chat_text(payload) -> str:
+    llm = getattr(payload, "llm", None) or getattr(payload, "response", None)
+    raw = getattr(llm, "raw_text", None)
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    choices = getattr(llm, "choices", None) or ()
+    if not choices:
+        return ""
+    message = getattr(choices[0], "message", None)
+    return _h666_choice_text(getattr(message, "content", None)).strip()
+
+
+async def _h666_chat(system: str, user: str, max_tokens: int, timeout: float) -> str:
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+    last = ""
+    for model in _H666_LLM_MODELS:
+        try:
+            payload = await _h666_llm_chat(
+                provider=_H666_LLM_PROVIDER,
+                messages=messages,
+                model=model,
+                temperature=0.0,
+                max_tokens=max_tokens,
+                timeout=timeout,
+            )
+            last = _h666_chat_text(payload)
+            if last:
+                return last
+        except Exception:
+            continue
+    return last
+
+
+async def _h666_search(query_text: str):
+    q = " ".join((query_text or "").split())[:280]
+    if len(q) < 4:
+        return None
+    for provider in _H666_SEARCH_PROVIDERS:
+        try:
+            payload = await _h666_search_web(
+                q,
+                provider=provider,
+                num=5,
+                timeout=_H666_SEARCH_TIMEOUT_S,
+            )
+            if payload is not None and getattr(payload, "results", None):
+                return payload
+        except Exception:
+            continue
+    return None
+
+
+async def _h666_fetch(url: str, provider: str = "parallel"):
+    if not url or not isinstance(url, str):
+        return None
+    try:
+        return await _h666_fetch_page(
+            url,
+            provider=provider,
+            timeout=_H666_FETCH_TIMEOUT_S,
+        )
+    except Exception:
+        return None
+
+
+def _h666_row_from_payload(payload, prefer_first: bool, corpus: str) -> list[dict]:
+    receipt = str(getattr(payload, "receipt_id", "") or "")
+    rows: list[dict] = []
+    if not receipt:
+        return rows
+    for item in getattr(payload, "results", None) or ():
+        result_id = getattr(item, "result_id", None)
+        note = getattr(item, "note", None) or ""
+        if not isinstance(result_id, str) or not result_id:
+            continue
+        if not isinstance(note, str) or len(note.strip()) < 12:
+            continue
+        rows.append(
+            {
+                "receipt_id": receipt,
+                "result_id": result_id,
+                "note": note,
+                "title": str(getattr(item, "title", "") or "")[:180],
+                "url": str(getattr(item, "url", "") or "")[:400],
+                "corpus": corpus,
+            }
+        )
+        if prefer_first:
+            break
+    return rows
+
+
+def _h666_cite_key(ref) -> tuple:
+    slices = []
+    for slc in getattr(ref, "slices", None) or ():
+        slices.append((int(getattr(slc, "start", 0) or 0), int(getattr(slc, "end", 0) or 0)))
+    return (
+        str(getattr(ref, "receipt_id", "") or ""),
+        str(getattr(ref, "result_id", "") or ""),
+        tuple(slices),
+    )
+
+
+def _h666_copy_citations(response) -> list:
+    out: list = []
+    seen = set()
+    for ref in getattr(response, "citations", None) or ():
+        key = _h666_cite_key(ref)[:2]
+        if not key[0] or not key[1] or key in seen:
+            continue
+        seen.add(key)
+        out.append(ref)
+        if len(out) >= _H666_MAX_CITES:
+            break
+    return out
+
+
+def _h666_row_ref(row: dict):
+    note = row.get("note") or ""
+    end = min(len(note), 1800)
+    if end < 12 or not row.get("receipt_id") or not row.get("result_id"):
+        return None
+    try:
+        return _h666_CitationRef(
+            receipt_id=row["receipt_id"],
+            result_id=row["result_id"],
+            slices=[_h666_CitationSlice(start=0, end=end)],
+        )
+    except Exception:
+        return None
+
+
+def _h666_merge_row(citations: list, row: dict) -> int | None:
+    ref = _h666_row_ref(row)
+    if ref is None:
+        return None
+    key = _h666_cite_key(ref)[:2]
+    for idx, existing in enumerate(citations, start=1):
+        if _h666_cite_key(existing)[:2] == key:
+            return idx
+    if len(citations) >= _H666_MAX_CITES:
+        return None
+    citations.append(ref)
+    return len(citations)
+
+
+def _h666_board_text(rows: list[dict], citations: list) -> str:
+    lines: list[str] = []
+    for row in rows:
+        pos = _h666_merge_row(citations, row)
+        marker = f"[[{pos}]]" if pos else ""
+        snippet = " ".join((row.get("note") or "").split())[:700]
+        lines.append(
+            f"{row.get('corpus') or 'source'} {marker} {row.get('title') or ''} "
+            f"{row.get('url') or ''}\n{snippet}"
+        )
+    return "\n\n".join(lines)[:9000]
+
+
+def _h666_normalize_pointers(text: str | None, n_cites: int) -> str | None:
+    if not isinstance(text, str):
+        return text
+
+    def _one(match):
+        n = int(match.group(1))
+        if 1 <= n <= n_cites:
+            return f"[[{n}]]"
+        return match.group(0)
+
+    return _H666_SINGLE_RE.sub(_one, text)
+
+
+def _h666_rebuild(response, text, output, note, citations: list):
+    cite = citations[:_H666_MAX_CITES] or None
+    cleaned_note = note.strip()[:_H666_NOTE_CAP] if isinstance(note, str) and note.strip() else None
+    n = len(cite or [])
+    if text is not None:
+        clipped = (text or "").strip()[:_H666_ANSWER_CAP]
+        if not clipped:
+            return response
+        clipped = _h666_normalize_pointers(clipped, n) or clipped
+        if cleaned_note:
+            cleaned_note = _h666_normalize_pointers(cleaned_note, n)
+        try:
+            if cleaned_note and cite:
+                return _h666_Response(text=clipped, note=cleaned_note, citations=cite)
+            if cleaned_note:
+                return _h666_Response(text=clipped, note=cleaned_note)
+            if cite:
+                return _h666_Response(text=clipped, citations=cite)
+            return _h666_Response(text=clipped)
+        except Exception:
+            try:
+                if cite:
+                    return _h666_Response(text=clipped, citations=cite)
+                return _h666_Response(text=clipped)
+            except Exception:
+                return response
+    if cleaned_note:
+        cleaned_note = _h666_normalize_pointers(cleaned_note, n)
+    try:
+        if cleaned_note and cite:
+            return _h666_Response(output=output, note=cleaned_note, citations=cite)
+        if cleaned_note:
+            return _h666_Response(output=output, note=cleaned_note)
+        if cite:
+            return _h666_Response(output=output, citations=cite)
+        return response
+    except Exception:
+        try:
+            if cite:
+                return _h666_Response(output=output, citations=cite)
+        except Exception:
+            return response
+        return response
+
+
+def _h666_draft_blob(response) -> str:
+    text = getattr(response, "text", None)
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    output = getattr(response, "output", None)
+    if output is None:
+        return ""
+    try:
+        return _h666_json.dumps(output, ensure_ascii=False)[:6500]
+    except Exception:
+        return str(output)[:6500]
+
+
+def _h666_pointer_only(response):
+    text = getattr(response, "text", None)
+    note = getattr(response, "note", None)
+    output = getattr(response, "output", None)
+    citations = _h666_copy_citations(response)
+    n = len(citations)
+    new_text = _h666_normalize_pointers(text, n) if isinstance(text, str) else None
+    new_note = _h666_normalize_pointers(note, n) if isinstance(note, str) else None
+    if new_text == text and new_note == note:
+        return response
+    if new_text is not None:
+        return _h666_rebuild(response, new_text, None, new_note, citations)
+    if output is not None:
+        return _h666_rebuild(response, None, output, new_note, citations)
+    return response
+
+
+async def _h666_audit_ledger(question: str, blob: str, schema) -> _H666Ledger:
+    system = (
+        "You audit a research draft against the user question. Return JSON only "
+        "with keys missing_elements (string array), unsupported_claims (string "
+        "array), comparison_gap (boolean), pool_incomplete (boolean), "
+        "source_conflict (boolean), false_premise (boolean), "
+        "period_basis_mismatch (boolean), targeted_queries (string array), "
+        "note_hint (string or null). "
+        "missing_elements: query-required facts the draft does not answer. "
+        "unsupported_claims: time-sensitive or load-bearing facts stated without "
+        "traceable support. "
+        "comparison_gap: true when the question compares entities, sources, or "
+        "periods and the draft lacks a required side or an explicit reconciled "
+        "conclusion. "
+        "pool_incomplete: true when the question needs a complete in-scope set "
+        "and the draft does not enumerate members plus decisive exclusions. "
+        "source_conflict: true when official/primary and independent evidence "
+        "could disagree and the draft does not name each scope. "
+        "false_premise: true when a named event, document, status, or entity in "
+        "the question may be stale or false and the draft does not verify it. "
+        "period_basis_mismatch: true when compared figures may use different "
+        "periods, bases, jurisdictions, or vintages. "
+        "targeted_queries: 2-4 short web queries that would retrieve official/"
+        "primary and independent contemporaneous sources for those open claims. "
+        "note_hint: one sentence the public note could use to explain why the "
+        "answer follows from evidence, or null. "
+        "Treat comparison, synthesis, set, and current-status questions as open "
+        "unless the draft already covers every required side/member and the "
+        "reconciled conclusion. Do not invent facts."
+    )
+    user = (
+        f"Question:\n{question[:3000]}\n\n"
+        f"Public schema:\n"
+        f"{_h666_json.dumps(schema, ensure_ascii=False)[:1800] if schema is not None else 'null'}\n\n"
+        f"Draft:\n{blob[:6500]}"
+    )
+    parsed = _h666_parse_json(await _h666_chat(system, user, max_tokens=900, timeout=_H666_CHAT_TIMEOUT_S))
+    return _H666Ledger(parsed)
+
+
+def _h666_default_queries(question: str, ledger: _H666Ledger) -> list[str]:
+    if ledger.targeted_queries:
+        return ledger.targeted_queries[:4]
+    q = " ".join((question or "").split())[:180]
+    claims = " ".join(ledger.open_claims())[:120]
+    return [
+        f"{q} official primary source {claims}".strip(),
+        f"{q} independent contemporaneous report {claims}".strip(),
+    ]
+
+
+async def _h666_retrieve_for_ledger(question: str, ledger: _H666Ledger) -> list[dict]:
+    """Re-enter retrieval using the ledger's open research claims."""
+
+    queries = _h666_default_queries(question, ledger)
+    rows: list[dict] = []
+    payloads = await _h666_asyncio.gather(*[_h666_search(q) for q in queries[:4]])
+    labels = (
+        "official_primary",
+        "independent_contemporaneous",
+        "supporting_official",
+        "supporting_independent",
+    )
+    fetch_url = ""
+    for payload, corpus in zip(payloads, labels):
+        if not payload:
+            continue
+        got = _h666_row_from_payload(payload, False, corpus)
+        if not fetch_url and got:
+            fetch_url = got[0].get("url") or ""
+        rows.extend(got[:2])
+    if fetch_url:
+        fetched = await _h666_fetch(fetch_url)
+        fetched_rows = (
+            _h666_row_from_payload(fetched, False, "official_primary_document") if fetched else []
+        )
+        if fetched_rows:
+            rows = fetched_rows[:1] + rows
+    seen = set()
+    uniq: list[dict] = []
+    for row in rows:
+        key = (row.get("receipt_id"), row.get("result_id"))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(row)
+        if len(uniq) >= 6:
+            break
+    return uniq
+
+
+async def _h666_regenerate(question: str, schema, response, ledger: _H666Ledger, rows: list[dict], citations: list):
+    is_text = isinstance(getattr(response, "text", None), str) and bool(
+        (getattr(response, "text", None) or "").strip()
+    )
+    board_text = _h666_board_text(rows, citations)
+    if not board_text:
+        return None
+    if is_text:
+        system = (
+            "Rewrite the research answer after a ledger-triggered second retrieval "
+            "over official/primary and independent/contemporaneous sources. Return "
+            "JSON only with keys text (string), note (string or null). "
+            "Sentence one is the answer. Cover every query-required element the "
+            "board supports. For comparison or synthesis questions, state each "
+            "side, matching period/basis/jurisdiction, and an explicit reconciled "
+            "conclusion. If official and independent sources disagree, name each "
+            "scope and the residual difference. For set/pool questions, keep every "
+            "verified qualifier and cite the failing condition for exclusions. If "
+            "a named premise is false or stale, correct it from the board before "
+            "answering. Grounding beats completeness; do not invent facts. Every "
+            "material researched claim needs a [[n]] pointer to the numbered "
+            "board/citation array. Ordinary [n] is not a citation. Prefer primary "
+            "sources. Obey any explicit requested form (terse, XML, ordered list). "
+            "note is optional public supplementary scope/caveat with the same [[n]] "
+            "mapping; omit it when it would only repeat the answer."
+        )
+    else:
+        system = (
+            "Rewrite the structured research answer after a ledger-triggered "
+            "second retrieval over official/primary and independent/"
+            "contemporaneous sources. Return JSON only with keys output (JSON "
+            "value matching the public schema), note (string). Follow the public "
+            "schema exactly. Do not put citation syntax in atomic fields "
+            "(numbers, dates, ids, booleans). Put the why-this-is-warranted "
+            "explanation in note with [[n]] pointers to the numbered citation "
+            "array. Cover every required field the board supports. Align period/"
+            "basis on comparisons. If a named premise is false, correct it in the "
+            "fields the schema allows and explain in note. Grounding beats "
+            "completeness. Do not invent facts."
+        )
+    user = (
+        f"Question:\n{question[:3000]}\n\n"
+        f"Public schema:\n{_h666_json.dumps(schema, ensure_ascii=False)[:1800] if schema is not None else 'null'}\n\n"
+        f"Inherited draft:\n{_h666_draft_blob(response)[:5000]}\n\n"
+        f"Open research claims from the ledger:\n" + "\n".join(ledger.open_claims()) + "\n\n"
+        f"Fresh dual-corpus board ([[n]] is 1-based on the merged citation array):\n{board_text}"
+    )
+    parsed = _h666_parse_json(await _h666_chat(system, user, max_tokens=1800, timeout=14.0))
+    if not parsed:
+        return None
+    note = parsed.get("note")
+    note_text = " ".join(note.split()).strip() if isinstance(note, str) else None
+    if ledger.note_hint and not note_text:
+        note_text = ledger.note_hint
+    if is_text:
+        text = parsed.get("text")
+        if not isinstance(text, str) or len(text.strip()) < 8:
+            return None
+        return _h666_rebuild(response, text.strip(), None, note_text, citations)
+    output = parsed.get("output")
+    if output is None:
+        return None
+    if not note_text and ledger.note_hint:
+        note_text = ledger.note_hint
+    return _h666_rebuild(response, None, output, note_text, citations)
+
+
+@entrypoint("query")
+async def query(query: Query) -> Response:
+    started = _h666_monotonic()
+    try:
+        draft = await _h666_base_query(query)
+    except Exception:
+        draft = _h666_Response(
+            text="No verifiable source-backed answer was reached for this question."
+        )
+    question = str(getattr(query, "text", "") or "")
+    schema = getattr(query, "output_schema", None)
+    try:
+        # Fallback-only timeout recovery. The research-role decision is the
+        # ledger check below, which reads open query-required claims.
+        if _h666_monotonic() - started >= _H666_SKIP_AFTER_S:
+            return _h666_pointer_only(draft)
+        citations = _h666_copy_citations(draft)
+        blob = _h666_draft_blob(draft)
+        ledger = await _h666_audit_ledger(question, blob, schema)
+        if ledger.requires_fresh_retrieval_and_rewrite():
+            rows = await _h666_retrieve_for_ledger(question, ledger)
+            if rows:
+                rewritten = await _h666_regenerate(
+                    question, schema, draft, ledger, rows, citations
+                )
+                if rewritten is not None:
+                    return rewritten
+        return _h666_pointer_only(draft)
+    except Exception:
+        return draft
+# --- h666 claim-conflict ledger (end) ---

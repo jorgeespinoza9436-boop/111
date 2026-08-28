@@ -9520,4 +9520,400 @@ async def _h666_search(query_text: str):
         return None
     for provider in _H666_SEARCH_PROVIDERS:
         try:
-  
+            payload = await _h666_search_web(
+                q,
+                provider=provider,
+                num=5,
+                timeout=_H666_SEARCH_TIMEOUT_S,
+            )
+            if payload is not None and getattr(payload, "results", None):
+                return payload
+        except Exception:
+            continue
+    return None
+
+
+async def _h666_fetch(url: str, provider: str = "parallel"):
+    if not url or not isinstance(url, str):
+        return None
+    try:
+        return await _h666_fetch_page(
+            url,
+            provider=provider,
+            timeout=_H666_FETCH_TIMEOUT_S,
+        )
+    except Exception:
+        return None
+
+
+def _h666_row_from_payload(payload, prefer_first: bool, corpus: str) -> list[dict]:
+    receipt = str(getattr(payload, "receipt_id", "") or "")
+    rows: list[dict] = []
+    if not receipt:
+        return rows
+    for item in getattr(payload, "results", None) or ():
+        result_id = getattr(item, "result_id", None)
+        note = getattr(item, "note", None) or ""
+        if not isinstance(result_id, str) or not result_id:
+            continue
+        if not isinstance(note, str) or len(note.strip()) < 12:
+            continue
+        rows.append(
+            {
+                "receipt_id": receipt,
+                "result_id": result_id,
+                "note": note,
+                "title": str(getattr(item, "title", "") or "")[:180],
+                "url": str(getattr(item, "url", "") or "")[:400],
+                "corpus": corpus,
+            }
+        )
+        if prefer_first:
+            break
+    return rows
+
+
+def _h666_cite_key(ref) -> tuple:
+    slices = []
+    for slc in getattr(ref, "slices", None) or ():
+        slices.append((int(getattr(slc, "start", 0) or 0), int(getattr(slc, "end", 0) or 0)))
+    return (
+        str(getattr(ref, "receipt_id", "") or ""),
+        str(getattr(ref, "result_id", "") or ""),
+        tuple(slices),
+    )
+
+
+def _h666_copy_citations(response) -> list:
+    out: list = []
+    seen = set()
+    for ref in getattr(response, "citations", None) or ():
+        key = _h666_cite_key(ref)[:2]
+        if not key[0] or not key[1] or key in seen:
+            continue
+        seen.add(key)
+        out.append(ref)
+        if len(out) >= _H666_MAX_CITES:
+            break
+    return out
+
+
+def _h666_row_ref(row: dict):
+    note = row.get("note") or ""
+    end = min(len(note), 1800)
+    if end < 12 or not row.get("receipt_id") or not row.get("result_id"):
+        return None
+    try:
+        return _h666_CitationRef(
+            receipt_id=row["receipt_id"],
+            result_id=row["result_id"],
+            slices=[_h666_CitationSlice(start=0, end=end)],
+        )
+    except Exception:
+        return None
+
+
+def _h666_merge_row(citations: list, row: dict) -> int | None:
+    ref = _h666_row_ref(row)
+    if ref is None:
+        return None
+    key = _h666_cite_key(ref)[:2]
+    for idx, existing in enumerate(citations, start=1):
+        if _h666_cite_key(existing)[:2] == key:
+            return idx
+    if len(citations) >= _H666_MAX_CITES:
+        return None
+    citations.append(ref)
+    return len(citations)
+
+
+def _h666_board_text(rows: list[dict], citations: list) -> str:
+    lines: list[str] = []
+    for row in rows:
+        pos = _h666_merge_row(citations, row)
+        marker = f"[[{pos}]]" if pos else ""
+        snippet = " ".join((row.get("note") or "").split())[:700]
+        lines.append(
+            f"{row.get('corpus') or 'source'} {marker} {row.get('title') or ''} "
+            f"{row.get('url') or ''}\n{snippet}"
+        )
+    return "\n\n".join(lines)[:9000]
+
+
+def _h666_normalize_pointers(text: str | None, n_cites: int) -> str | None:
+    if not isinstance(text, str):
+        return text
+
+    def _one(match):
+        n = int(match.group(1))
+        if 1 <= n <= n_cites:
+            return f"[[{n}]]"
+        return match.group(0)
+
+    return _H666_SINGLE_RE.sub(_one, text)
+
+
+def _h666_rebuild(response, text, output, note, citations: list):
+    cite = citations[:_H666_MAX_CITES] or None
+    cleaned_note = note.strip()[:_H666_NOTE_CAP] if isinstance(note, str) and note.strip() else None
+    n = len(cite or [])
+    if text is not None:
+        clipped = (text or "").strip()[:_H666_ANSWER_CAP]
+        if not clipped:
+            return response
+        clipped = _h666_normalize_pointers(clipped, n) or clipped
+        if cleaned_note:
+            cleaned_note = _h666_normalize_pointers(cleaned_note, n)
+        try:
+            if cleaned_note and cite:
+                return _h666_Response(text=clipped, note=cleaned_note, citations=cite)
+            if cleaned_note:
+                return _h666_Response(text=clipped, note=cleaned_note)
+            if cite:
+                return _h666_Response(text=clipped, citations=cite)
+            return _h666_Response(text=clipped)
+        except Exception:
+            try:
+                if cite:
+                    return _h666_Response(text=clipped, citations=cite)
+                return _h666_Response(text=clipped)
+            except Exception:
+                return response
+    if cleaned_note:
+        cleaned_note = _h666_normalize_pointers(cleaned_note, n)
+    try:
+        if cleaned_note and cite:
+            return _h666_Response(output=output, note=cleaned_note, citations=cite)
+        if cleaned_note:
+            return _h666_Response(output=output, note=cleaned_note)
+        if cite:
+            return _h666_Response(output=output, citations=cite)
+        return response
+    except Exception:
+        try:
+            if cite:
+                return _h666_Response(output=output, citations=cite)
+        except Exception:
+            return response
+        return response
+
+
+def _h666_draft_blob(response) -> str:
+    text = getattr(response, "text", None)
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    output = getattr(response, "output", None)
+    if output is None:
+        return ""
+    try:
+        return _h666_json.dumps(output, ensure_ascii=False)[:6500]
+    except Exception:
+        return str(output)[:6500]
+
+
+def _h666_pointer_only(response):
+    text = getattr(response, "text", None)
+    note = getattr(response, "note", None)
+    output = getattr(response, "output", None)
+    citations = _h666_copy_citations(response)
+    n = len(citations)
+    new_text = _h666_normalize_pointers(text, n) if isinstance(text, str) else None
+    new_note = _h666_normalize_pointers(note, n) if isinstance(note, str) else None
+    if new_text == text and new_note == note:
+        return response
+    if new_text is not None:
+        return _h666_rebuild(response, new_text, None, new_note, citations)
+    if output is not None:
+        return _h666_rebuild(response, None, output, new_note, citations)
+    return response
+
+
+async def _h666_audit_ledger(question: str, blob: str, schema) -> _H666Ledger:
+    system = (
+        "You audit a research draft against the user question. Return JSON only "
+        "with keys missing_elements (string array), unsupported_claims (string "
+        "array), comparison_gap (boolean), pool_incomplete (boolean), "
+        "source_conflict (boolean), false_premise (boolean), "
+        "period_basis_mismatch (boolean), targeted_queries (string array), "
+        "note_hint (string or null). "
+        "missing_elements: query-required facts the draft does not answer. "
+        "unsupported_claims: time-sensitive or load-bearing facts stated without "
+        "traceable support. "
+        "comparison_gap: true when the question compares entities, sources, or "
+        "periods and the draft lacks a required side or an explicit reconciled "
+        "conclusion. "
+        "pool_incomplete: true when the question needs a complete in-scope set "
+        "and the draft does not enumerate members plus decisive exclusions. "
+        "source_conflict: true when official/primary and independent evidence "
+        "could disagree and the draft does not name each scope. "
+        "false_premise: true when a named event, document, status, or entity in "
+        "the question may be stale or false and the draft does not verify it. "
+        "period_basis_mismatch: true when compared figures may use different "
+        "periods, bases, jurisdictions, or vintages. "
+        "targeted_queries: 2-4 short web queries that would retrieve official/"
+        "primary and independent contemporaneous sources for those open claims. "
+        "note_hint: one sentence the public note could use to explain why the "
+        "answer follows from evidence, or null. "
+        "Treat comparison, synthesis, set, and current-status questions as open "
+        "unless the draft already covers every required side/member and the "
+        "reconciled conclusion. Do not invent facts."
+    )
+    user = (
+        f"Question:\n{question[:3000]}\n\n"
+        f"Public schema:\n"
+        f"{_h666_json.dumps(schema, ensure_ascii=False)[:1800] if schema is not None else 'null'}\n\n"
+        f"Draft:\n{blob[:6500]}"
+    )
+    parsed = _h666_parse_json(await _h666_chat(system, user, max_tokens=900, timeout=_H666_CHAT_TIMEOUT_S))
+    return _H666Ledger(parsed)
+
+
+def _h666_default_queries(question: str, ledger: _H666Ledger) -> list[str]:
+    if ledger.targeted_queries:
+        return ledger.targeted_queries[:4]
+    q = " ".join((question or "").split())[:180]
+    claims = " ".join(ledger.open_claims())[:120]
+    return [
+        f"{q} official primary source {claims}".strip(),
+        f"{q} independent contemporaneous report {claims}".strip(),
+    ]
+
+
+async def _h666_retrieve_for_ledger(question: str, ledger: _H666Ledger) -> list[dict]:
+    """Re-enter retrieval using the ledger's open research claims."""
+
+    queries = _h666_default_queries(question, ledger)
+    rows: list[dict] = []
+    payloads = await _h666_asyncio.gather(*[_h666_search(q) for q in queries[:4]])
+    labels = (
+        "official_primary",
+        "independent_contemporaneous",
+        "supporting_official",
+        "supporting_independent",
+    )
+    fetch_url = ""
+    for payload, corpus in zip(payloads, labels):
+        if not payload:
+            continue
+        got = _h666_row_from_payload(payload, False, corpus)
+        if not fetch_url and got:
+            fetch_url = got[0].get("url") or ""
+        rows.extend(got[:2])
+    if fetch_url:
+        fetched = await _h666_fetch(fetch_url)
+        fetched_rows = (
+            _h666_row_from_payload(fetched, False, "official_primary_document") if fetched else []
+        )
+        if fetched_rows:
+            rows = fetched_rows[:1] + rows
+    seen = set()
+    uniq: list[dict] = []
+    for row in rows:
+        key = (row.get("receipt_id"), row.get("result_id"))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(row)
+        if len(uniq) >= 6:
+            break
+    return uniq
+
+
+async def _h666_regenerate(question: str, schema, response, ledger: _H666Ledger, rows: list[dict], citations: list):
+    is_text = isinstance(getattr(response, "text", None), str) and bool(
+        (getattr(response, "text", None) or "").strip()
+    )
+    board_text = _h666_board_text(rows, citations)
+    if not board_text:
+        return None
+    if is_text:
+        system = (
+            "Rewrite the research answer after a ledger-triggered second retrieval "
+            "over official/primary and independent/contemporaneous sources. Return "
+            "JSON only with keys text (string), note (string or null). "
+            "Sentence one is the answer. Cover every query-required element the "
+            "board supports. For comparison or synthesis questions, state each "
+            "side, matching period/basis/jurisdiction, and an explicit reconciled "
+            "conclusion. If official and independent sources disagree, name each "
+            "scope and the residual difference. For set/pool questions, keep every "
+            "verified qualifier and cite the failing condition for exclusions. If "
+            "a named premise is false or stale, correct it from the board before "
+            "answering. Grounding beats completeness; do not invent facts. Every "
+            "material researched claim needs a [[n]] pointer to the numbered "
+            "board/citation array. Ordinary [n] is not a citation. Prefer primary "
+            "sources. Obey any explicit requested form (terse, XML, ordered list). "
+            "note is optional public supplementary scope/caveat with the same [[n]] "
+            "mapping; omit it when it would only repeat the answer."
+        )
+    else:
+        system = (
+            "Rewrite the structured research answer after a ledger-triggered "
+            "second retrieval over official/primary and independent/"
+            "contemporaneous sources. Return JSON only with keys output (JSON "
+            "value matching the public schema), note (string). Follow the public "
+            "schema exactly. Do not put citation syntax in atomic fields "
+            "(numbers, dates, ids, booleans). Put the why-this-is-warranted "
+            "explanation in note with [[n]] pointers to the numbered citation "
+            "array. Cover every required field the board supports. Align period/"
+            "basis on comparisons. If a named premise is false, correct it in the "
+            "fields the schema allows and explain in note. Grounding beats "
+            "completeness. Do not invent facts."
+        )
+    user = (
+        f"Question:\n{question[:3000]}\n\n"
+        f"Public schema:\n{_h666_json.dumps(schema, ensure_ascii=False)[:1800] if schema is not None else 'null'}\n\n"
+        f"Inherited draft:\n{_h666_draft_blob(response)[:5000]}\n\n"
+        f"Open research claims from the ledger:\n" + "\n".join(ledger.open_claims()) + "\n\n"
+        f"Fresh dual-corpus board ([[n]] is 1-based on the merged citation array):\n{board_text}"
+    )
+    parsed = _h666_parse_json(await _h666_chat(system, user, max_tokens=1800, timeout=14.0))
+    if not parsed:
+        return None
+    note = parsed.get("note")
+    note_text = " ".join(note.split()).strip() if isinstance(note, str) else None
+    if ledger.note_hint and not note_text:
+        note_text = ledger.note_hint
+    if is_text:
+        text = parsed.get("text")
+        if not isinstance(text, str) or len(text.strip()) < 8:
+            return None
+        return _h666_rebuild(response, text.strip(), None, note_text, citations)
+    output = parsed.get("output")
+    if output is None:
+        return None
+    if not note_text and ledger.note_hint:
+        note_text = ledger.note_hint
+    return _h666_rebuild(response, None, output, note_text, citations)
+
+
+@entrypoint("query")
+async def query(query: Query) -> Response:
+    started = _h666_monotonic()
+    try:
+        draft = await _h666_base_query(query)
+    except Exception:
+        draft = _h666_Response(
+            text="No verifiable source-backed answer was reached for this question."
+        )
+    question = str(getattr(query, "text", "") or "")
+    schema = getattr(query, "output_schema", None)
+    try:
+        # Fallback-only timeout recovery. The research-role decision is the
+        # ledger check below, which reads open query-required claims.
+        if _h666_monotonic() - started >= _H666_SKIP_AFTER_S:
+            return _h666_pointer_only(draft)
+        citations = _h666_copy_citations(draft)
+        blob = _h666_draft_blob(draft)
+        ledger = await _h666_audit_ledger(question, blob, schema)
+        if ledger.requires_fresh_retrieval_and_rewrite():
+            rows = await _h666_retrieve_for_ledger(question, ledger)
+            if rows:
+                rewritten = await _h666_regenerate(
+                    question, schema, draft, ledger, rows, citations
+                )
+                if rewritten is not None:
+                    return rewritten
+        return _h666_pointer_only(draft)
+    except Exception:
+        return draft
+# --- h666 claim-conflict ledger (end) ---
