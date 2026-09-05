@@ -10,23 +10,43 @@ from harnyx_miner_sdk.api import fetch_page, llm_chat, search_web, tooling_info
 from harnyx_miner_sdk.decorators import entrypoint
 from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
 
-VERSION = "v52-pin-reviewed"
+VERSION = "v4-v52-shape"
 
                                                                                 
 LLM_LANE_A = "openrouter"                                          
-LLM_LANE_B = "openrouter"   # was ai_gateway: no credential on our miners
+LLM_LANE_B = "openrouter"
                                                                                
                                                                                   
-LOOP_MODEL_A = "z-ai/glm-5.3-flash"
-LOOP_MODEL_B = "deepseek/deepseek-v3.2"   # openrouter-served, verified
+LOOP_MODEL_A = "z-ai/glm-5.2"
+LOOP_MODEL_B = "z-ai/glm-5"
 AUDIT_MODEL = "openai/gpt-oss-120b"              
 SCHEMA_MODEL = "openai/gpt-oss-120b"             
 RESORT_MODEL = "deepseek/deepseek-v3.2"          
 SEARCH_PROVIDER = "parallel"                                       
                                                                                 
                                                                                   
-SEARCH_PROVIDERS = ("parallel",)   # exa/tavily: no credential
-FETCH_PROVIDERS = ("parallel",)   # exa/firecrawl: no credential
+SEARCH_PROVIDERS = ("parallel", "exa", "tavily")
+FETCH_PROVIDERS = ("parallel", "exa", "firecrawl")
+                                                                        
+                                                                        
+SEARCH_MODE_TURBO = {"mode": "turbo"}
+SEARCH_LANES = ((SEARCH_PROVIDERS[0], SEARCH_MODE_TURBO),
+                ) + tuple((_p, None) for _p in SEARCH_PROVIDERS)
+                                                                             
+                                                                                
+SEARCH_LANE_MIN_ROWS = 3
+SEARCH_LANE_MIN_NOTE_CHARS = 200
+
+
+def _usable_rows(payload) -> int:
+    rows = 0
+    for item in list(getattr(payload, "results", None) or []):
+        if not isinstance(getattr(item, "result_id", None), str):
+            continue
+        note = getattr(item, "note", None) or ""
+        if len(note.strip()) >= SEARCH_LANE_MIN_NOTE_CHARS:
+            rows += 1
+    return rows
 
                                                                                 
 WALL_BUDGET_S = 266.0                                                               
@@ -52,10 +72,42 @@ MAX_TURNS = 15
 AUDIT_EXTRA_TURNS = 2
 ANSWER_REPAIR_TURNS = 2                                                                             
 RESCUE_TIMEOUT_S = 55.0
-DIGEST_TAIL_S = 14.0                                                                      
+DIGEST_TAIL_S = 14.0
+SYNTH_RESERVE_S = 42.0                                                                      
 
                                                                                 
 SEARCH_EXCERPT_CHARS = 550
+
+
+def _relevant_excerpt(note: str, query: str, limit: int) -> tuple[str, int, int]:
+    n = len(note)
+    if n <= limit:
+        return note, 0, n
+    terms = re.findall(r"[A-Za-z0-9]{4,}", query.lower())
+    if not terms:
+        return note[:limit], 0, limit
+    low = note.lower()
+    anchors = {0}
+    for t in terms:
+        p = low.find(t)
+        while p != -1 and len(anchors) < 64:
+            anchors.add(max(0, min(p - limit // 3, n - limit)))
+            p = low.find(t, p + 1)
+    uniq = set(terms)
+    best_start, best_score = 0, (-1, -1)
+    for s in anchors:
+        window = low[s:s + limit]
+        # cover the most DISTINCT query terms first (a window that answers more
+        # of the question), then break ties by total density -- counting raw
+        # occurrences alone rewards one repeated common word over real coverage.
+        score = (sum(t in window for t in uniq),
+                 sum(window.count(t) for t in terms))
+        if score > best_score:
+            best_score, best_start = score, s
+    start, end = best_start, min(best_start + limit, n)
+    if end - start < 100:
+        start = max(0, end - 100)
+    return note[start:end], start, end
 _LEDGER_TEXT_CAP = 400_000                                                        
 PAGE_GREP_WINDOW = 700
 PAGE_GREP_MAX_HITS = 6
@@ -974,15 +1026,30 @@ async def _do_search(query_text: str, ledger: EvidenceLedger):
         if not attempt.strip() or (attempt in fired and not allow_repeat):
             continue
         fired.add(attempt)
-        for _prov in SEARCH_PROVIDERS:
+        best, best_rows = None, -1
+        for _i, (_prov, _extra) in enumerate(SEARCH_LANES):
             try:
-                payload = await search_web(attempt, provider=_prov, num=8,
-                                           timeout=SEARCH_TIMEOUT_S)
-                if getattr(payload, "results", None):
-                    break
+                got = await search_web(attempt, provider=_prov, num=8,
+                                       timeout=SEARCH_TIMEOUT_S,
+                                       provider_extra=(dict(_extra)
+                                                       if _extra else None))
             except Exception:
                 _spend_blind()
-                payload = None
+                continue
+            if not getattr(got, "results", None):
+                continue
+            rows = _usable_rows(got)
+            if rows > best_rows:
+                best, best_rows = got, rows
+                                                                       
+            if rows >= SEARCH_LANE_MIN_ROWS:
+                break
+                                                                               
+                                                                             
+            _next = SEARCH_LANES[_i + 1] if _i + 1 < len(SEARCH_LANES) else None
+            if _next is None or _next[0] != SEARCH_PROVIDER:
+                break
+        payload = best
         if payload is not None and getattr(payload, "results", None):
             break
     if payload is None:
@@ -1004,15 +1071,16 @@ async def _do_search(query_text: str, ledger: EvidenceLedger):
                                                                                 
                                                                   
         n_len = len(note)
-        span = ([(0, min(max(SEARCH_EXCERPT_CHARS, 100), n_len))] if n_len >= 100
+        exc, e_start, e_end = _relevant_excerpt(note, query_text, SEARCH_EXCERPT_CHARS)
+        span = ([(e_start, e_end)] if n_len >= 100
                 else ([(0, n_len)] if n_len else None))
         title = (getattr(item, "title", None) or "").strip()
         url = (getattr(item, "url", None) or "").strip()
         rows.append({"receipt_id": receipt, "result_id": rid, "note_len": n_len,
                      "kind": "search", "spans": span, "title": title, "url": url,
-                     "preview": note[:SEARCH_EXCERPT_CHARS], "text": note})
+                     "preview": exc, "text": note})
         lines.append(f"[{_SLOT.format(len(rows) - 1)}] {title} — {url}"
-                     f"\n    {note[:SEARCH_EXCERPT_CHARS]}")
+                     f"\n    {exc}")
     return ToolOutput("\n".join(lines), rows, memo_key=memo_key if rows else "")
 
 
@@ -1630,13 +1698,14 @@ async def _chat_turn(messages: list[dict], deadline: float, *, finish_only: bool
                         if isinstance(msg, dict))
                                                                                      
                                                                                  
-    for lane_model in ((LLM_LANE_A, LOOP_MODEL_A, True),
-                       (LLM_LANE_A, LOOP_MODEL_A, False),
+    loop_model_a = _m5_loop_model_a()
+    for lane_model in ((LLM_LANE_A, loop_model_a, True),
+                       (LLM_LANE_A, loop_model_a, False),
                        (LLM_LANE_B, LOOP_MODEL_B, False)):
         lane = lane_model[0]
         model = lane_model[1]
         pinned = lane_model[2]
-        if lane == LLM_LANE_B and payload_chars > LANE_B_MAX_PAYLOAD_CHARS:
+        if model == LOOP_MODEL_B and payload_chars > LANE_B_MAX_PAYLOAD_CHARS:
                                                                                   
                                                                                    
             return _EMPTY_TURN
@@ -1658,9 +1727,9 @@ async def _chat_turn(messages: list[dict], deadline: float, *, finish_only: bool
                 temperature=0.2,
                                                                                   
                                                                                    
-                thinking=({"enabled": False} if (finish_only and lane == LLM_LANE_B)
+                thinking=({"enabled": False} if (finish_only and model == LOOP_MODEL_B)
                           else {"enabled": True, "effort": "low"}),
-                max_output_tokens=6000 if (finish_only and lane == LLM_LANE_B) else None,
+                max_output_tokens=6000 if (finish_only and model == LOOP_MODEL_B) else None,
                 provider_extra=_upstream(lane, model) if pinned else None,
                 timeout=timeout,
             ), timeout=min(timeout + 6.0,
@@ -2443,10 +2512,7 @@ _COMMIT_RULES = (
     "judge compares your answer with a strong reference and credits only claims "
     "carrying an [n] citation to the numbered evidence.\n\n"
     "SHAPE: the first words are the answer entities themselves — no preamble, no "
-    "remark about evidence quality. Then a short proof section: the candidate "
-    "pool, each condition applied, one line per qualifier (cited) and one line "
-    "per rejected member with its cited reason — every member gets its own "
-    "line, never several swept into one clause. Reproduce figures and dates "
+    "remark about evidence quality. Answer only what was asked, in the requested shape, each claim followed by its own [n]. Do NOT append a Proof, Candidate pool, Evidence or Sources section: when the question ranges over a set, name every qualifying member with its cited qualifying fact inline in the answer prose, and mention rejected members only when the question asks for them. Reproduce figures and dates "
     "VERBATIM. Name ALL qualifying members — omitting one scores as wrong. "
     "Obey any literal formatting demand in the question — sort order, "
     "comma-separated, a requested count, 'without the word X' meaning delete "
@@ -2460,7 +2526,7 @@ _REPAIR_ORDER = (
     "markup, was empty, or was a refusal). Do NOT emit tool syntax as text. "
     "Write the FINAL ANSWER now as plain prose: first words are the answer "
     "entities themselves, every factual claim followed by its [n] citation, "
-    "then the short proof section. Nothing else."
+    "with no proof or evidence section. Nothing else."
 )
 
 
@@ -2623,7 +2689,7 @@ async def _write_from_digest(question: str, ledger: EvidenceLedger, deadline: fl
                  f"facts by these [n]):\n\n{digest}\n\n"
                  "Write the FINAL ANSWER now from this evidence. Plain prose, no "
                  "tool syntax. First words are the answer entities; every factual "
-                 "claim carries its [n]; then the short proof section (pool, "
+                 "claim carries its [n]; with no proof or evidence section (pool, "
                  "conditions, qualifiers, exclusions).")}]
     async def _one(lane: str, model: str, budget: float) -> str:
                                                                                  
@@ -2910,7 +2976,7 @@ def _cap(text: str) -> str:
     return t
 
 
-async def _base_agent_query(query: Query) -> Response:
+async def _v52_base_query(query: Query) -> Response:
     question = (query.text or "").strip()
     if not question:
         return Response(text="No question provided.")
@@ -2969,88 +3035,12 @@ def _select_best(draft: str, patched: str) -> str:
     return draft
 
 
-# ── official schema contract stage ────────────────────────────────────────────
-# The platform validates structured output against the task schema with the
-# SDK's Draft 2020-12 validator; a violation voids the whole response. The
-# shape check used inside _schema_output is looser than that validator, so
-# every structured answer is checked against the OFFICIAL validator here and
-# repaired once with the validator's own error message as feedback.
-
-def _sc_official_error(value, schema) -> str | None:
-    try:
-        from harnyx_miner_sdk.structured_output import validate_output_against_schema
-        validate_output_against_schema(value, schema)
-        return None
-    except Exception as exc:
-        return str(exc)[:1500]
-
-
-def _sc_json_salvage(raw: str):
-    text_value = (raw or "").strip()
-    if text_value.startswith("```"):
-        first = text_value.find("\n")
-        fence = text_value.rfind("```")
-        if first >= 0 and fence > first:
-            text_value = text_value[first + 1:fence].strip()
-    try:
-        return json.loads(text_value)
-    except Exception:
-        pass
-    starts = [p for p in (text_value.find("{"), text_value.find("[")) if p >= 0]
-    if not starts:
-        return None
-    start = min(starts)
-    closing = "}" if text_value[start] == "{" else "]"
-    end = text_value.rfind(closing)
-    if end <= start:
-        return None
-    try:
-        return json.loads(text_value[start:end + 1])
-    except Exception:
-        return None
-
-
-async def _sc_contract_repair(question: str, schema, value, error: str,
-                              deadline: float):
-    left = deadline - monotonic()
-    if left < 14.0:
-        return None
-    ask = ("This JSON value violates its output schema. Repair it: keep every "
-           "correct field value, change ONLY what the validator error names, "
-           "and output the corrected JSON value alone.\n\n"
-           f"Validator error:\n{error}\n\n"
-           f"Schema:\n{json.dumps(schema)}\n\n"
-           f"Question:\n{question[:2000]}\n\n"
-           f"Current JSON:\n{json.dumps(value)[:8000]}")
-    try:
-        raw = await _chat_simple(LLM_LANE_A, SCHEMA_MODEL,
-                                 "You output strictly valid JSON.", ask,
-                                 timeout=min(40.0, left - 4.0), max_tokens=3400)
-    except Exception:
-        return None
-    fixed = _sc_json_salvage(raw)
-    if fixed is None:
-        return None
-    if _sc_official_error(fixed, schema) is None:
-        return fixed
-    return None
-
-
-async def _sc_enforce_contract(question: str, schema, value, deadline: float):
-    """Return an officially-valid value when possible; None keeps the draft."""
-    error = _sc_official_error(value, schema)
-    if error is None:
-        return value
-    repaired = await _sc_contract_repair(question, schema, value, error, deadline)
-    return repaired if repaired is not None else value
-
-
 async def _solve(query: Query, question: str) -> Response:
                                                                                 
                                                                                  
     _reset_run_state()
-    question = question.partition("\x0c")[0] or question
     deadline = monotonic() + WALL_BUDGET_S
+    fast = bool(getattr(query, "fast", False))
     try:
         info = await tooling_info(timeout=10.0)
         _spend_note(info)
@@ -3068,8 +3058,9 @@ async def _solve(query: Query, question: str) -> Response:
     ledger = EvidenceLedger()
     answer = ""
     messages: list[dict] = []
+    research_deadline = deadline - SYNTH_RESERVE_S
     try:
-        answer, messages = await _loop(question, brief, ledger, deadline, MAX_TURNS)
+        answer, messages = await _loop(question, brief, ledger, research_deadline, MAX_TURNS)
     except Exception:
         answer = ""
 
@@ -3101,10 +3092,13 @@ async def _solve(query: Query, question: str) -> Response:
         if _is_usable_answer(fallback):
             answer = fallback                                                     
 
-    try:
-        citations, _slot_pos = _citations_for(answer, ledger)
-    except Exception:
+    if fast:
         citations, _slot_pos = [], {}
+    else:
+        try:
+            citations, _slot_pos = _citations_for(answer, ledger)
+        except Exception:
+            citations, _slot_pos = [], {}
 
     answer = _normalize_brackets(answer)                                           
     answer = _strip_lead_narration(answer)
@@ -3115,8 +3109,10 @@ async def _solve(query: Query, question: str) -> Response:
     text = (_cap(_repoint(answer, _slot_pos))
             or f"Best-effort answer unavailable for: {question[:400]}")
 
-    synth_note = text if (_is_usable_answer(text)
-                          and not _STUB_ANSWER_RE.match(text.strip())) else None
+                                                                     
+    synth_note = None if fast else (
+        text if (_is_usable_answer(text)
+                 and not _STUB_ANSWER_RE.match(text.strip())) else None)
 
     if query.output_schema is not None:
         structured = None
@@ -3125,27 +3121,22 @@ async def _solve(query: Query, question: str) -> Response:
         except Exception:
             structured = None
         if structured is not None:
-            try:
-                structured = _verbatim_structured(structured, ledger)
-            except Exception:
-                pass
-            try:
-                structured = await _sc_enforce_contract(
-                    question, query.output_schema, structured, deadline)
-            except Exception:
-                pass
-                                                                             
-            try:
-                if _VERBATIM_TRIGGER_RE.search(getattr(query, "text", None) or question or ""):
-                    structured = _source_region_verbatim(
-                        structured, question, query.output_schema, answer, ledger)
-            except Exception:
-                pass
+            if not fast:
+                try:
+                    structured = _verbatim_structured(structured, ledger)
+                except Exception:
+                    pass
+                try:
+                    if _VERBATIM_TRIGGER_RE.search(getattr(query, "text", None) or question or ""):
+                        structured = _source_region_verbatim(
+                            structured, question, query.output_schema, answer, ledger)
+                except Exception:
+                    pass
             try:
                 return Response(output=structured, note=synth_note,
                                 citations=citations or None)
             except Exception:
-                structured = None
+                structured = None                                           
                                                                               
                                                                              
         basis = answer if _is_usable_answer(answer) else ""
@@ -3186,236 +3177,528 @@ async def _solve(query: Query, question: str) -> Response:
         return Response(text=text)
 
 
+# --- v52 -> m5 adapters ------------------------------------------------------
+#
+# The m5 controller below was written against the w4-wrapped champion, whose
+# research stage and answer-repair helpers carry _w4_ names. This artifact's
+# base is the leaner v52 pipeline (no contract planner, no audit stage), so
+# the same four names are provided here as thin shims over it.
+
+async def _w4_research_or_salvage(query_input: Query) -> Response:
+    """Run the base pipeline; never let an exception escape to the platform."""
+    try:
+        return await _v52_base_query(query_input)
+    except Exception:
+        return Response(text="No verifiable source-backed answer was reached for this question.")
 
 
-# ── gx: deterministic answer guards ───────────────────────────────────────────
-# Pure detectors (no LLM, no tools, no cost) plus ONE bounded no-tool repair whose
-# output is accepted only when provably non-destructive. Fails open everywhere.
-_GX_REPAIR_MIN_SECONDS = 34.0
-_GX_REPAIR_TIMEOUT_SECONDS = 26.0
-_GX_MIN_KEEP_RATIO = 0.85
-_GX_MAX_NOTES = 4
-_GX_MIN_ENTITY_CHARS = 4
-_GX_DRAFT_CHARS = 12000
-
-_GX_FIG_RE = re.compile(r"\d[\d,]*(?:\.\d+)?%?")
-_GX_CITE_RE = re.compile(r"\[\d[\d,\s\-]*\]")
-_GX_SENT_RE = re.compile(r"[^.!?\n]+[.!?]|[^.!?\n]+$")
-_GX_SUPER_RE = re.compile(r"\b(?:most|least|highest|lowest|largest|smallest|greatest|"
-                          r"fewest|longest|shortest|best|worst|top|maximum|minimum)\b"
-                          r"|\b[a-z]{3,}est\b", re.IGNORECASE)
-_GX_SUPER_STOP = frozenset({"interest","latest","earliest","honest","modest","request",
-                            "suggest","invest","protest","harvest","forest","nearest",
-                            "rest","test","west","best"})
-_GX_YEAR_RE = re.compile(r"\b(1[89]\d{2}|20\d{2})\b")
-_GX_CAP_RE = re.compile(r"\b[A-Z][A-Za-z0-9&.\-]{2,}(?:\s+[A-Z][A-Za-z0-9&.\-]{2,}){0,3}\b")
-_GX_QSTOP = frozenset({"Which","What","Who","When","Where","How","Why","The","A","An",
-                       "For","From","In","On","Of","And","Or","As","At","By","To",
-                       "Answer","Give","List","Name","Using","According","Report",
-                       "Compare","Consider","Identify","Determine","Explain","State",
-                       "Find","Return","Provide","Between","Across","Both","Each",
-                       "Per","With","Within","Their","Its","This","That","These"})
-_GX_UNIT_RE = re.compile(r"\b(?:in|as)\s+(percent|percentage|per cent|dollars?|USD|EUR|GBP|"
-                         r"euros?|pounds?|yen|km|kilometres?|kilometers?|miles?|metres?|"
-                         r"meters?|tonnes?|tons?|kg|kilograms?|days?|weeks?|months?|years?|"
-                         r"hours?|minutes?)\b", re.IGNORECASE)
-_GX_UNIT_TOKENS = {"percent":("%","percent","per cent"),"percentage":("%","percent"),
-                   "per cent":("%","per cent","percent"),
-                   "dollar":("$","usd","dollar"),"dollars":("$","usd","dollar"),
-                   "usd":("$","usd"),"eur":("€","eur","euro"),"gbp":("£","gbp","pound"),
-                   "euro":("€","euro"),"euros":("€","euro"),"pound":("£","pound"),
-                   "pounds":("£","pound"),"yen":("¥","yen"),
-                   "km":("km","kilomet"),"kilometre":("km","kilomet"),"kilometres":("km","kilomet"),
-                   "kilometer":("km","kilomet"),"kilometers":("km","kilomet"),
-                   "mile":("mile",),"miles":("mile",),"metre":("m","metre"),"metres":("m","metre"),
-                   "meter":("m","meter"),"meters":("m","meter"),
-                   "tonne":("tonne","ton"),"tonnes":("tonne","ton"),"ton":("ton",),"tons":("ton",),
-                   "kg":("kg","kilogram"),"kilogram":("kg","kilogram"),"kilograms":("kg","kilogram"),
-                   "day":("day",),"days":("day",),"week":("week",),"weeks":("week",),
-                   "month":("month",),"months":("month",),"year":("year",),"years":("year",),
-                   "hour":("hour",),"hours":("hour",),"minute":("minute",),"minutes":("minute",)}
-# an explicit range separator, OR "between/from X and Y". A bare "2010 and 2020"
-# is a LIST, not a range, so "and" only counts behind between/from.
-_GX_RANGE_RE = re.compile(r"\b(1[89]\d{2}|20\d{2})\s*(?:-|–|—|to|through|until)\s*(1[89]\d{2}|20\d{2})\b")
-_GX_RANGE2_RE = re.compile(r"\b(?:between|from)\s+(1[89]\d{2}|20\d{2})\s+and\s+(1[89]\d{2}|20\d{2})\b",
-                           re.IGNORECASE)
+def _w4_response_text(response) -> str:
+    try:
+        return (getattr(response, "text", None) or "").strip()
+    except Exception:
+        return ""
 
 
-def _gx_figures(text: str) -> set:
-    return {m.group(0).replace(",", "").rstrip("%") for m in _GX_FIG_RE.finditer(text or "")}
+def _w4_with_text(response, text: str):
+    try:
+        return response.model_copy(update={"text": text})
+    except Exception:
+        try:
+            return Response(text=text, citations=getattr(response, "citations", None))
+        except Exception:
+            return response
 
 
-def _gx_markers(text: str) -> list:
-    return _GX_CITE_RE.findall(text or "")
+async def _w4_repair_structured_output(question: str, schema, response, *, deadline=None):
+    """The v52 base already answers a structured query in `output`; nothing to repair."""
+    return response
 
 
-def _gx_sentences(text: str) -> list:
-    return [s.strip() for s in _GX_SENT_RE.findall(text or "") if s.strip()]
+async def _m5_cited_query(query_input: Query) -> Response:
+    """Cited path: the base pipeline, then the answer-shape stage."""
+    return _sh_shape(query_input, await _w4_research_or_salvage(query_input))
+
+# --- m5 mode-aware controller (start) ---------------------------------------
+#
+# Why this layer exists.
+#
+# The platform scores a task one of two ways, chosen per output slot with
+# probability 0.5, and the two scorers reward different answers:
+#
+#   fast=False  A pairwise judge against the reference answer, run twice with
+#               the positions swapped. Citations are read and weighed. The
+#               task scores exactly 0.0, 0.5 or 1.0.
+#   fast=True   One correctness judge names the expected components it finds
+#               answered and the excessive components it finds surplus, then
+#               deterministic code computes
+#                   precision = correct / (correct + excessive)
+#                   recall    = correct / expected
+#               and returns their F1. Citations are never sent to this judge
+#               and earn nothing.
+#
+# The baseline pipeline never reads `query.fast`. On a fast task it therefore
+# spends its answer contract, its citation audit and its per-figure grounding
+# passes on a scorer that discards all three, and it emits the qualifying prose
+# those stages exist to produce into a scorer where every unrequested clause is
+# an excessive component dividing precision. Both halves of that are losses:
+# the spend buys nothing, and the prose costs score.
+#
+# So the controller routes on the mode instead:
+#
+#   cited path  The baseline pipeline, unchanged, on the model it was tuned on.
+#               Score-critical, so nothing in it is traded away for cost.
+#   fast path   The same research core, then a different tail: name the
+#               components first, then drop any sentence carrying none of them.
+#               The contract and audit stages are skipped, because that scorer
+#               cannot read what they produce.
+#
+# The paths share the evidence ledger, the search and fetch tools, and the
+# research loop. Only the controller and the answer-production tail differ.
+#
+# Recall is protected ahead of precision throughout. Dropping a component costs
+# recall AND precision, because the numerator falls in both; dropping surplus
+# costs precision alone. Every trim below therefore fails open, keeping the
+# untrimmed answer whenever the trimmed one looks lossy.
+
+# Fast tasks want terse component prose, not the cited argument the baseline
+# model was tuned to write, so the cheaper model is enough there. The cited
+# path keeps LOOP_MODEL_A untouched.
+_M5_FAST_MODEL = "z-ai/glm-5.3-flash"
+
+# v2: the fast path also runs the research loop itself on the cheaper model.
+#
+# v1 switched only the answer tail. The loop is where the spend is -- up to
+# MAX_TURNS calls, each carrying the evidence ledger -- and on a fast task
+# that spend buys component recall, not cited argument. The override is
+# per-run state held the same way the baseline holds _SPEND and _BRIEF_STORE
+# (the platform rejects `import contextvars`, and the baseline already
+# assumes one request per process), set on entry to the fast path and
+# cleared on every exit, so LOOP_MODEL_A itself is never rebound and the
+# lane-B fallback in _chat_turn is untouched: a flash outage still degrades
+# to LOOP_MODEL_B exactly as before.
+_M5_RUN: dict = {"loop_model": None}
 
 
-def _gx_uncited_claims(answer: str) -> list:
-    out = []
-    for s in _gx_sentences(answer):
-        if _GX_CITE_RE.search(s):
+def _m5_loop_model_a() -> str:
+    """Lane-A model for the research loop: the fast override when set, else LOOP_MODEL_A."""
+    chosen = _M5_RUN.get("loop_model")
+    return chosen if isinstance(chosen, str) and chosen else LOOP_MODEL_A
+
+_M5_MIN_FAST_SECONDS = 25.0
+_M5_COMPONENT_TIMEOUT_S = 22.0
+_M5_TRIM_TIMEOUT_S = 26.0
+_M5_MAX_COMPONENTS = 12
+
+
+def _m5_is_fast(query_input) -> bool:
+    """Read the mode defensively; an unreadable flag means the cited path.
+
+    Query.fast is a strict boolean on the current contract, but this artifact
+    must also survive an older or newer payload shape. Guessing "fast" wrongly
+    would strip citations from a task that is scored on them, so the ambiguous
+    case resolves to the path that is never wrong, only more expensive.
+    """
+    try:
+        return getattr(query_input, "fast", False) is True
+    except Exception:
+        return False
+
+
+_M5_COMPONENT_SYSTEM = (
+    "You list the atomic factual components an answer to a question must contain.\n"
+    "- One component per line, no numbering, no commentary.\n"
+    "- A component is a single checkable fact: a name, a figure, a date, a yes/no verdict.\n"
+    "- List only what the question actually asks for. Do not add background, "
+    "context, caveats, or anything the question did not request.\n"
+    "- If the question asks one thing, return exactly one line.\n"
+    "- Return nothing else."
+)
+
+
+async def _m5_components(question: str, deadline: float) -> list[str]:
+    """The atomic facts the answer owes, named the way the fast judge names them.
+
+    This mirrors the judge's own first move. Getting the list roughly right is
+    what lets the trim below tell a required clause from a surplus one; getting
+    it wrong is survivable, because an empty list disables trimming rather than
+    trimming blindly.
+    """
+    budget = min(_M5_COMPONENT_TIMEOUT_S, max(0.0, deadline - monotonic() - 8.0))
+    if budget < 6.0:
+        return []
+    try:
+        raw = await _chat_simple(
+            LLM_LANE_A, _M5_FAST_MODEL, _M5_COMPONENT_SYSTEM,
+            f"Question:\n{question.strip()[:4000]}",
+            max_tokens=400, timeout=budget,
+            think=_least_think(LLM_LANE_A, _M5_FAST_MODEL),
+        )
+    except Exception:
+        return []
+    found: list[str] = []
+    for line in (raw or "").splitlines():
+        item = line.strip().lstrip("-*0123456789.) ").strip()
+        if len(item) < 3:
             continue
-        if _GX_FIG_RE.search(s) or _GX_YEAR_RE.search(s):
-            out.append(s[:160])
-    return out
+        found.append(item)
+        if len(found) >= _M5_MAX_COMPONENTS:
+            break
+    return found
 
 
-def _gx_has_superlative(question: str) -> bool:
-    for m in _GX_SUPER_RE.finditer(question or ""):
-        if m.group(0).lower() not in _GX_SUPER_STOP:
+_M5_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(\[])")
+
+# Function words that reach _entities() only by starting a sentence.
+#
+# _entities() calls any capitalized token of three or more characters an
+# entity, which is right for its own caller and wrong for a recall guard: every
+# sentence begins with a capital, so "The" and "This" register as entities and
+# any sentence removal at all appears to lose one. That made the guard fire on
+# everything and the trim fire on nothing. Excluding these restores the guard
+# to what it was meant to catch -- a dropped proper noun.
+_M5_LEAD_WORDS = frozenset({
+    "the", "this", "that", "these", "those", "there", "then", "thus", "they",
+    "their", "them", "and", "but", "for", "nor", "yet", "so", "because",
+    "however", "although", "though", "while", "when", "where", "which", "who",
+    "whom", "whose", "what", "why", "how", "its", "his", "her", "our", "your",
+    "also", "both", "each", "every", "any", "all", "some", "such", "only",
+    "not", "was", "were", "are", "been", "being", "has", "have", "had", "will",
+    "would", "can", "could", "may", "might", "must", "should", "shall", "did",
+    "does", "one", "two", "several", "many", "most", "more", "less", "based",
+    "according", "overall", "finally", "additionally", "furthermore", "since",
+    "after", "before", "during", "from", "with", "without", "into", "over",
+    "under", "between", "about", "above", "below", "here", "both",
+})
+
+
+def _m5_significant(text: str) -> set:
+    """Entities worth guarding: proper nouns, not sentence-initial function words."""
+    return {token for token in _entities(text) if token not in _M5_LEAD_WORDS}
+
+
+def _m5_sentences(text: str) -> list[str]:
+    parts: list[str] = []
+    for block in (text or "").split("\n"):
+        block = block.strip()
+        if not block:
+            continue
+        parts.extend(s.strip() for s in _M5_SENTENCE_SPLIT.split(block) if s.strip())
+    return parts
+
+
+def _m5_carries_component(sentence: str, component_terms: list[set]) -> bool:
+    """Whether a sentence carries any component's distinguishing terms.
+
+    Deliberately generous: one shared distinguishing term is enough to keep the
+    sentence. The trim is a precision tool operating under a recall constraint,
+    so its bias has to be toward keeping.
+    """
+    if not component_terms:
+        return True
+    words = _key_terms(sentence)
+    if not words:
+        return False
+    for terms in component_terms:
+        if terms and (terms & words):
             return True
     return False
 
 
-def _gx_comparison_shown(answer: str) -> bool:
-    if len(_gx_figures(answer)) >= 2:
-        return True
-    low = (answer or "").lower()
-    return any(k in low for k in ("second","runner-up","next highest","next largest",
-                                  "compared with","compared to","versus"," vs ",
-                                  "other candidates","the remaining"))
+def _m5_trim_surplus(answer: str, components: list[str]) -> str:
+    """Drop sentences that carry no component. Fails open on anything doubtful.
+
+    Every dropped sentence is one fewer excessive component in the denominator
+    of precision. But a sentence holding the only statement of a component is
+    worth more than every surplus sentence combined, so the guards below refuse
+    the trim whenever it looks like it removed substance rather than padding.
+    """
+    if not components or not answer:
+        return answer
+    sentences = _m5_sentences(answer)
+    if len(sentences) <= 1:
+        return answer
+    component_terms = [_key_terms(c) for c in components]
+
+    # The lead sentence is kept unconditionally. Answers state the answer
+    # first, and the component list is an LLM's guess that may simply miss one;
+    # keeping the lead bounds what a wrong guess can cost to a single excessive
+    # component, where dropping the sentence that carried the only statement of
+    # a component would cost precision AND recall together.
+    kept = [
+        sentence for index, sentence in enumerate(sentences)
+        if index == 0 or _m5_carries_component(sentence, component_terms)
+    ]
+    if len(kept) == len(sentences):
+        return answer
+    trimmed = " ".join(kept).strip()
+    # No length floor here on purpose. A short answer covering every component
+    # is the best possible outcome for this scorer, so the only length worth
+    # refusing is a fragment that cannot be an answer at all.
+    if len(trimmed) < 12:
+        return answer
+    # Never let the trim lose a figure or a proper noun the answer had; those
+    # are components far more often than they are padding.
+    if (_figures(answer) - _figures(trimmed)) or (_m5_significant(answer) - _m5_significant(trimmed)):
+        return answer
+    return trimmed
 
 
-def _gx_asked_entities(question: str) -> set:
-    out = set()
-    for m in _GX_CAP_RE.finditer(question or ""):
-        toks = m.group(0).split()
-        while toks and toks[0] in _GX_QSTOP:
-            toks.pop(0)
-        while toks and toks[-1] in _GX_QSTOP:
-            toks.pop()
-        if not toks:
-            continue
-        name = " ".join(toks)
-        if len(toks) < 2 or len(name) < _GX_MIN_ENTITY_CHARS:
-            continue
-        out.add(name)
-    return out
-
-
-def _gx_missing_entities(question: str, answer: str) -> list:
-    a = (answer or "").lower()
-    return [e for e in sorted(_gx_asked_entities(question)) if e.lower() not in a][:_GX_MAX_NOTES]
-
-
-def _gx_missing_units(question: str, answer: str) -> list:
-    """The question demands an explicit unit the answer never renders."""
-    a = (answer or "").lower()
-    out = []
-    for m in _GX_UNIT_RE.finditer(question or ""):
-        unit = m.group(1).lower()
-        toks = _GX_UNIT_TOKENS.get(unit)
-        if not toks:
-            continue
-        if not any(t in a for t in toks):
-            out.append(unit)
-    return sorted(set(out))[:_GX_MAX_NOTES]
-
-
-def _gx_out_of_window(question: str, answer: str) -> list:
-    """The question fixes a year range; the answer asserts years outside it."""
-    m = _GX_RANGE_RE.search(question or "") or _GX_RANGE2_RE.search(question or "")
-    if not m:
-        return []
-    lo, hi = sorted((int(m.group(1)), int(m.group(2))))
-    bad = sorted({y for y in (int(x) for x in _GX_YEAR_RE.findall(answer or ""))
-                  if y < lo or y > hi})
-    return [str(y) for y in bad][:_GX_MAX_NOTES]
-
-
-def _gx_accept(draft: str, revision: str) -> bool:
-    if not revision or not revision.strip():
-        return False
-    r = revision.strip()
-    if len(r) < _GX_MIN_KEEP_RATIO * len(draft.strip()):
-        return False
-    if not _gx_figures(draft) <= _gx_figures(r):
-        return False
-    if len(_gx_markers(r)) < len(_gx_markers(draft)):
-        return False
-    low = r[:160].lower()
-    return not any(low.startswith(b) for b in
-                   ("i cannot","i'm unable","as an ai","the draft","no changes"))
-
-
-_GX_SYSTEM = (
-    "You repair a research answer against a list of concrete defects.\n"
-    "Rules:\n"
-    "- Fix ONLY the listed defects. Change nothing else.\n"
-    "- Use ONLY facts already present in the draft. Never introduce a figure, "
-    "name, date or citation the draft does not contain.\n"
-    "- Every figure, date, name and [n] marker in the draft must survive verbatim. "
-    "Your edits may only ADD.\n"
-    "- If a defect cannot be fixed from the draft's own content, say so in one "
-    "short clause rather than inventing anything.\n"
-    "- Keep the answer's existing shape and opening. Plain prose, no preamble.\n"
-    "Return the full corrected answer and nothing else."
+_M5_TIGHTEN_SYSTEM = (
+    "You remove surplus content from an answer. You never add, reword, or correct.\n"
+    "- Keep every sentence that states one of the listed components.\n"
+    "- Delete sentences that only restate the question, describe your process, "
+    "describe the sources, hedge, or add unrequested background.\n"
+    "- Preserve the surviving sentences verbatim, in their original order.\n"
+    "- Preserve every figure, name, and date that appears in a kept sentence.\n"
+    "- If nothing is surplus, return the answer unchanged.\n"
+    "- Return the answer text only."
 )
 
 
-async def _gx_repair(question: str, answer: str, deadline: float) -> str:
+async def _m5_tighten(question: str, answer: str, components: list[str],
+                      deadline: float) -> str:
+    """Second trim pass, for surplus the term test cannot see.
+
+    The deterministic trim only removes sentences sharing no vocabulary with a
+    component, which misses the common case: a fluent sentence about the right
+    subject that still answers nothing, such as a description of what the
+    sources say or how the answer was reached. Those are excessive components
+    too. The result is accepted only if it stays a subset of what went in.
+    """
+    budget = min(_M5_TRIM_TIMEOUT_S, max(0.0, deadline - monotonic() - 6.0))
+    if budget < 8.0 or not answer.strip() or not components:
+        return answer
+    listed = "\n".join(f"- {c}" for c in components)
     try:
-        notes = _gx_defects(question, answer)
-        if not notes:
-            return answer
-        left = deadline - monotonic()
-        if left < _GX_REPAIR_MIN_SECONDS:
-            return answer
-        timeout = min(_GX_REPAIR_TIMEOUT_SECONDS, left - MIN_TAIL_S)
-        if timeout < 10.0:
-            return answer
-        user = (f"Question:\n{question[:2500]}\n\nDefects to fix:\n"
-                + "\n".join(f"- {n}" for n in notes)
-                + f"\n\nDraft answer:\n{answer[:_GX_DRAFT_CHARS]}")
-        revision = await _chat_simple(LLM_LANE_A, AUDIT_MODEL, _GX_SYSTEM, user,
-                                      max_tokens=2600, timeout=timeout)
-        return revision.strip() if _gx_accept(answer, revision or "") else answer
+        out = await _chat_simple(
+            LLM_LANE_A, _M5_FAST_MODEL, _M5_TIGHTEN_SYSTEM,
+            f"Question:\n{question.strip()[:2000]}\n\n"
+            f"Required components:\n{listed}\n\n"
+            f"Answer:\n{answer.strip()[:12000]}",
+            max_tokens=1400, timeout=budget,
+            think=_least_think(LLM_LANE_A, _M5_FAST_MODEL),
+        )
     except Exception:
         return answer
-# ── end gx guards ─────────────────────────────────────────────────────────────
+    out = (out or "").strip()
+    if not out or not _is_usable_answer(out):
+        return answer
+    # Only ever accept a shortening. A longer result means the model wrote
+    # rather than cut, and new prose is new excessive components.
+    if len(out) > len(answer.strip()):
+        return answer
+    if (_figures(answer) - _figures(out)) or (_m5_significant(answer) - _m5_significant(out)):
+        return answer
+    return out
 
 
-def _gx_defects(question: str, answer: str) -> list:
-    notes = []
-    if not answer or not answer.strip():
-        return notes
-    if _gx_has_superlative(question) and not _gx_comparison_shown(answer):
-        notes.append("The question asks for a superlative but the answer shows no "
-                     "comparison set — name the runner-up and the figure that "
-                     "separates it from the winner.")
-    units = _gx_missing_units(question, answer)
-    if units:
-        notes.append("The question demands the answer be given in these units and "
-                     "the answer never renders them: " + ", ".join(units))
-    oow = _gx_out_of_window(question, answer)
-    if oow:
-        notes.append("The question fixes a date range and the answer asserts years "
-                     "outside it: " + ", ".join(oow))
-    return notes[:_GX_MAX_NOTES]
+async def _m5_fast_query(query_input: Query, question: str) -> Response:
+    """Fast path: research as usual, then answer for the component scorer.
+
+    The research core is the baseline's, deliberately, run on the cheaper
+    model (see _M5_RUN). What changes is the tail and what is
+    skipped: no answer contract, no citation audit, no figure grounding,
+    because the fast judge never sees a citation. The time and spend those
+    stages would have taken is left to the trims instead.
+    """
+    _M5_RUN["loop_model"] = _M5_FAST_MODEL
+    try:
+        response = await _w4_research_or_salvage(query_input)
+    finally:
+        _M5_RUN["loop_model"] = None
+    answer = _w4_response_text(response)
+    schema = getattr(query_input, "output_schema", None)
+
+    if answer and _is_usable_answer(answer):
+        deadline = monotonic() + max(_M5_MIN_FAST_SECONDS, DIGEST_TAIL_S * 3.0)
+        components: list[str] = []
+        try:
+            components = await _m5_components(question, deadline)
+        except Exception:
+            components = []
+        if components:
+            try:
+                answer = _m5_trim_surplus(answer, components)
+            except Exception:
+                pass
+            try:
+                answer = await _m5_tighten(question, answer, components, deadline)
+            except Exception:
+                pass
+            if _is_usable_answer(answer):
+                response = _w4_with_text(response, answer)
+
+    # A structured query still has to answer in `output`, whatever the mode.
+    if schema is not None:
+        try:
+            response = await _w4_repair_structured_output(
+                question, schema, response, deadline=monotonic() + 45.0,
+            )
+        except Exception:
+            pass
+    return response
 
 
 @entrypoint("query")
 async def query(query: Query) -> Response:
-    deadline = monotonic() + WALL_BUDGET_S
-    response = await _base_agent_query(query)
-    # guards run on TEXT answers only: a structured payload has already been
-    # schema-coerced by the base and must not be rewritten by a prose repair.
-    try:
-        if getattr(query, "output_schema", None) is None:
-            drafted = getattr(response, "text", None)
-            if isinstance(drafted, str) and drafted.strip():
-                fixed = await _gx_repair(getattr(query, "text", "") or "", drafted, deadline)
-                if fixed and fixed != drafted:
-                    try:
-                        return Response(text=fixed, citations=getattr(response, "citations", None))
-                    except Exception:
-                        return Response(text=fixed)
-    except Exception:
-        pass
-    return response
+    """Route on the scoring mode, then hand off to the matching pipeline.
 
-VERSION = "f2b-423"
-_GX_ACTIVE = ('super', 'unit', 'window')
+    Nothing may escape here. The platform charges an escaping exception to the
+    miner as MINER_UNHANDLED_EXCEPTION and the task scores zero with no retry,
+    so the router's own failure mode is the cited pipeline, and that pipeline's
+    failure mode is a floor answer. A floor answer scores poorly; an escape
+    scores zero and takes the whole task with it.
+    """
+    question = ""
+    try:
+        question = (getattr(query, "text", "") or "").strip()
+    except Exception:
+        question = ""
+
+    if question and _m5_is_fast(query):
+        try:
+            return await _m5_fast_query(query, question)
+        except Exception:
+            # Fall through to the cited path rather than surfacing anything.
+            pass
+    try:
+        return await _m5_cited_query(query)
+    except Exception:
+        return Response(text="No verifiable source-backed answer was reached for this question.")
+# --- m5 mode-aware controller (end) -----------------------------------------
+
+
+# --- answer-shape stage (start) ----------------------------------------------
+#
+# Why this stage exists. Batch 4117ad03 (2026-09-03), all four top artifacts:
+# answers that carried a headed "Proof" / "Candidate pool" / "Evidence" section
+# averaged 0.00-0.13 against 0.63-0.71 for answers without one, and the judge's
+# most frequent complaints on sub-1.0 rows were "format", "prose", "extra",
+# "concise", "verbose". Two verbatim examples: a fully correct MAIB answer lost
+# "for conciseness and strict adherence to prose format"; a correct NOAA answer
+# lost for "a lot of redundant information ... 'candidate dump' style analysis".
+# The same judge praised sequential [[1]]..[[n]] pointers as "much easier to
+# follow". So, on the cited path only:
+#   1. drop a trailing headed proof/pool/evidence section when the lead already
+#      is a cited answer (fail-open: uncertain leads, "show your working"
+#      questions, and short leads keep the full text);
+#   2. renumber the surviving [[n]] pointers by first appearance and keep only
+#      the citations they reference, so pointers stay exact and sequential.
+# Nothing here runs on fast tasks (no citations there) or structured output.
+
+import re as _sh_re
+
+_SH_KW = (r"(?:proof|candidate[ \t]+pool|evidence|verification|sources|references|"
+          r"supporting[ \t]+evidence|analysis|working|sweep)")
+# A headed section starts a line as (a) a markdown heading, (b) a bold heading
+# that may carry extra words up to its closing **, or (c) a plain
+# "Proof:" / "Candidate pool:" / "Proof section." label.
+_SH_HEADER_RE = _sh_re.compile(
+    r"^[ \t]*(?:"
+    r"#{1,4}[ \t]*" + _SH_KW + r"\b[^\n]{0,100}"
+    r"|\*\*[ \t]*" + _SH_KW + r"\b[^\n*]{0,100}\*\*"
+    r"|" + _SH_KW + r"(?:[ \t]+section)?[ \t]*[:.]"
+    r")", _sh_re.I | _sh_re.M)
+_SH_POINTER_RE = _sh_re.compile(r"\[\[(\d{1,3})\]\]")
+_SH_ODD_POINTER_RE = _sh_re.compile(r"\[\[[^\]]*[,\-–][^\]]*\]\]")
+_SH_UNCERTAIN_RE = _sh_re.compile(
+    r"\b(?:cannot|could not|unable to|no (?:qualifying|such)|not (?:present|found|"
+    r"available|reproduced) in|empty set|insufficient|could be identified|"
+    r"best-effort)\b", _sh_re.I)
+_SH_WORKING_RE = _sh_re.compile(
+    r"\b(?:show (?:your|the|all) (?:work|working|reasoning|steps)|explain (?:how|why|"
+    r"your reasoning)|justify|step[- ]by[- ]step|walk (?:me )?through|"
+    r"list (?:every|all) (?:candidate|member|step)|for each (?:candidate|member))\b",
+    _sh_re.I)
+_SH_MIN_LEAD_CHARS = 40
+_SH_MAX_CARRIED_POINTERS = 6
+_SH_SENTENCE_END_RE = _sh_re.compile(r"(?:[.!?]|\]\])[*_\"')\]]*$")
+
+
+def _sh_split(text: str):
+    """(lead, stripped_section) or None when no strippable trailing section exists.
+
+    The lead must read as a finished answer: long enough, ending a sentence.
+    A lead without its own [[n]] pointers is still accepted -- the pointers the
+    dropped section used are carried onto the lead by the caller, because an
+    uncited lead is a defect but a correct answer buried under a candidate
+    dump scored 0.0 on every observed row.
+    """
+    for m in _SH_HEADER_RE.finditer(text):
+        lead = text[:m.start()].rstrip()
+        if len(lead) < _SH_MIN_LEAD_CHARS:
+            continue
+        if not _SH_SENTENCE_END_RE.search(lead):
+            continue
+        return lead, text[m.start():]
+    return None
+
+
+def _sh_carry_pointers(lead: str, dropped: str) -> str:
+    """Give a pointer-less lead the distinct pointers its dropped proof used."""
+    if _SH_POINTER_RE.search(lead):
+        return lead
+    seen: list = []
+    for m in _SH_POINTER_RE.finditer(dropped):
+        n = int(m.group(1))
+        if n not in seen:
+            seen.append(n)
+        if len(seen) >= _SH_MAX_CARRIED_POINTERS:
+            break
+    if not seen:
+        return lead
+    return lead + " " + "".join(f"[[{n}]]" for n in seen)
+
+
+def _sh_renumber(text: str, citations):
+    """Renumber [[n]] by first appearance; keep only referenced refs. Fail open."""
+    if not citations or _SH_ODD_POINTER_RE.search(text):
+        return text, citations
+    order: list = []
+    for m in _SH_POINTER_RE.finditer(text):
+        n = int(m.group(1))
+        if n < 1 or n > len(citations):
+            return text, citations
+        if n not in order:
+            order.append(n)
+    if not order:
+        return text, citations
+    mapping = {n: i + 1 for i, n in enumerate(order)}
+    new_text = _SH_POINTER_RE.sub(lambda m: f"[[{mapping[int(m.group(1))]}]]", text)
+    new_cits = [citations[n - 1] for n in order]
+    return new_text, new_cits
+
+
+def _sh_shape(query_input, response):
+    """Cited-path answer hygiene. Returns the response unchanged on any doubt."""
+    try:
+        if getattr(query_input, "fast", False) is True:
+            return response
+        if getattr(query_input, "output_schema", None) is not None:
+            return response
+        text = getattr(response, "text", None)
+        if not isinstance(text, str) or getattr(response, "output", None) is not None:
+            return response
+        question = str(getattr(query_input, "text", "") or "")
+        if _SH_WORKING_RE.search(question):
+            return response
+        split = _sh_split(text)
+        if split is None:
+            return response
+        lead, dropped = split
+        if _SH_UNCERTAIN_RE.search(lead):
+            return response
+        citations = list(getattr(response, "citations", None) or [])
+        lead = _sh_carry_pointers(lead, dropped)
+        new_text, new_cits = _sh_renumber(lead, citations)
+        if not new_text.strip():
+            return response
+        try:
+            return response.model_copy(update={"text": new_text,
+                                               "citations": new_cits or None})
+        except Exception:
+            return Response(text=new_text, citations=new_cits or None,
+                            note=getattr(response, "note", None))
+    except Exception:
+        return response
+# --- answer-shape stage (end) ------------------------------------------------

@@ -1,7 +1,21 @@
 
 from __future__ import annotations
-# fork of 1_uid_230_score_0.650_highest.py: added cov:entity:finish (variant u230)
 
+
+FETCH_TIMEOUT_S = 16.0
+TASK_TOTAL_BUDGET_SECONDS = 250.0
+SEARCH_TIMEOUT_S = 18.0
+BRIEF_TIMEOUT_S = 50.0
+SEARCH_EXCERPT_CHARS = 550
+MIN_TAIL_S = 8.0
+DIGEST_TAIL_S = 14.0
+PAGE_GREP_WINDOW = 700
+TURN_TIMEOUT_S = 75.0
+
+LLM_PROVIDER = "openrouter"
+MODEL = "z-ai/glm-5.2"
+
+from time import perf_counter
 import asyncio
 import json
 import re
@@ -11,74 +25,47 @@ from harnyx_miner_sdk.api import fetch_page, llm_chat, search_web, tooling_info
 from harnyx_miner_sdk.decorators import entrypoint
 from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
 
-VERSION = "v52-pin-reviewed"
+VERSION = "v260-10-ksvu"
 
                                                                                 
 LLM_LANE_A = "openrouter"                                          
-LLM_LANE_B = "openrouter"   # was openrouter: no credential on our miners
+LLM_LANE_B = "openrouter"                                                        
                                                                                
                                                                                   
 LOOP_MODEL_A = "z-ai/glm-5.2"
-LOOP_MODEL_B = "z-ai/glm-5.2"   # openrouter-served, verified
-AUDIT_MODEL = "z-ai/glm-5.2"              
-# --- element-coverage controller [u230-cov-entity-finish: named-entity coverage, finish-gate re-entry] --------
-# The inherited controller finishes when the MODEL stops calling tools or when
-# turns/time/spend run out; nothing checks whether the question's required
-# evidence was gathered. Here the question's required elements (entity) are
-# resolved BEFORE research, carried on the ledger, and element coverage -- not
-# the model's choice to stop -- decides when research is complete. When
-# coverage is incomplete and budget remains, the loop re-enters retrieval aimed
-# at the uncovered elements and the answer is produced again afterwards.
-ELEMENT_MAX = 8
-ELEMENT_MODEL = AUDIT_MODEL
-ELEMENT_TIMEOUT_S = 20.0
-ELEMENT_MAX_TOKENS = 400
-ELEMENT_MIN_SECONDS = 150.0
-ELEMENT_COVER_RATIO = 0.6
-COVERAGE_MAX_REENTRIES = 2
-COVERAGE_MIN_SECONDS = 75.0
-COVERAGE_MIN_USD = 0.04
-COVERAGE_STEER_TURN = 4
-COVERAGE_PREDICATE = "entity"
-_COVERAGE = {"reentries": 0, "steered": False}
-_FAST = {"on": False}
-SCHEMA_MODEL = "z-ai/glm-5.2"             
-RESORT_MODEL = "z-ai/glm-5.2"          
+LOOP_MODEL_B = "z-ai/glm-5"
+AUDIT_MODEL = "openai/gpt-oss-120b"              
+SCHEMA_MODEL = "openai/gpt-oss-120b"             
+RESORT_MODEL = "deepseek/deepseek-v3.2"          
 SEARCH_PROVIDER = "parallel"                                       
                                                                                 
                                                                                   
-SEARCH_PROVIDERS = ("parallel",)   # exa/tavily: no credential
-FETCH_PROVIDERS = ("parallel",)   # exa/firecrawl: no credential
+SEARCH_PROVIDERS = ("parallel", "exa", "tavily")
+FETCH_PROVIDERS = ("parallel", "exa", "firecrawl")
 
                                                                                 
-WALL_BUDGET_S = 250.0                                                               
+WALL_BUDGET_S = 266.0                                                               
                                                                                   
                                                                                  
-BRIEF_TIMEOUT_S = 50.0                                                                           
                                                                                     
                                                                                 
-TURN_TIMEOUT_S = 75.0
 LANE_B_MAX_PAYLOAD_CHARS = 144000                                          
                                                                             
                                   
 AUDIT_TIMEOUT_S = 28.0
-SEARCH_TIMEOUT_S = 18.0
-FETCH_TIMEOUT_S = 16.0
                                                                                  
                                                                                
 WRAPUP_AT_S = 90.0                                                                                       
                                                                                 
                                                                                 
+MAX_TURNS = 15                                                                              
 AUDIT_EXTRA_TURNS = 2
-SEARCH_EXCERPT_CHARS = 550
-MIN_TAIL_S = 8.0
-MAX_TURNS = 15
-_LEDGER_TEXT_CAP = 400_000
-PAGE_GREP_WINDOW = 700
-PAGE_GREP_MAX_HITS = 6
-ANSWER_REPAIR_TURNS = 2
+ANSWER_REPAIR_TURNS = 2                                                                             
 RESCUE_TIMEOUT_S = 55.0
-DIGEST_TAIL_S = 14.0
+
+                                                                                
+_LEDGER_TEXT_CAP = 400_000                                                        
+PAGE_GREP_MAX_HITS = 6
 PAGE_READ_MAX_CHARS = 12_000
 
                                                                                
@@ -611,99 +598,9 @@ SET_RULE = (
 )
 
 
-# --- required elements (entity): the controller's completion criterion -------
-_ELEMTOK_STOP = (
-    "the", "and", "for", "its", "their", "both", "this", "that", "with", "from",
-    "full", "official", "quarterly", "each", "all", "new", "one", "page", "dated",
-    "list", "every", "must", "then", "into", "over", "under", "only", "same",
-    "record", "value", "member", "figure", "evidence",
-)
-_ELEM_SPLIT_RE = re.compile(r"[^A-Za-z0-9]+")
-
-_ENT_CAP_RE = re.compile(r"\b[A-Z][A-Za-z0-9&.\-]{2,}(?:\s+(?:of|the|and|de|for)\s+)?(?:\s+[A-Z][A-Za-z0-9&.\-]{2,}){0,3}\b")
-_ENT_QSTOP = frozenset({"Which","What","Who","When","Where","How","Why","The","A","An",
-                        "For","From","In","On","Of","And","Or","As","At","By","To",
-                        "Answer","Give","List","Name","Using","According","Report",
-                        "Compare","Consider","Identify","Determine","Explain","State",
-                        "Find","Return","Provide","Between","Across","Both","Each",
-                        "Per","With","Within","Their","Its","This","That","These","If",
-                        "Then","Also","Please","JSON","Only","Output"})
-def _seed_elements(question: str) -> list[str]:
-    out: list[str] = []
-    for m in _ENT_CAP_RE.finditer(question or ""):
-        phrase = " ".join(m.group(0).split())
-        if phrase.split()[0] in _ENT_QSTOP or len(phrase) < 5:
-            continue
-        if any(phrase.lower() == p.lower() for p in out):
-            continue
-        out.append(phrase + " record")
-        if len(out) >= 5:
-            break
-    return out
-
-def _element_keys(element: str) -> list[str]:
-    """The distinctive words of an element, deduplicated."""
-    keys: list[str] = []
-    for token in _ELEM_SPLIT_RE.split((element or "").lower()):
-        if len(token) >= 4 and token not in _ELEMTOK_STOP and token not in keys:
-            keys.append(token)
-    return keys[:6]
-
-def _element_hard_keys(element: str) -> list[str]:
-    """Tokens that MUST appear in a row for it to cover the element (entity)."""
-    return []
-
 class EvidenceLedger:
     def __init__(self) -> None:
         self.rows: list[dict] = []                        
-        # Required evidence elements and which ledger rows carry each one. The
-        # controller consults this to decide completion: the ledger is the
-        # coverage state the loop terminates on, not only a record of fetches.
-        self.elements: list[str] = []
-        self.element_rows: dict[int, list[int]] = {}
-
-    def set_elements(self, elements: list[str]) -> None:
-        self.elements = [e for e in (elements or []) if str(e).strip()][:ELEMENT_MAX]
-        self.element_rows = {}
-        self.index_elements()
-
-    def index_elements(self) -> None:
-        """Recompute element -> row coverage. Deterministic, no model call."""
-        if not self.elements:
-            return
-        hay = []
-        for n, row in enumerate(self.rows, start=1):
-            blob = " ".join((
-                row.get("title") or "", row.get("url") or "",
-                row.get("preview") or "", row.get("text") or "",
-            )).lower()
-            hay.append((n, blob))
-        for i, element in enumerate(self.elements):
-            keys = _element_keys(element)
-            hard = _element_hard_keys(element)
-            if not keys and not hard:
-                continue
-            hits = []
-            for n, blob in hay:
-                if hard and not all(h.lower() in blob for h in hard):
-                    continue
-                found = 0
-                for key in keys:
-                    if key in blob:
-                        found += 1
-                if not keys or float(found) / float(len(keys)) >= ELEMENT_COVER_RATIO:
-                    hits.append(n)
-            self.element_rows[i] = hits
-
-    def uncovered_elements(self) -> list[str]:
-        """Elements no gathered row carries. The loop's completion criterion."""
-        if not self.elements:
-            return []
-        out = []
-        for i, element in enumerate(self.elements):
-            if not self.element_rows.get(i):
-                out.append(element)
-        return out
 
     def add(self, receipt_id: str, result_id: str, note_len: int,
             kind: str, spans: list[tuple[int, int]] | None,
@@ -866,13 +763,40 @@ class ToolOutput:
 
 _TOOL_MEMO: dict = {}
                                                                       
-_FETCH_STATE: dict = {"spent_s": 0.0, "dead": []}
+_FETCH_STATE: dict = {"spent_s": 0.0, "dead": [], "dead_norm": []}
+# Strip EVERY leading variant label, not just one: the log shows
+# "www.dv.the-numbers.com" -- one strip leaves "dv.the-numbers.com",
+# which misses the already-dead key and costs another 16s timeout.
+# Only known site-variant labels are stripped, so en./de.wikipedia.org
+# stay distinct resources.
+_HOST_PREFIX_RE = re.compile(r"^(?:www|m|mobile|amp|dv|web|secure)\.", re.I)
+_PATH_PREFIX_RE = re.compile(r"^/(?:alpha|amp|beta)(?=/)", re.I)
+_URL_SPLIT_RE = re.compile(r"^https?://([^/\s?#]+)([^\s?#]*)", re.I)
+
+
+def _norm_fetch_key(url: str) -> str:
+    """Collapse www./m./alpha variants of one resource onto a single key."""
+    text = (url or "").strip()
+    if "web.archive.org" in text.lower():
+        return ""          # an archive copy is its own resource
+    match = _URL_SPLIT_RE.match(text)
+    if not match:
+        return ""
+    host = match.group(1).lower()
+    for _ in range(3):
+        stripped = _HOST_PREFIX_RE.sub("", host, count=1)
+        if stripped == host or stripped.count(".") < 1:
+            break
+        host = stripped
+    path = _PATH_PREFIX_RE.sub("", match.group(2) or "").rstrip("/")
+    return host + path.lower()
 
 
 def _reset_run_state() -> None:
     _TOOL_MEMO.clear()
     _FETCH_STATE["spent_s"] = 0.0
     _FETCH_STATE["dead"] = []
+    _FETCH_STATE["dead_norm"] = []
                                                                                 
                                                                                  
     _SPEND["left"] = None
@@ -1138,7 +1062,9 @@ async def _do_fetch(url: str, focus: str, question: str, ledger: EvidenceLedger)
         return f"# read_page({url!r}) {hit}"
                                                                                 
                                                             
-    if url in _FETCH_STATE["dead"]:
+    _dead_key = _norm_fetch_key(url)
+    if url in _FETCH_STATE["dead"] or (
+            _dead_key and _dead_key in _FETCH_STATE["dead_norm"]):
         return (f"# read_page({url!r}): this url already returned no content in "
                 f"this run and will not be retried. Use a different source, or "
                 f"answer from the evidence already numbered above.")
@@ -1165,6 +1091,8 @@ async def _do_fetch(url: str, focus: str, question: str, ledger: EvidenceLedger)
             break
     if payload is None or not getattr(payload, "results", None):
         _FETCH_STATE["dead"].append(url)
+        if _dead_key and _dead_key not in _FETCH_STATE["dead_norm"]:
+            _FETCH_STATE["dead_norm"].append(_dead_key)
     if payload is None:
         return f"# read_page({url!r}) failed"
     _spend_note(payload)
@@ -1746,7 +1674,7 @@ async def _chat_turn(messages: list[dict], deadline: float, *, finish_only: bool
         lane = lane_model[0]
         model = lane_model[1]
         pinned = lane_model[2]
-        if lane == LLM_LANE_B and payload_chars > LANE_B_MAX_PAYLOAD_CHARS:
+        if model == LOOP_MODEL_B and payload_chars > LANE_B_MAX_PAYLOAD_CHARS:
                                                                                   
                                                                                    
             return _EMPTY_TURN
@@ -1768,9 +1696,9 @@ async def _chat_turn(messages: list[dict], deadline: float, *, finish_only: bool
                 temperature=0.2,
                                                                                   
                                                                                    
-                thinking=({"enabled": False} if (finish_only and lane == LLM_LANE_B)
+                thinking=({"enabled": False} if (finish_only and model == LOOP_MODEL_B)
                           else {"enabled": True, "effort": "low"}),
-                max_output_tokens=6000 if (finish_only and lane == LLM_LANE_B) else None,
+                max_output_tokens=6000 if (finish_only and model == LOOP_MODEL_B) else None,
                 provider_extra=_upstream(lane, model) if pinned else None,
                 timeout=timeout,
             ), timeout=min(timeout + 6.0,
@@ -1894,7 +1822,12 @@ def _seed_queries(question: str, set_question: bool) -> list[str]:
     seeds = [q[:300]]
                                                                                
                                                                                
-    salient = [t for t in _SEED_TOKEN_RE.findall(q)
+    salient_src = q
+    try:
+        salient_src = _ask_clause(q) or q
+    except Exception:
+        salient_src = q
+    salient = [t for t in _SEED_TOKEN_RE.findall(salient_src)
                if len(t) >= 3 and t.lower() not in _STOP and t.lower() not in _SEED_STOP]
     if len(salient) >= 2:
         seeds.append(" ".join(salient[:8]))
@@ -1940,10 +1873,144 @@ async def _preseed(question: str, set_question: bool, ledger: EvidenceLedger,
             "directly, and search further as needed):\n\n" + "\n".join(good))
 
 
+
+# ── cobertura por elementos: condição de término do loop de pesquisa ─────────
+COVELEM_MAX = 8
+COVELEM_MODEL = AUDIT_MODEL
+COVELEM_PLAN_TIMEOUT_S = 20.0
+COVELEM_PLAN_MAX_TOKENS = 400
+COVELEM_PLAN_MIN_SECONDS = 150.0
+COVELEM_COVER_RATIO = 0.6
+COVELEM_MAX_REENTRIES = 2
+COVELEM_MIN_SECONDS = 75.0
+COVELEM_MIN_USD = 0.04
+_COVELEM = {"elements": [], "reentries": 0}
+_COVELEM_SPLIT_RE = re.compile(r"[^A-Za-z0-9]+")
+_COVELEM_TOK_STOP = frozenset((
+    "the", "and", "for", "its", "their", "both", "this", "that", "with", "from",
+    "full", "official", "quarterly", "each", "all", "new", "one", "page", "dated",
+    "list", "every", "must", "then", "into", "over", "under", "only", "same",
+    "record", "value", "member", "figure", "evidence"))
+_COVELEM_DOCNOUN_RE = re.compile(
+    r"(?i)\b((?:[a-z0-9][\w/\-]*\s+){0,4}"
+    r"(?:tables?|sheets?|summar(?:y|ies)|reports?|bulletins?|appendix|appendices|"
+    r"indexe?s?|rosters?|listings?|schedules?|registers?|catalogues?|notices?|filings?|"
+    r"10-k|10-q|annual report|press release|datasets?|statistics))\b")
+_COVELEM_DOCNOUN_STOP = ("the following", "these", "those", "such ", "any ", "each ",
+    "both ", "and ", "or ", "in ", "on ", "at ", "to ", "of ", "as ", "by ", "for ",
+    "with ", "from ", "between ", "using ", "consider ", "together ", "that ",
+    "their ", "its ", "his ", "her ", "this ", "contains ", "credited ",
+    "appear ", "shown ", "written ", "state ", "working ", "all ")
+
+
+def _covelem_seed(question: str) -> list:
+    out = []
+    for m in _COVELEM_DOCNOUN_RE.finditer(question or ""):
+        phrase = " ".join(m.group(1).split())
+        low = phrase.lower()
+        if len(phrase) < 12 or len(phrase.split()) < 2:
+            continue
+        if any(low.startswith(s) for s in _COVELEM_DOCNOUN_STOP) or re.match(r"^\W*\d", phrase):
+            continue
+        if any(low == p.lower() or low in p.lower() for p in out):
+            continue
+        out.append(phrase)
+        if len(out) >= 5:
+            break
+    return out
+
+
+def _covelem_keys(element: str) -> list:
+    keys = []
+    for token in _COVELEM_SPLIT_RE.split((element or "").lower()):
+        if len(token) >= 4 and token not in _COVELEM_TOK_STOP and token not in keys:
+            keys.append(token)
+    return keys[:6]
+
+
+async def _covelem_plan(question: str, deadline: float) -> None:
+    """Resolve, ANTES da coleta, quais documentos/registros a pergunta exige.
+
+    A lista vira o estado de cobertura que decide o término do loop: enquanto
+    algum elemento não tiver linha de evidência que o carregue, o controlador
+    devolve o modelo à coleta em vez de aceitar a resposta.
+    """
+    elements = list(_covelem_seed(question))
+    probe = ("Name the distinct DOCUMENTS or authoritative records that must be "
+             "RETRIEVED before this question is answerable: every named report, "
+             "filing, table, register, dataset or official page the question "
+             "names or implies. One short noun phrase per item. JSON only: a "
+             "list of strings, at most 6.\n\nQuestion:\n" + question[:4000])
+    try:
+        raw = await _chat_simple(
+            LLM_LANE_A, COVELEM_MODEL,
+            "Research planner. Name the evidence to gather. JSON list only.",
+            probe, max_tokens=COVELEM_PLAN_MAX_TOKENS,
+            timeout=max(6.0, min(COVELEM_PLAN_TIMEOUT_S,
+                                 (deadline - monotonic()) - 90.0)))
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", (raw or "").strip(),
+                     flags=re.I | re.M)
+        parsed = json.loads(raw)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, dict):
+        for value in parsed.values():
+            if isinstance(value, list):
+                parsed = value
+                break
+    if isinstance(parsed, list):
+        for item in parsed:
+            text = " ".join(str(item).split())
+            if len(text) < 8 or len(_covelem_keys(text)) < 2:
+                continue
+            if not any(text.lower() == e.lower() for e in elements):
+                elements.append(text)
+    _COVELEM["elements"] = elements[:COVELEM_MAX]
+
+
+def _covelem_uncovered(ledger) -> list:
+    """Elementos exigidos que nenhuma linha coletada carrega. Determinístico."""
+    elements = _COVELEM["elements"]
+    if not elements:
+        return []
+    hay = []
+    for row in getattr(ledger, "rows", []) or []:
+        hay.append(" ".join((row.get("title") or "", row.get("url") or "",
+                             row.get("preview") or "",
+                             row.get("text") or "")).lower())
+    missing = []
+    for element in elements:
+        keys = _covelem_keys(element)
+        if not keys:
+            continue
+        covered = False
+        for blob in hay:
+            found = sum(1 for key in keys if key in blob)
+            if float(found) / float(len(keys)) >= COVELEM_COVER_RATIO:
+                covered = True
+                break
+        if not covered:
+            missing.append(element)
+    return missing
+
+
+def _covelem_order(missing: list) -> str:
+    return (
+        "COVERAGE (required documents): research is NOT complete. No gathered "
+        "row carries these required elements:\n- " + "\n- ".join(missing[:COVELEM_MAX]) +
+        "\nSearch or fetch each one specifically now -- query it by its own "
+        "name, not the question as a whole. If one genuinely does not exist, "
+        "state that explicitly in the answer and cite what you checked. Then "
+        "produce the COMPLETE final answer with [n] citations in the required "
+        "shape.")
+
+
 async def _loop(question: str, brief: str, ledger: EvidenceLedger,
                 deadline: float, turn_cap: int,
                 carry: list[dict] | None = None,
-                allow_tools_in_wrapup: bool = False) -> tuple[str, list[dict]]:
+                allow_tools_in_wrapup: bool = False,
+                criteria: list | None = None) -> tuple[str, list[dict]]:
+    _covelem_primary = carry is None
     if carry is not None:
         messages = carry
     else:
@@ -1962,6 +2029,7 @@ async def _loop(question: str, brief: str, ledger: EvidenceLedger,
         messages.append({"role": "user", "content": question})
 
     answer = ""
+    held = ""
     ordered_wrapup = False
     repairs_left = ANSWER_REPAIR_TURNS
     for turn in range(1, turn_cap + 1):
@@ -1977,6 +2045,15 @@ async def _loop(question: str, brief: str, ledger: EvidenceLedger,
 
                                                                                
         _condense_history(messages)
+        if criteria is not None and turn * 2 >= turn_cap:
+            hint = ""
+            try:
+                hint = _open_criteria_hint(criteria, ledger)
+            except Exception:
+                hint = ""
+            criteria = None
+            if hint:
+                messages.append({"role": "system", "content": hint})
         payload = await _chat_turn(messages, deadline, finish_only=finish_only,
                                    force_tools=allow_tools_in_wrapup and turn == 1)
         if payload is None:
@@ -2006,26 +2083,38 @@ async def _loop(question: str, brief: str, ledger: EvidenceLedger,
                 answer = ""                                                       
                 break
             answer = candidate
-            # COVERAGE GATE -- the controller's completion decision. The inherited
-            # loop finished here because the model stopped calling tools. Completion
-            # is now decided by whether the ledger carries every required element;
-            # when it does not and budget remains, the loop re-enters retrieval
-            # aimed at the missing elements and the answer is produced again.
-            ledger.index_elements()
-            missing = ledger.uncovered_elements()
-            if (missing
-                    and not _FAST["on"]
-                    and _COVERAGE["reentries"] < COVERAGE_MAX_REENTRIES
-                    and not finish_only
-                    and (deadline - monotonic()) > COVERAGE_MIN_SECONDS
-                    and _spend_left() >= COVERAGE_MIN_USD):
-                _COVERAGE["reentries"] = _COVERAGE["reentries"] + 1
-                messages.append({"role": "assistant", "content": answer})
-                messages.append({"role": "system", "content": _coverage_order(missing)})
-                answer = ""
-                continue
+            if criteria is not None:
+                hint = ""
+                try:
+                    hint = _open_criteria_hint(criteria, ledger)
+                except Exception:
+                    hint = ""
+                criteria = None
+                if hint and (deadline - monotonic()) > NUDGE_MIN_LEFT_S:
+                    held = answer
+                    answer = ""
+                    messages.append({"role": "assistant", "content": held})
+                    messages.append({"role": "system", "content": hint})
+                    continue
                                                                            
                                                                             
+            if _covelem_primary:
+                _cov_missing = []
+                try:
+                    _cov_missing = _covelem_uncovered(ledger)
+                except Exception:
+                    _cov_missing = []
+                if (_cov_missing
+                        and not finish_only
+                        and _COVELEM["reentries"] < COVELEM_MAX_REENTRIES
+                        and (deadline - monotonic()) > COVELEM_MIN_SECONDS
+                        and _spend_left() >= COVELEM_MIN_USD):
+                    _COVELEM["reentries"] = _COVELEM["reentries"] + 1
+                    messages.append({"role": "assistant", "content": answer})
+                    messages.append({"role": "system",
+                                     "content": _covelem_order(_cov_missing)})
+                    answer = ""
+                    continue
             messages.append({"role": "assistant", "content": answer})
             break
         messages.append(msg.to_input_message())
@@ -2060,68 +2149,10 @@ async def _loop(question: str, brief: str, ledger: EvidenceLedger,
                                                                             
             body = _commit_tool_output(call_result[1], ledger)
             messages.append({"role": "tool", "tool_call_id": call.id, "content": body})
-        ledger.index_elements()
         for call in calls[8:]:
             messages.append({"role": "tool", "tool_call_id": call.id,
                              "content": "# skipped: per-turn tool budget reached — re-issue next turn if still needed"})
-    return answer, messages
-
-async def _required_elements(question: str, deadline: float) -> list[str]:
-    """Resolve the question's required entity elements BEFORE research.
-
-    These become the ledger's coverage keys and, through it, the condition the
-    research loop terminates on. Elements are seeded deterministically from the
-    question and completed with one small model call.
-    """
-    elements: list[str] = []
-    for phrase in _seed_elements(question):
-        if phrase and not any(phrase.lower() == e.lower() for e in elements):
-            elements.append(phrase)
-    if (deadline - monotonic()) < ELEMENT_MIN_SECONDS:
-        return elements[:ELEMENT_MAX]
-    probe = ("List the distinct named entities (people, organisations, products, places, titled works, or schema fields) whose own record must be GATHERED before this question can be answered. One short noun phrase each naming the entity and what is needed from it. JSON only: a list of strings, at most 6." + "\n\nQuestion:\n" + question[:4000])
-    try:
-        raw = await _chat_simple(
-            LLM_LANE_A, ELEMENT_MODEL,
-            "Deep-research planner. Name the evidence to gather. JSON list only.",
-            probe, max_tokens=ELEMENT_MAX_TOKENS,
-            timeout=max(6.0, min(ELEMENT_TIMEOUT_S,
-                                 (deadline - monotonic()) - ELEMENT_MIN_SECONDS + 40.0)))
-        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I | re.M)
-        parsed = json.loads(raw)
-    except Exception:
-        return elements[:ELEMENT_MAX]
-    if isinstance(parsed, dict):
-        for value in parsed.values():
-            if isinstance(value, list):
-                parsed = value
-                break
-    if isinstance(parsed, list):
-        for item in parsed:
-            text = " ".join(str(item).split())
-            if len(text) < 8 or (len(_element_keys(text)) < 2 and not _element_hard_keys(text)):
-                continue
-            if not any(text.lower() == e.lower() for e in elements):
-                elements.append(text)
-    return elements[:ELEMENT_MAX]
-
-def _coverage_order(missing: list[str]) -> str:
-    """The order that sends the loop back to retrieval for uncovered elements."""
-    return (
-        "COVERAGE (entity): research is NOT complete. Nothing you have gathered carries "
-        "these required elements:\n- " + "\n- ".join(missing[:ELEMENT_MAX]) +
-        "\nSearch or fetch for these specifically now -- query each by its own "
-        "name, not the question as a whole. If one genuinely does not exist, say "
-        "so explicitly in the answer and cite what you checked. Then produce the "
-        "COMPLETE final answer with [n] citations in the required shape."
-    )
-
-def _coverage_steer(missing: list[str]) -> str:
-    return (
-        "COVERAGE CHECK (entity): the evidence gathered so far does not yet carry:\n- " +
-        "\n- ".join(missing[:ELEMENT_MAX]) +
-        "\nBefore finishing, direct at least one search or fetch at each of these."
-    )
+    return (answer or held), messages
 
 
 async def _audit_patch(question: str, answer: str, messages: list[dict],
@@ -3096,7 +3127,7 @@ def _cap(text: str) -> str:
     return t
 
 
-async def _base_agent_query(query: Query) -> Response:
+async def _w4_baseline_query(query: Query) -> Response:
     question = (query.text or "").strip()
     if not question:
         return Response(text="No question provided.")
@@ -3155,10 +3186,520 @@ def _select_best(draft: str, patched: str) -> str:
     return draft
 
 
+# ---- v260-10-ksvu ----
+# Stages: coverage nudge, set gap-fill, value repair, unit repair
+# Ordinary successful path:
+#   query -> _solve -> _knowledge_brief -> _loop (+_open_criteria_hint) -> _audit_patch -> _widen_pool -> _ground_figures -> _conform_measures -> _citations_for -> _answer_line_only -> Response
+
+_MARKER_STRIP_RE = re.compile(r"\[[0-9][0-9,\s\-]*\]")
+_NUMERIC_TOKEN_RE = re.compile(r"\d[\d,]*(?:\.\d+)?%?")
+
+
+def _strip_markers(text: str) -> str:
+    return _MARKER_STRIP_RE.sub(" ", text or "")
+
+
+def _norm_num(token: str) -> str:
+    value = (token or "").replace(",", "").rstrip("%")
+    if "." in value:
+        value = value.rstrip("0").rstrip(".")
+    return value or "0"
+
+
+PROBE_CHARS = 180
+MIN_ASK_MATCH_TERMS = 3
+MIN_ROW_BODY_CHARS = 200
+_ASK_CUE_RE = re.compile(
+    r"\b(which|what|who|whom|whose|when|where|how many|how much|name the|"
+    r"list (?:all|the|every|each)|identify|give the)\b", re.I)
+_SENT_SPLIT_RE = re.compile(r"(?<=[.?!])\s+")
+
+
+def _ask_clause(question: str) -> str:
+    """The clause that actually asks something.
+
+    These questions characteristically OPEN with premise decoration -- a
+    sentence or two about entities that are not the pool -- and put the ask
+    last. Slicing question[:N] therefore probes the decoration. Measured on a
+    live run: the roster pre-pass searched "Walt Disney Studios distributed
+    family movies like A Tiger Walks (1964) ... present in t complete list of
+    all" and filled the ledger with Disney filmographies instead of the
+    distributor table the question asked for.
+    """
+    text = " ".join((question or "").split())
+    if not text:
+        return ""
+    sentences = [s for s in _SENT_SPLIT_RE.split(text) if s.strip()]
+    if not sentences:
+        return text
+    ask = ""
+    for sentence in sentences:
+        if _ASK_CUE_RE.search(sentence):
+            ask = sentence
+    return ask or sentences[-1]
+
+
+def _probe_from(question: str, suffix: str = "", limit: int = PROBE_CHARS) -> str:
+    """Search probe built from the ask, clipped on a WORD boundary.
+
+    The shipped version cut mid-word ("present in t"), which turns the final
+    token into noise the search engine still weighs.
+    """
+    ask = _ASK_CUE_RE.sub(" ", _ask_clause(question))
+    words: list = []
+    for word in ask.split():
+        if len(" ".join(words + [word])) > limit:
+            break
+        words.append(word)
+    probe = " ".join(words).strip()
+    if suffix:
+        probe = (probe + " " + suffix).strip()
+    return probe
+
+
+def _ask_terms(question: str) -> set:
+    return {t for t in _key_terms(_ask_clause(question)) if len(t) >= 4}
+
+
+def _rows_match_ask(rows, question: str) -> bool:
+    """Do retrieved rows actually speak to the ask?
+
+    A pre-pass commits its rows to the ledger, and the deterministic floor
+    cites whatever the ledger holds -- so an off-target search does not merely
+    waste a call, it MANUFACTURES the citations a failed run ships. One live
+    run cited a page whose entire content was "Direct access to this page is
+    temporarily disabled". Checking before the commit keeps it out entirely.
+    """
+    terms = _ask_terms(question)
+    if len(terms) < MIN_ASK_MATCH_TERMS:
+        return True
+    for row in rows or ():
+        body = (row.get("text") or "") or (row.get("preview") or "")
+        # A stub page states nothing whatever its title says. The page that
+        # polluted the live run was titled "Associated Film Distributors Movies
+        # Index" -- two ask terms for free -- above a body reading only
+        # "Direct access to this page is temporarily disabled". Title overlap
+        # is what the search engine already matched on; it is not evidence.
+        if len(body) < MIN_ROW_BODY_CHARS:
+            continue
+        blob = ((row.get("title") or "") + " " + body[:4000]).lower()
+        hits = 0
+        for term in terms:
+            if term in blob:
+                hits += 1
+                if hits >= MIN_ASK_MATCH_TERMS:
+                    return True
+    return False
+
+
+SWEEP_TURNS = 2
+SWEEP_MIN_RATIO = 0.6
+SWEEP_MIN_USD = 0.02
+SWEEP_EVIDENCE_CHARS = 7000
+SWEEP_ANSWER_CHARS = 6000
+STAGE_FACT_KEEP_PCT = 70
+_STAGE_NAME_RE = re.compile(
+    r"[A-Z][A-Za-z0-9&'\-]+(?:\s+[A-Z][A-Za-z0-9&'\-]+){1,3}")
+
+
+async def _stage_rewrite(question: str, answer: str, messages: list[dict],
+                         ledger: EvidenceLedger, deadline: float,
+                         order: str, probe: str) -> str:
+    """Shared tail for every post-audit stage.
+
+    One targeted search, one bounded re-invocation of the primary controller,
+    then an adoption guard. The transcript is copied rather than mutated, so a
+    stage that is not adopted leaves no trace for the stage behind it.
+    """
+    body = ""
+    if probe:
+        try:
+            out = await _do_search(probe, ledger)
+            body = _commit_tool_output(out, ledger)
+        except Exception:
+            body = ""
+    block = order
+    if body:
+        block = block + "\n\nNEW EVIDENCE:\n" + body[:SWEEP_EVIDENCE_CHARS]
+    block = block + "\n\nCURRENT ANSWER:\n" + answer[:SWEEP_ANSWER_CHARS]
+    carry = list(messages)
+    carry.append({"role": "system", "content": block})
+    try:
+        revised, _ = await _loop(question, "", ledger, deadline, SWEEP_TURNS,
+                                 carry=carry)
+    except Exception:
+        return answer
+    revised = revised.strip()
+    if not _is_usable_answer(revised):
+        return answer
+    if len(revised) < int(len(answer) * SWEEP_MIN_RATIO):
+        return answer
+    if not _stage_keeps_facts(answer, revised):
+        return answer
+    return revised
+
+
+def _stage_facts(text: str) -> set:
+    """Figures and capitalised names a revision must not silently drop."""
+    body = _strip_markers(text or "")
+    out = set()
+    for match in _NUMERIC_TOKEN_RE.finditer(body):
+        out.add("n:" + _norm_num(match.group(0)))
+    for match in _STAGE_NAME_RE.finditer(body):
+        out.add("e:" + " ".join(match.group(0).split()).lower())
+    return out
+
+
+def _stage_keeps_facts(draft: str, revision: str) -> bool:
+    """Self-contained adoption guard.
+
+    The v114 branch ships _unmakes_draft, the v52 branch does not. Depending on
+    it would make half the stage library silently branch-specific, so the guard
+    is defined here and behaves identically on both.
+    """
+    before = _stage_facts(draft)
+    if not before:
+        return True
+    after = _stage_facts(revision)
+    kept = len(before.intersection(after))
+    return kept * 100 >= len(before) * STAGE_FACT_KEEP_PCT
+
+
+# Split into SEPARATE conditions. The donor regex grabbed a 90-char window from
+# every boundary including "^", so criterion 1 was the question's own prefix,
+# cut mid-word ("certified annual re"). Any on-topic source then "supported" it
+# and the nudge never fired -- the stage was a no-op in 7 of 10 builds.
+# Bare "and" is deliberately not a split point: it would cut "2019 and 2022".
+_CLAUSE_SPLIT_RE = re.compile(
+    r"[;\n]|,\s+and\s+|\s+that\s+|\s+which\s+|\s+whose\s+|\s+with\s+|"
+    r"\s+and\s+also\s+|\s+but\s+", re.I)
+MAX_CRITERIA = 5
+MIN_CRITERION_CHARS = 9
+MAX_CRITERION_CHARS = 120
+NUDGE_AT_FRACTION = 0.5
+NUDGE_MIN_LEFT_S = 60.0
+
+
+def _extract_criteria(question: str) -> list:
+    """Split the question into the conditions an answer has to satisfy."""
+    text = " ".join((question or "").split())
+    out: list = []
+    seen: set = set()
+    for piece in _CLAUSE_SPLIT_RE.split(text):
+        clause = (piece or "").strip(" ,.?!")
+        if not clause:
+            continue
+        if len(clause) < MIN_CRITERION_CHARS or len(clause) > MAX_CRITERION_CHARS:
+            continue
+        key = clause.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(clause)
+        if len(out) >= MAX_CRITERIA:
+            break
+    return out
+
+
+def _criterion_has_support(criterion: str, ledger: EvidenceLedger) -> bool:
+    terms = [t for t in _key_terms(criterion) if len(t) >= 4]
+    if not terms:
+        return True
+    for row in ledger.rows:
+        blob = ((row.get("preview") or "") + " " + (row.get("title") or "")).lower()
+        if not blob.strip():
+            continue
+        hits = 0
+        for term in terms:
+            if term in blob:
+                hits += 1
+        if hits * 2 >= len(terms):
+            return True
+    return False
+
+
+def _open_criteria_hint(criteria: list[str], ledger: EvidenceLedger) -> str:
+    open_rows = [c for c in criteria if not _criterion_has_support(c, ledger)]
+    if not open_rows:
+        return ""
+    return ("COVERAGE CHECK (midpoint). Nothing gathered so far speaks to:\n- "
+            + "\n- ".join(open_rows[:MAX_CRITERIA])
+            + "\nSpend the next tool call on the weakest one. If a condition "
+            "genuinely cannot be evidenced, say so explicitly in the answer "
+            "rather than leaving it unaddressed.")
+
+
+WIDEN_POOL_MIN_LEFT_S = 95.0
+MIN_LISTED_MEMBERS = 3
+_ROSTER_ROW_RE = re.compile(r"(?m)^[ \t]*(?:[-*\u2022]|[(\[]?\d{1,2}[.)\]])\s+\S")
+_VAGUE_TAIL_RE = re.compile(
+    r"\b(?:among others|and others|and more|etc\.?|and so on|several others|"
+    r"a number of others|others include)\b", re.I)
+
+
+def _listed_member_count(answer: str) -> int:
+    return len(_ROSTER_ROW_RE.findall(answer or ""))
+
+
+def _roster_hunt_query(question: str) -> str:
+    return _probe_from(question, "full list every", 170)
+
+
+async def _widen_pool(question: str, answer: str, messages: list[dict],
+                      ledger: EvidenceLedger, deadline: float) -> str:
+    if (deadline - monotonic()) < WIDEN_POOL_MIN_LEFT_S:
+        return answer
+    if _spend_left() < SWEEP_MIN_USD:
+        return answer
+    if not _needs_set_completeness(question):
+        return answer
+    listed = _listed_member_count(answer)
+    vague = bool(_VAGUE_TAIL_RE.search(answer or ""))
+    if listed >= MIN_LISTED_MEMBERS and not vague:
+        return answer
+    if vague:
+        why = ("the answer trails off into an open-ended phrase instead of "
+               "naming the rest of the pool")
+    else:
+        why = ("the answer enumerates only " + str(listed) + " member(s), which "
+               "is short for a set question")
+    order = ("SET COMPLETENESS. This question asks for a complete set and "
+             + why + ". Find the authoritative list or table that enumerates "
+             "the WHOLE pool -- query it as a list, not one member at a time -- "
+             "check every member against every condition, then rewrite the "
+             "COMPLETE answer with [n] citations. Naming a member you cannot "
+             "evidence is worse than naming fewer.")
+    return await _stage_rewrite(question, answer, messages, ledger, deadline,
+                                order, _roster_hunt_query(question))
+
+
+GROUND_FIGURES_MIN_LEFT_S = 90.0
+MAX_FLAGGED_FIGURES = 3
+MIN_FIGURE_CHARS = 2
+
+
+def _asserted_figures(answer: str) -> list[str]:
+    body = _strip_markers(answer)
+    out: list[str] = []
+    seen: set[str] = set()
+    for match in _NUMERIC_TOKEN_RE.finditer(body):
+        token = match.group(0)
+        if len(token) < MIN_FIGURE_CHARS:
+            continue
+        key = _norm_num(token)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(token)
+    return out
+
+
+def _figure_in_sources(token: str, ledger: EvidenceLedger) -> int:
+    key = _norm_num(token)
+    backers = 0
+    for row in ledger.rows:
+        text = row.get("text") or ""
+        if not text:
+            continue
+        if token in text or key in text.replace(",", ""):
+            backers += 1
+    return backers
+
+
+def _ungrounded_figures(answer: str, ledger: EvidenceLedger) -> list[str]:
+    """Figures with zero backers. Corroboration owns exactly-one."""
+    out: list[str] = []
+    for token in _asserted_figures(answer):
+        if _figure_in_sources(token, ledger) == 0:
+            out.append(token)
+        if len(out) >= MAX_FLAGGED_FIGURES:
+            break
+    return out
+
+
+async def _ground_figures(question: str, answer: str, messages: list[dict],
+                          ledger: EvidenceLedger, deadline: float) -> str:
+    if (deadline - monotonic()) < GROUND_FIGURES_MIN_LEFT_S:
+        return answer
+    if _spend_left() < SWEEP_MIN_USD:
+        return answer
+    flagged = _ungrounded_figures(answer, ledger)
+    if not flagged:
+        return answer
+    order = ("VALUE GROUNDING. These figures appear in the answer but in no "
+             "gathered source: " + ", ".join(flagged)
+             + ".\nEXEMPTION: a figure you DERIVED -- a total, mean, share or "
+             "difference computed from cited values -- is legitimate and no "
+             "source will contain it. If one of the above is derived, keep it "
+             "and show the inputs with their [n] citations. Otherwise evidence "
+             "it or remove it. Rewrite the COMPLETE answer with [n] citations.")
+    return await _stage_rewrite(question, answer, messages, ledger, deadline,
+                                order,
+                                _probe_from(question, flagged[0], 130))
+
+
+CONFORM_MEASURES_MIN_LEFT_S = 70.0
+_MEASURE_ASK_RE = re.compile(
+    r"\bin\s+(usd|us dollars|dollars|eur|euros|gbp|pounds|yen|jpy|"
+    r"millions?|billions?|thousands?|kg|kilograms?|tonnes?|tons?|km|"
+    r"kilometres?|kilometers?|miles|metres?|meters?|percent|percentage|"
+    r"per capita|square kilometres?|square miles)\b", re.I)
+_MEASURE_GLYPH = {
+    "usd": "$", "us dollars": "$", "dollars": "$", "eur": "\u20ac",
+    "euros": "\u20ac", "gbp": "\u00a3", "pounds": "\u00a3",
+    "yen": "\u00a5", "jpy": "\u00a5", "percent": "%", "percentage": "%",
+}
+
+
+def _required_measure(question: str) -> str:
+    match = _MEASURE_ASK_RE.search(question or "")
+    if not match:
+        return ""
+    return match.group(1).lower()
+
+
+def _measure_present(answer: str, measure: str) -> bool:
+    body = (answer or "").lower()
+    if measure in body:
+        return True
+    glyph = _MEASURE_GLYPH.get(measure, "")
+    return bool(glyph) and glyph in (answer or "")
+
+
+async def _conform_measures(question: str, answer: str, messages: list[dict],
+                            ledger: EvidenceLedger, deadline: float) -> str:
+    """Runs LAST among the post-audit stages, always.
+
+    Every other stage rewrites the whole answer, so a unit annotation applied
+    before one of them is discarded by it. Six donor builds shipped this stage
+    ahead of a rewriting sweep; the gate below is the lowest in the chain so
+    that ordering cannot silently invert.
+    """
+    if (deadline - monotonic()) < CONFORM_MEASURES_MIN_LEFT_S:
+        return answer
+    if _spend_left() < SWEEP_MIN_USD:
+        return answer
+    measure = _required_measure(question)
+    if not measure:
+        return answer
+    if _measure_present(answer, measure):
+        return answer
+    order = ("MEASURE CONFORMANCE. The question asks for the result in "
+             + measure + " and the answer does not express it that way. State "
+             "every load-bearing figure in the requested unit, keeping the "
+             "source's own unit alongside it in parentheses where a conversion "
+             "was needed, and cite the row the original figure came from. "
+             "Rewrite the COMPLETE answer with [n] citations.")
+    return await _stage_rewrite(question, answer, messages, ledger, deadline,
+                                order,
+                                _probe_from(question, measure, 140))
+
+# ── temporal recheck: the year the question asks about, verified in evidence ──
+_TEMPORAL_YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
+_TEMPORAL_MAX_YEARS = 3
+_TEMPORAL_MIN_LEFT_S = 100.0
+_TEMPORAL_TAIL_RESERVE_S = 42.0
+_TEMPORAL_SCAN_CHARS = 400_000
+_TEMPORAL_KEEP_PCT = 60
+_TEMPORAL_MARK_RE = re.compile(r"\[[0-9][0-9,\s\-]*\]")
+_TEMPORAL_NUM_RE = re.compile(r"\d[\d,.]*")
+_TEMPORAL_NAME_RE = re.compile(r"[A-Z][A-Za-z0-9&'\u2019.\-]{2,}")
+
+
+def _temporal_years(question: str) -> list:
+    seen, years = set(), []
+    for match in _TEMPORAL_YEAR_RE.finditer(question or ""):
+        year = match.group(0)
+        if year not in seen:
+            seen.add(year)
+            years.append(year)
+    return years[:_TEMPORAL_MAX_YEARS]
+
+
+def _temporal_corpus(ledger) -> str:
+    parts, scanned = [], 0
+    for row in getattr(ledger, "rows", []) or []:
+        for field in ("text", "preview", "title"):
+            blob = row.get(field) or ""
+            if not blob:
+                continue
+            room = _TEMPORAL_SCAN_CHARS - scanned
+            if room <= 0:
+                return " ".join(parts)
+            parts.append(blob[:room])
+            scanned += min(len(blob), room)
+    return " ".join(parts)
+
+
+def _temporal_missing(question: str, ledger) -> list:
+    corpus = _temporal_corpus(ledger)
+    return [y for y in _temporal_years(question) if y not in corpus]
+
+
+def _temporal_facts(text: str) -> set:
+    body = _TEMPORAL_MARK_RE.sub(" ", text or "")
+    out = set()
+    for match in _TEMPORAL_NUM_RE.finditer(body):
+        out.add("n:" + match.group(0).replace(",", "").rstrip("."))
+    for match in _TEMPORAL_NAME_RE.finditer(body):
+        out.add("e:" + " ".join(match.group(0).split()).lower())
+    return out
+
+
+def _temporal_keeps_facts(draft: str, revision: str) -> bool:
+    before = _temporal_facts(draft)
+    if not before:
+        return True
+    kept = len(before & _temporal_facts(revision))
+    return kept * 100 >= len(before) * _TEMPORAL_KEEP_PCT
+
+
+async def _temporal_recheck(question: str, answer: str, messages: list,
+                            ledger, deadline: float) -> str:
+    """Re-enter research when a year the question is anchored to never made it
+    into the gathered evidence: the figure delivered may belong to a different
+    period than the one asked, which reads as wrong rather than incomplete."""
+    try:
+        if not messages or not _is_usable_answer(answer):
+            return answer
+        if (deadline - monotonic()) < _TEMPORAL_MIN_LEFT_S:
+            return answer
+        missing = _temporal_missing(question, ledger)
+        if not missing:
+            return answer
+        tail = " ".join(w for w in (question or "").split()
+                        if w.lower() not in ("the", "a", "an", "of", "for",
+                                             "and", "or", "to", "in", "on"))[:100]
+        for year in missing[:2]:
+            try:
+                await _do_search(year + " " + tail, ledger)
+            except Exception:
+                pass
+        listed = ", ".join(missing)
+        messages.append({"role": "system", "content": (
+            "TEMPORAL CHECK. The question is anchored to " + listed + ", and "
+            "nothing retrieved covers that period. Report the figure for the "
+            "year the question names, citing the row that dates it with [n]. "
+            "If the evidence still only covers another year, state plainly "
+            "which year your figure belongs to instead of presenting it as "
+            "the answer for the year asked. Then rewrite the COMPLETE final "
+            "answer with [n] citations.")})
+        patched, _ = await _loop(question, "", ledger,
+                                 deadline - _TEMPORAL_TAIL_RESERVE_S,
+                                 AUDIT_EXTRA_TURNS + 1, carry=messages,
+                                 allow_tools_in_wrapup=True)
+        patched = (patched or "").strip()
+        if not _is_usable_answer(patched):
+            return answer
+        if len(patched) < int(len(answer) * 0.6):
+            return answer
+        if not _temporal_keeps_facts(answer, patched):
+            return answer
+        return patched
+    except Exception:
+        return answer
+
 async def _solve(query: Query, question: str) -> Response:
-    _COVERAGE["reentries"] = 0
-    _COVERAGE["steered"] = False
-    _FAST["on"] = bool(getattr(query, "fast", False))
                                                                                 
                                                                                  
     _reset_run_state()
@@ -3178,17 +3719,23 @@ async def _solve(query: Query, question: str) -> Response:
         brief = ""
 
     ledger = EvidenceLedger()
-    # Resolve what must be gathered before gathering starts and hand it to the
-    # ledger; from here loop completion is decided by coverage of these elements.
-    if not _FAST["on"]:
-        try:
-            ledger.set_elements(await _required_elements(question, deadline))
-        except Exception:
-            pass
+    criteria: list = []
+    try:
+        criteria = _extract_criteria(question)
+    except Exception:
+        criteria = []
+    _COVELEM["elements"] = []
+    _COVELEM["reentries"] = 0
+    try:
+        if (deadline - monotonic()) > COVELEM_PLAN_MIN_SECONDS:
+            await _covelem_plan(question, deadline)
+    except Exception:
+        _COVELEM["elements"] = []
     answer = ""
     messages: list[dict] = []
     try:
-        answer, messages = await _loop(question, brief, ledger, deadline, MAX_TURNS)
+        answer, messages = await _loop(question, brief, ledger, deadline, MAX_TURNS,
+                    criteria=criteria)
     except Exception:
         answer = ""
 
@@ -3199,6 +3746,34 @@ async def _solve(query: Query, question: str) -> Response:
             answer = _select_best(answer, patched)
     except Exception:
         pass
+
+    # Post-audit repair chain. A PRIORITY RANKING, not a pipeline: the
+    # tail has room for roughly two firing stages, so position decides
+    # which repair the answer actually gets. Stages whose detector does
+    # not fire cost nothing. Order is fixed by the section 5 rules:
+    # scope before content, grounding and authority before
+    # corroboration, measures last.
+    if _is_usable_answer(answer):
+        try:
+            answer = await _widen_pool(question, answer, messages,
+                                       ledger, deadline)
+        except Exception:
+            pass
+        try:
+            answer = await _ground_figures(question, answer, messages,
+                                           ledger, deadline)
+        except Exception:
+            pass
+        try:
+            answer = await _conform_measures(question, answer, messages,
+                                             ledger, deadline)
+        except Exception:
+            pass
+        try:
+            answer = await _temporal_recheck(question, answer, messages,
+                                             ledger, deadline)
+        except Exception:
+            pass
 
                                                                          
     if not _is_usable_answer(answer) and ledger.rows:
@@ -3300,228 +3875,427 @@ async def _solve(query: Query, question: str) -> Response:
         return Response(text=text)
 
 
+# --- w4 answer-contract wrapper (begin) ---
+# The base artifact's `query` entrypoint is demoted to `_w4_baseline_query` and a
+# new `query` coordinates three stages: answer-contract planning, baseline
+# research, and contract verification with authority over the returned answer.
+# The only contract with the demoted base is the platform ABI (`Query`,
+# `Response`, `llm_chat`) plus NameError-guarded probes for optional base
+# constants.
+
+_W2_PLAN_TIMEOUT_SECONDS = 22.0
+_W2_VERIFY_TIMEOUT_SECONDS = 28.0
+_W2_REPAIR_TIMEOUT_SECONDS = 24.0
+_W2_TAIL_RESERVE_SECONDS = 8.0
+_W2_PLAN_TEMPERATURE = 0.1
+_W2_VERIFY_TEMPERATURE = 0.12
+_W2_MIN_REVISION_CHARS = 80
+_W2_MIN_REVISION_RATIO = 0.6
+_W2_MIN_ENTITY_CHARS = 3
+_W2_MAX_CONTRACT_ITEMS = 6
+_W2_DRAFT_PROMPT_CHARS = 6_000
+_W2_DEFAULT_BUDGET_SECONDS = 235.0
+
+_W2_LIST_MARKER_RE = re.compile(r"(?m)^[ \t]*[(\[]?\d{1,2}[.)\]][ \t]+")
+_W2_FIGURE_RE = re.compile(r"\d+(?:[.,]\d+)*")
+_W2_WORD_RE = re.compile(r"[A-Z][A-Za-z0-9&'’.\-]*")
+_W2_CLAUSE_HEAD_CHARS = ".!?:;#*->|•"
+
+_W2_PLAN_SYSTEM = (
+    "You plan the acceptance criteria for a research answer before the research runs.\n"
+    "Read the question and list what a complete, correct answer must contain.\n"
+    "Reply with JSON only, no prose, in this exact shape:\n"
+    '{"deliverable": "<one sentence naming what must be returned>", '
+    '"required": ["<concrete element the answer must state>", ...], '
+    '"pitfalls": ["<a specific way an answer to this question goes wrong>", ...]}\n'
+    "Give at most six `required` entries and at most three `pitfalls`. "
+    "Each entry must be concrete and checkable against a draft answer - name the "
+    "quantity, entity, unit, date range, or enumeration that must appear. "
+    "Never guess the answer itself; describe only what the answer must cover."
+)
+
+_W2_VERIFY_SYSTEM = (
+    "You audit a draft research answer against an answer contract and repair it.\n"
+    "The contract lists what the answer must contain. Check the draft against every "
+    "entry and return the corrected answer.\n"
+    "Rules:\n"
+    "- Repair only concrete, verifiable gaps: a required element the draft never "
+    "states, an internal contradiction, a requested unit or format the draft ignores.\n"
+    "- Use only facts already present in the draft. Never introduce a fact, figure, "
+    "name, or citation that the draft does not contain.\n"
+    "- Every figure, quantity, date, unit, name, and citation marker the draft states "
+    "stands as written. You may not drop one, round one, reword one, or swap one for a "
+    "different value or a different entity. Your edits may only add.\n"
+    "- The draft's own answer to the question is the answer. If you believe a different "
+    "entity or value fits the question better, say so in one added clause and leave the "
+    "draft's answer standing.\n"
+    "- If a required element is genuinely absent from the draft's evidence, say so "
+    "plainly in one clause rather than inventing it.\n"
+    "- Preserve the draft's wording wherever it already satisfies the contract.\n"
+    "- If the draft already satisfies the contract, return it unchanged.\n"
+    "Return the full corrected answer text and nothing else - no preamble, no notes, "
+    "no commentary about what you changed."
+)
+
+_W2_REPAIR_SYSTEM = (
+    "You convert a research answer into the exact JSON object a caller's schema "
+    "requires.\n"
+    "Use only facts stated in the answer text. Do not invent values. If the answer "
+    "does not supply a required field, use null for it.\n"
+    "Reply with a single JSON object and nothing else."
+)
 
 
-# ── gx: deterministic answer guards ───────────────────────────────────────────
-# Pure detectors (no LLM, no tools, no cost) plus ONE bounded no-tool repair whose
-# output is accepted only when provably non-destructive. Fails open everywhere.
-_GX_REPAIR_MIN_SECONDS = 34.0
-_GX_REPAIR_TIMEOUT_SECONDS = 26.0
-_GX_MIN_KEEP_RATIO = 0.85
-_GX_MAX_NOTES = 4
-_GX_MIN_ENTITY_CHARS = 4
-_GX_DRAFT_CHARS = 12000
+class _W2AnswerContract:
+    """The formal state object carried between the plan and verify stages."""
 
-_GX_FIG_RE = re.compile(r"\d[\d,]*(?:\.\d+)?%?")
-_GX_CITE_RE = re.compile(r"\[\d[\d,\s\-]*\]")
-_GX_SENT_RE = re.compile(r"[^.!?\n]+[.!?]|[^.!?\n]+$")
-_GX_SUPER_RE = re.compile(r"\b(?:most|least|highest|lowest|largest|smallest|greatest|"
-                          r"fewest|longest|shortest|best|worst|top|maximum|minimum)\b"
-                          r"|\b[a-z]{3,}est\b", re.IGNORECASE)
-_GX_SUPER_STOP = frozenset({"interest","latest","earliest","honest","modest","request",
-                            "suggest","invest","protest","harvest","forest","nearest",
-                            "rest","test","west","best"})
-_GX_YEAR_RE = re.compile(r"\b(1[89]\d{2}|20\d{2})\b")
-_GX_CAP_RE = re.compile(r"\b[A-Z][A-Za-z0-9&.\-]{2,}(?:\s+[A-Z][A-Za-z0-9&.\-]{2,}){0,3}\b")
-_GX_QSTOP = frozenset({"Which","What","Who","When","Where","How","Why","The","A","An",
-                       "For","From","In","On","Of","And","Or","As","At","By","To",
-                       "Answer","Give","List","Name","Using","According","Report",
-                       "Compare","Consider","Identify","Determine","Explain","State",
-                       "Find","Return","Provide","Between","Across","Both","Each",
-                       "Per","With","Within","Their","Its","This","That","These"})
-_GX_UNIT_RE = re.compile(r"\b(?:in|as)\s+(percent|percentage|per cent|dollars?|USD|EUR|GBP|"
-                         r"euros?|pounds?|yen|km|kilometres?|kilometers?|miles?|metres?|"
-                         r"meters?|tonnes?|tons?|kg|kilograms?|days?|weeks?|months?|years?|"
-                         r"hours?|minutes?)\b", re.IGNORECASE)
-_GX_UNIT_TOKENS = {"percent":("%","percent","per cent"),"percentage":("%","percent"),
-                   "per cent":("%","per cent","percent"),
-                   "dollar":("$","usd","dollar"),"dollars":("$","usd","dollar"),
-                   "usd":("$","usd"),"eur":("€","eur","euro"),"gbp":("£","gbp","pound"),
-                   "euro":("€","euro"),"euros":("€","euro"),"pound":("£","pound"),
-                   "pounds":("£","pound"),"yen":("¥","yen"),
-                   "km":("km","kilomet"),"kilometre":("km","kilomet"),"kilometres":("km","kilomet"),
-                   "kilometer":("km","kilomet"),"kilometers":("km","kilomet"),
-                   "mile":("mile",),"miles":("mile",),"metre":("m","metre"),"metres":("m","metre"),
-                   "meter":("m","meter"),"meters":("m","meter"),
-                   "tonne":("tonne","ton"),"tonnes":("tonne","ton"),"ton":("ton",),"tons":("ton",),
-                   "kg":("kg","kilogram"),"kilogram":("kg","kilogram"),"kilograms":("kg","kilogram"),
-                   "day":("day",),"days":("day",),"week":("week",),"weeks":("week",),
-                   "month":("month",),"months":("month",),"year":("year",),"years":("year",),
-                   "hour":("hour",),"hours":("hour",),"minute":("minute",),"minutes":("minute",)}
-# an explicit range separator, OR "between/from X and Y". A bare "2010 and 2020"
-# is a LIST, not a range, so "and" only counts behind between/from.
-_GX_RANGE_RE = re.compile(r"\b(1[89]\d{2}|20\d{2})\s*(?:-|–|—|to|through|until)\s*(1[89]\d{2}|20\d{2})\b")
-_GX_RANGE2_RE = re.compile(r"\b(?:between|from)\s+(1[89]\d{2}|20\d{2})\s+and\s+(1[89]\d{2}|20\d{2})\b",
-                           re.IGNORECASE)
+    def __init__(self, deliverable: str, required: list[str], pitfalls: list[str]) -> None:
+        self.deliverable = deliverable
+        self.required = required
+        self.pitfalls = pitfalls
+
+    def is_actionable(self) -> bool:
+        return bool(self.deliverable or self.required)
 
 
-def _gx_figures(text: str) -> set:
-    return {m.group(0).replace(",", "").rstrip("%") for m in _GX_FIG_RE.finditer(text or "")}
+def _w4_provider() -> str:
+    """Resolve the base's LLM provider without globals(); the validator rejects it."""
+    try:
+        return LLM_PROVIDER
+    except NameError:
+        return "openrouter"
 
 
-def _gx_markers(text: str) -> list:
-    return _GX_CITE_RE.findall(text or "")
+def _w4_model() -> str:
+    try:
+        return MODEL
+    except NameError:
+        return "z-ai/glm-5"
 
 
-def _gx_sentences(text: str) -> list:
-    return [s.strip() for s in _GX_SENT_RE.findall(text or "") if s.strip()]
+def _w4_total_budget_seconds() -> float:
+    try:
+        return float(TASK_TOTAL_BUDGET_SECONDS)
+    except (NameError, TypeError, ValueError):
+        return _W2_DEFAULT_BUDGET_SECONDS
 
 
-def _gx_uncited_claims(answer: str) -> list:
-    out = []
-    for s in _gx_sentences(answer):
-        if _GX_CITE_RE.search(s):
+def _w4_remaining(deadline: float) -> float:
+    return deadline - perf_counter()
+
+
+async def _w4_chat(messages: list[dict[str, object]], *, timeout: float, temperature: float) -> str:
+    """One bounded LLM call on the platform ABI; empty string on any failure."""
+    if timeout <= 0:
+        return ""
+    try:
+        result = await llm_chat(
+            provider=_w4_provider(), model=_w4_model(), messages=messages,
+            temperature=temperature, timeout=timeout,
+        )
+    except Exception:
+        return ""
+    try:
+        return (result.response.raw_text or "").strip()
+    except Exception:
+        return ""
+
+
+def _w4_json_object(text: str) -> dict | None:
+    """Tolerant extraction of the first JSON object in a model reply."""
+    if not text:
+        return None
+    body = text.strip()
+    if body.startswith("```"):
+        body = body.split("```")[1] if "```" in body[3:] else body[3:]
+        if body[:4].lower().startswith("json"):
+            body = body[4:]
+    start = body.find("{")
+    end = body.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        parsed = json.loads(body[start:end + 1])
+    except (ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _w4_string_list(value: object, limit: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items = []
+    for entry in value:
+        if isinstance(entry, str) and entry.strip():
+            items.append(entry.strip())
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _w4_schema_hint(schema: object) -> str:
+    """Render the caller's output schema for the planning prompt."""
+    if schema is None:
+        return ""
+    try:
+        rendered = json.dumps(schema, ensure_ascii=False)[:1_200]
+    except (TypeError, ValueError):
+        return ""
+    return f"\n\nThe answer will be returned against this output schema:\n{rendered}"
+
+
+async def _w4_build_answer_contract(
+    question: str, schema: object, *, deadline: float,
+) -> _W2AnswerContract | None:
+    """Stage 1 - plan the acceptance criteria before the baseline research runs."""
+    timeout = min(_W2_PLAN_TIMEOUT_SECONDS, _w4_remaining(deadline) - _W2_TAIL_RESERVE_SECONDS)
+    messages = [
+        {"role": "system", "content": _W2_PLAN_SYSTEM},
+        {"role": "user", "content": f"Question:\n{question}{_w4_schema_hint(schema)}"},
+    ]
+    payload = _w4_json_object(await _w4_chat(
+        messages, timeout=timeout, temperature=_W2_PLAN_TEMPERATURE,
+    ))
+    if payload is None:
+        return None
+    deliverable = payload.get("deliverable")
+    contract = _W2AnswerContract(
+        deliverable=deliverable.strip() if isinstance(deliverable, str) else "",
+        required=_w4_string_list(payload.get("required"), _W2_MAX_CONTRACT_ITEMS),
+        pitfalls=_w4_string_list(payload.get("pitfalls"), 3),
+    )
+    return contract if contract.is_actionable() else None
+
+
+def _w4_contract_block(contract: _W2AnswerContract) -> str:
+    """Render the contract as the audit checklist handed to the verify stage."""
+    lines = []
+    if contract.deliverable:
+        lines.append(f"Deliverable: {contract.deliverable}")
+    if contract.required:
+        lines.append("The answer must state:")
+        lines.extend(f"  - {item}" for item in contract.required)
+    if contract.pitfalls:
+        lines.append("Known ways this question is answered badly:")
+        lines.extend(f"  - {item}" for item in contract.pitfalls)
+    return "\n".join(lines)
+
+
+def _w4_response_text(response: object) -> str:
+    try:
+        text = getattr(response, "text", None)
+    except Exception:
+        return ""
+    return text.strip() if isinstance(text, str) else ""
+
+
+def _w4_with_text(response: object, text: str) -> object:
+    """Rebuild the response around the audited answer, carrying citations over.
+
+    The platform accepts exactly one non-null answer field, so a response that
+    already carries a structured `output` owns no text answer to override and is
+    returned untouched.
+    """
+    if getattr(response, "output", None) is not None:
+        return response
+    citations = getattr(response, "citations", None)
+    try:
+        if citations:
+            return Response(text=text, citations=citations)
+        return Response(text=text)
+    except Exception:
+        return response
+
+
+def _w4_normalize_figure(token: str) -> str:
+    """One numeric literal reduced to the value it states, not how it is typed."""
+    value = token.replace(",", "")
+    if "." in value:
+        value = value.rstrip("0").rstrip(".")
+    return value or "0"
+
+
+def _w4_figures(text: str) -> set:
+    """Every quantity the text asserts, less the ordinals that only number a list."""
+    body = _W2_LIST_MARKER_RE.sub(" ", text)
+    found = set()
+    for match in _W2_FIGURE_RE.finditer(body):
+        found.add(_w4_normalize_figure(match.group(0)))
+    return found
+
+
+def _w4_entities(text: str) -> set:
+    """Every named token the text asserts.
+
+    A capitalized word that opens a sentence, a heading, or a bullet is
+    capitalized by position rather than by being a name, so it is not counted;
+    a real name almost always also occurs somewhere it did not open a clause.
+    """
+    found = set()
+    for match in _W2_WORD_RE.finditer(text):
+        cursor = match.start() - 1
+        while cursor >= 0 and text[cursor] in " \t":
+            cursor -= 1
+        if cursor < 0 or text[cursor] == "\n" or text[cursor] in _W2_CLAUSE_HEAD_CHARS:
             continue
-        if _GX_FIG_RE.search(s) or _GX_YEAR_RE.search(s):
-            out.append(s[:160])
-    return out
+        word = match.group(0).strip(".-'’").lower()
+        if len(word) >= _W2_MIN_ENTITY_CHARS:
+            found.add(word)
+    return found
 
 
-def _gx_has_superlative(question: str) -> bool:
-    for m in _GX_SUPER_RE.finditer(question or ""):
-        if m.group(0).lower() not in _GX_SUPER_STOP:
+def _w4_unmakes_draft(draft: str, revision: str) -> bool:
+    """True when the revision fails to carry forward something the draft asserted."""
+    if not _w4_figures(draft).issubset(_w4_figures(revision)):
+        return True
+    return not _w4_entities(draft).issubset(_w4_entities(revision))
+
+
+def _w4_accept_revision(draft: str, revision: str) -> bool:
+    """Keep the audited answer only when it adds to the draft without unmaking it.
+
+    Length cannot tell a repair from a replacement: a revision that answers with
+    a different entity, or restates a figure as a different figure, is exactly as
+    long as one that fills a gap. The audited text is therefore accepted only
+    when every concrete claim the draft asserted - each quantity, each named
+    token - still stands in it. Additions are free; deletions and substitutions
+    return the draft.
+    """
+    if not revision or revision == draft:
+        return False
+    if len(revision) < _W2_MIN_REVISION_CHARS:
+        return False
+    if len(revision) < len(draft) * _W2_MIN_REVISION_RATIO:
+        return False
+    return not _w4_unmakes_draft(draft, revision)
+
+
+async def _w4_verify_against_contract(
+    contract: _W2AnswerContract, question: str, draft: str, *, deadline: float,
+) -> str:
+    """Stage 3 - audit the draft against the contract and return the answer to deliver."""
+    timeout = min(_W2_VERIFY_TIMEOUT_SECONDS, _w4_remaining(deadline) - _W2_TAIL_RESERVE_SECONDS)
+    messages = [
+        {"role": "system", "content": _W2_VERIFY_SYSTEM},
+        {
+            "role": "user",
+            "content": (
+                f"Question:\n{question}\n\nAnswer contract:\n{_w4_contract_block(contract)}"
+                f"\n\nDraft answer:\n{draft[:_W2_DRAFT_PROMPT_CHARS]}"
+            ),
+        },
+    ]
+    revision = await _w4_chat(messages, timeout=timeout, temperature=_W2_VERIFY_TEMPERATURE)
+    return revision if _w4_accept_revision(draft, revision) else draft
+
+
+def _w4_schema_property_names(schema: object) -> list[str]:
+    if not isinstance(schema, dict):
+        return []
+    properties = schema.get("properties")
+    return [key for key in properties] if isinstance(properties, dict) else []
+
+
+def _w4_is_degenerate_output(output: object, schema: object) -> bool:
+    """True when the base produced a structured payload the scorer will read as empty."""
+    if output is None:
+        return True
+    if isinstance(output, (str, list, tuple, dict)) and len(output) == 0:
+        return True
+    if isinstance(output, dict):
+        names = _w4_schema_property_names(schema)
+        if names and not any(key in output for key in names):
+            return True
+        if all(value in (None, "", [], {}) for value in output.values()):
             return True
     return False
 
 
-def _gx_comparison_shown(answer: str) -> bool:
-    if len(_gx_figures(answer)) >= 2:
-        return True
-    low = (answer or "").lower()
-    return any(k in low for k in ("second","runner-up","next highest","next largest",
-                                  "compared with","compared to","versus"," vs ",
-                                  "other candidates","the remaining"))
-
-
-def _gx_asked_entities(question: str) -> set:
-    out = set()
-    for m in _GX_CAP_RE.finditer(question or ""):
-        toks = m.group(0).split()
-        while toks and toks[0] in _GX_QSTOP:
-            toks.pop(0)
-        while toks and toks[-1] in _GX_QSTOP:
-            toks.pop()
-        if not toks:
-            continue
-        name = " ".join(toks)
-        if len(toks) < 2 or len(name) < _GX_MIN_ENTITY_CHARS:
-            continue
-        out.add(name)
-    return out
-
-
-def _gx_missing_entities(question: str, answer: str) -> list:
-    a = (answer or "").lower()
-    return [e for e in sorted(_gx_asked_entities(question)) if e.lower() not in a][:_GX_MAX_NOTES]
-
-
-def _gx_missing_units(question: str, answer: str) -> list:
-    """The question demands an explicit unit the answer never renders."""
-    a = (answer or "").lower()
-    out = []
-    for m in _GX_UNIT_RE.finditer(question or ""):
-        unit = m.group(1).lower()
-        toks = _GX_UNIT_TOKENS.get(unit)
-        if not toks:
-            continue
-        if not any(t in a for t in toks):
-            out.append(unit)
-    return sorted(set(out))[:_GX_MAX_NOTES]
-
-
-def _gx_out_of_window(question: str, answer: str) -> list:
-    """The question fixes a year range; the answer asserts years outside it."""
-    m = _GX_RANGE_RE.search(question or "") or _GX_RANGE2_RE.search(question or "")
-    if not m:
-        return []
-    lo, hi = sorted((int(m.group(1)), int(m.group(2))))
-    bad = sorted({y for y in (int(x) for x in _GX_YEAR_RE.findall(answer or ""))
-                  if y < lo or y > hi})
-    return [str(y) for y in bad][:_GX_MAX_NOTES]
-
-
-def _gx_accept(draft: str, revision: str) -> bool:
-    if not revision or not revision.strip():
-        return False
-    r = revision.strip()
-    if len(r) < _GX_MIN_KEEP_RATIO * len(draft.strip()):
-        return False
-    if not _gx_figures(draft) <= _gx_figures(r):
-        return False
-    if len(_gx_markers(r)) < len(_gx_markers(draft)):
-        return False
-    low = r[:160].lower()
-    return not any(low.startswith(b) for b in
-                   ("i cannot","i'm unable","as an ai","the draft","no changes"))
-
-
-_GX_SYSTEM = (
-    "You repair a research answer against a list of concrete defects.\n"
-    "Rules:\n"
-    "- Fix ONLY the listed defects. Change nothing else.\n"
-    "- Use ONLY facts already present in the draft. Never introduce a figure, "
-    "name, date or citation the draft does not contain.\n"
-    "- Every figure, date, name and [n] marker in the draft must survive verbatim. "
-    "Your edits may only ADD.\n"
-    "- If a defect cannot be fixed from the draft's own content, say so in one "
-    "short clause rather than inventing anything.\n"
-    "- Keep the answer's existing shape and opening. Plain prose, no preamble.\n"
-    "Return the full corrected answer and nothing else."
-)
-
-
-async def _gx_repair(question: str, answer: str, deadline: float) -> str:
+async def _w4_repair_structured_output(
+    question: str, schema: object, response: object, *, deadline: float,
+) -> object:
+    """Repair-only ladder: a working structured payload is always returned untouched."""
+    output = getattr(response, "output", None)
+    if not _w4_is_degenerate_output(output, schema):
+        return response
+    draft = _w4_response_text(response)
+    recovered = _w4_json_object(draft)
+    if recovered is None:
+        timeout = min(_W2_REPAIR_TIMEOUT_SECONDS, _w4_remaining(deadline) - 2.0)
+        try:
+            rendered = json.dumps(schema, ensure_ascii=False)[:1_500]
+        except (TypeError, ValueError):
+            rendered = ""
+        messages = [
+            {"role": "system", "content": _W2_REPAIR_SYSTEM},
+            {
+                "role": "user",
+                "content": (
+                    f"Question:\n{question}\n\nOutput schema:\n{rendered}"
+                    f"\n\nAnswer text:\n{draft[:_W2_DRAFT_PROMPT_CHARS]}"
+                ),
+            },
+        ]
+        recovered = _w4_json_object(await _w4_chat(messages, timeout=timeout, temperature=0.0))
+    if recovered is None or _w4_is_degenerate_output(recovered, schema):
+        return response
+    citations = getattr(response, "citations", None)
     try:
-        notes = _gx_defects(question, answer)
-        if not notes:
-            return answer
-        left = deadline - monotonic()
-        if left < _GX_REPAIR_MIN_SECONDS:
-            return answer
-        timeout = min(_GX_REPAIR_TIMEOUT_SECONDS, left - MIN_TAIL_S)
-        if timeout < 10.0:
-            return answer
-        user = (f"Question:\n{question[:2500]}\n\nDefects to fix:\n"
-                + "\n".join(f"- {n}" for n in notes)
-                + f"\n\nDraft answer:\n{answer[:_GX_DRAFT_CHARS]}")
-        revision = await _chat_simple(LLM_LANE_A, AUDIT_MODEL, _GX_SYSTEM, user,
-                                      max_tokens=2600, timeout=timeout)
-        return revision.strip() if _gx_accept(answer, revision or "") else answer
+        if citations:
+            return Response(output=recovered, citations=citations)
+        return Response(output=recovered)
     except Exception:
-        return answer
-# ── end gx guards ─────────────────────────────────────────────────────────────
+        return response
 
 
-def _gx_defects(question: str, answer: str) -> list:
-    notes = []
-    if not answer or not answer.strip():
-        return notes
-    miss = _gx_missing_entities(question, answer)
-    if miss:
-        notes.append("The question names these but the answer never mentions them: "
-                     + ", ".join(miss))
-    return notes[:_GX_MAX_NOTES]
+async def _w4_research_or_salvage(query_input: Query) -> Response:
+    """Stage 2 - the research stage, held so no failure inside it can escape.
+
+    The demoted base entrypoint is foreign code: it raises whatever its own tool
+    layer raises. A hosted tool call that overruns its own `timeout=` surfaces as
+    `harnyx_commons.errors.ToolInvocationTimeoutError`, which subclasses
+    RuntimeError directly and matches no guard the base installed for itself. Any
+    such escape leaves `@entrypoint`, and the platform charges an escaping
+    exception to the miner as MINER_UNHANDLED_EXCEPTION: the task scores 0 with
+    no retry. Measured on `FB_526bfbe6_w2`, 1 of 3 replays (2026-08-09).
+
+    The stage therefore always resolves to a Response the later stages can work
+    on. A floor answer scores poorly; an escape scores zero and takes the whole
+    task with it.
+    """
+    try:
+        return await _w4_baseline_query(query_input)
+    except Exception:
+        return Response(text="No verifiable source-backed answer was reached for this question.")
 
 
 @entrypoint("query")
 async def query(query: Query) -> Response:
-    deadline = monotonic() + WALL_BUDGET_S
-    response = await _base_agent_query(query)
-    # guards run on TEXT answers only: a structured payload has already been
-    # schema-coerced by the base and must not be rewritten by a prose repair.
-    try:
-        if getattr(query, "output_schema", None) is None:
-            drafted = getattr(response, "text", None)
-            if isinstance(drafted, str) and drafted.strip():
-                fixed = await _gx_repair(getattr(query, "text", "") or "", drafted, deadline)
-                if fixed and fixed != drafted:
-                    try:
-                        return Response(text=fixed, citations=getattr(response, "citations", None))
-                    except Exception:
-                        return Response(text=fixed)
-    except Exception:
-        pass
-    return response
+    """w4 contract wrapper: plan the answer contract, run the baseline, then verify.
 
-VERSION = "c3-402"
-_GX_ACTIVE = ('entity',)
+    The baseline artifact's own entrypoint is demoted to `_w4_baseline_query` and
+    runs as the research stage of this sequence. Contract planning runs on every
+    ordinary request before the research starts, and the verification stage holds
+    authority over the answer this entrypoint returns.
+    """
+    deadline = perf_counter() + _w4_total_budget_seconds()
+    question = getattr(query, "text", "") or ""
+    schema = getattr(query, "output_schema", None)
+
+    contract = await _w4_build_answer_contract(question, schema, deadline=deadline)
+    response = await _w4_research_or_salvage(query)
+
+    if contract is not None:
+        draft = _w4_response_text(response)
+        if draft:
+            audited = await _w4_verify_against_contract(
+                contract, question, draft, deadline=deadline,
+            )
+            if audited != draft:
+                response = _w4_with_text(response, audited)
+    if schema is not None:
+        response = await _w4_repair_structured_output(
+            question, schema, response, deadline=deadline,
+        )
+    return response
+# --- w4 answer-contract wrapper (end) ---
