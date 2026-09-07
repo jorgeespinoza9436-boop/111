@@ -1,6 +1,6 @@
 
 from __future__ import annotations
-# fork of 8_uid_238_score_0.575.py: added cov:temporal:finish + k2 (variant u238)
+# fork of 8_uid_190_score_0.750.py: added k2  (full mechanism set: K2)
 
 import asyncio
 import json
@@ -21,27 +21,6 @@ LLM_LANE_B = "openrouter"   # was openrouter: no credential on our miners
 LOOP_MODEL_A = "z-ai/glm-5.2"
 LOOP_MODEL_B = "z-ai/glm-5.2"   # openrouter-served, verified
 AUDIT_MODEL = "z-ai/glm-5.2"              
-# --- element-coverage controller [u238-cov-temporal-finish: temporal-window coverage, finish-gate re-entry] --------
-# The inherited controller finishes when the MODEL stops calling tools or when
-# turns/time/spend run out; nothing checks whether the question's required
-# evidence was gathered. Here the question's required elements (temporal) are
-# resolved BEFORE research, carried on the ledger, and element coverage -- not
-# the model's choice to stop -- decides when research is complete. When
-# coverage is incomplete and budget remains, the loop re-enters retrieval aimed
-# at the uncovered elements and the answer is produced again afterwards.
-ELEMENT_MAX = 8
-ELEMENT_MODEL = AUDIT_MODEL
-ELEMENT_TIMEOUT_S = 20.0
-ELEMENT_MAX_TOKENS = 400
-ELEMENT_MIN_SECONDS = 150.0
-ELEMENT_COVER_RATIO = 0.6
-COVERAGE_MAX_REENTRIES = 2
-COVERAGE_MIN_SECONDS = 75.0
-COVERAGE_MIN_USD = 0.04
-COVERAGE_STEER_TURN = 4
-COVERAGE_PREDICATE = "temporal"
-_COVERAGE = {"reentries": 0, "steered": False}
-_FAST = {"on": False}
 SCHEMA_MODEL = "z-ai/glm-5.2"             
 RESORT_MODEL = "z-ai/glm-5.2"          
 SEARCH_PROVIDER = "parallel"                                       
@@ -69,21 +48,22 @@ FETCH_TIMEOUT_S = 16.0
 WRAPUP_AT_S = 90.0                                                                                       
                                                                                 
                                                                                 
-AUDIT_EXTRA_TURNS = 2
-ANSWER_REPAIR_TURNS = 2
-_LEDGER_TEXT_CAP = 400_000
 MIN_TAIL_S = 8.0
+AUDIT_EXTRA_TURNS = 2
+ANSWER_REPAIR_TURNS = 2                                                                             
+RESCUE_TIMEOUT_S = 55.0
+MAX_TURNS = 15                                                                              
+DIGEST_TAIL_S = 14.0                                                                      
+
 PAGE_GREP_WINDOW = 700
 PAGE_GREP_MAX_HITS = 6
-MAX_TURNS = 15
-PAGE_READ_MAX_CHARS = 12_000
+_LEDGER_TEXT_CAP = 400_000                                                        
+PAGE_READ_MAX_CHARS = 12_000                                                                                
 SEARCH_EXCERPT_CHARS = 550
-DIGEST_TAIL_S = 14.0
-RESCUE_TIMEOUT_S = 55.0
-                                                                               
-RETAIN_MARGIN_CHARS = 260                                                   
+
 RETAIN_MAX_PER_ROW = 6
-SHOWN_SPAN_MAX_CHARS = 2400                                                                                                               
+SHOWN_SPAN_MAX_CHARS = 2400                                                                                  
+RETAIN_MARGIN_CHARS = 260                                                   
 RETAIN_MIN_QUOTE = 12
                                                                               
                                                                               
@@ -610,90 +590,9 @@ SET_RULE = (
 )
 
 
-# --- required elements (temporal): the controller's completion criterion -------
-_ELEMTOK_STOP = (
-    "the", "and", "for", "its", "their", "both", "this", "that", "with", "from",
-    "full", "official", "quarterly", "each", "all", "new", "one", "page", "dated",
-    "list", "every", "must", "then", "into", "over", "under", "only", "same",
-    "record", "value", "member", "figure", "evidence",
-)
-_ELEM_SPLIT_RE = re.compile(r"[^A-Za-z0-9]+")
-
-_TIME_RE = re.compile(r"(?i)\b((?:fy|q[1-4]\s*)?(?:19|20)\d{2}(?:\s*[-\u2013/]\s*(?:19|20)?\d{2})?|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+(?:19|20)\d{2}|(?:as of|since|until|through|between|before|after|by)\s+(?:19|20)\d{2})\b")
-def _seed_elements(question: str) -> list[str]:
-    out: list[str] = []
-    for m in _TIME_RE.finditer(question or ""):
-        phrase = "evidence dated " + " ".join(m.group(1).split())
-        if any(phrase.lower() == p.lower() for p in out):
-            continue
-        out.append(phrase)
-        if len(out) >= 5:
-            break
-    return out
-
-def _element_keys(element: str) -> list[str]:
-    """The distinctive words of an element, deduplicated."""
-    keys: list[str] = []
-    for token in _ELEM_SPLIT_RE.split((element or "").lower()):
-        if len(token) >= 4 and token not in _ELEMTOK_STOP and token not in keys:
-            keys.append(token)
-    return keys[:6]
-
-def _element_hard_keys(element: str) -> list[str]:
-    """Tokens that MUST appear in a row for it to cover the element (temporal)."""
-    return [m.group(0) for m in re.finditer(r"(?:19|20)\d{2}", element or "")][:2]
-
 class EvidenceLedger:
     def __init__(self) -> None:
         self.rows: list[dict] = []                        
-        # Required evidence elements and which ledger rows carry each one. The
-        # controller consults this to decide completion: the ledger is the
-        # coverage state the loop terminates on, not only a record of fetches.
-        self.elements: list[str] = []
-        self.element_rows: dict[int, list[int]] = {}
-
-    def set_elements(self, elements: list[str]) -> None:
-        self.elements = [e for e in (elements or []) if str(e).strip()][:ELEMENT_MAX]
-        self.element_rows = {}
-        self.index_elements()
-
-    def index_elements(self) -> None:
-        """Recompute element -> row coverage. Deterministic, no model call."""
-        if not self.elements:
-            return
-        hay = []
-        for n, row in enumerate(self.rows, start=1):
-            blob = " ".join((
-                row.get("title") or "", row.get("url") or "",
-                row.get("preview") or "", row.get("text") or "",
-            )).lower()
-            hay.append((n, blob))
-        for i, element in enumerate(self.elements):
-            keys = _element_keys(element)
-            hard = _element_hard_keys(element)
-            if not keys and not hard:
-                continue
-            hits = []
-            for n, blob in hay:
-                if hard and not all(h.lower() in blob for h in hard):
-                    continue
-                found = 0
-                for key in keys:
-                    if key in blob:
-                        found += 1
-                if not keys or float(found) / float(len(keys)) >= ELEMENT_COVER_RATIO:
-                    hits.append(n)
-            self.element_rows[i] = hits
-
-    def uncovered_elements(self) -> list[str]:
-        """Elements no gathered row carries. The loop's completion criterion."""
-        if not self.elements:
-            return []
-        out = []
-        for i, element in enumerate(self.elements):
-            if not self.element_rows.get(i):
-                out.append(element)
-        return out
 
     def add(self, receipt_id: str, result_id: str, note_len: int,
             kind: str, spans: list[tuple[int, int]] | None,
@@ -1996,24 +1895,6 @@ async def _loop(question: str, brief: str, ledger: EvidenceLedger,
                 answer = ""                                                       
                 break
             answer = candidate
-            # COVERAGE GATE -- the controller's completion decision. The inherited
-            # loop finished here because the model stopped calling tools. Completion
-            # is now decided by whether the ledger carries every required element;
-            # when it does not and budget remains, the loop re-enters retrieval
-            # aimed at the missing elements and the answer is produced again.
-            ledger.index_elements()
-            missing = ledger.uncovered_elements()
-            if (missing
-                    and not _FAST["on"]
-                    and _COVERAGE["reentries"] < COVERAGE_MAX_REENTRIES
-                    and not finish_only
-                    and (deadline - monotonic()) > COVERAGE_MIN_SECONDS
-                    and _spend_left() >= COVERAGE_MIN_USD):
-                _COVERAGE["reentries"] = _COVERAGE["reentries"] + 1
-                messages.append({"role": "assistant", "content": answer})
-                messages.append({"role": "system", "content": _coverage_order(missing)})
-                answer = ""
-                continue
                                                                            
                                                                             
             messages.append({"role": "assistant", "content": answer})
@@ -2050,68 +1931,10 @@ async def _loop(question: str, brief: str, ledger: EvidenceLedger,
                                                                             
             body = _commit_tool_output(call_result[1], ledger)
             messages.append({"role": "tool", "tool_call_id": call.id, "content": body})
-        ledger.index_elements()
         for call in calls[8:]:
             messages.append({"role": "tool", "tool_call_id": call.id,
                              "content": "# skipped: per-turn tool budget reached — re-issue next turn if still needed"})
     return answer, messages
-
-async def _required_elements(question: str, deadline: float) -> list[str]:
-    """Resolve the question's required temporal elements BEFORE research.
-
-    These become the ledger's coverage keys and, through it, the condition the
-    research loop terminates on. Elements are seeded deterministically from the
-    question and completed with one small model call.
-    """
-    elements: list[str] = []
-    for phrase in _seed_elements(question):
-        if phrase and not any(phrase.lower() == e.lower() for e in elements):
-            elements.append(phrase)
-    if (deadline - monotonic()) < ELEMENT_MIN_SECONDS:
-        return elements[:ELEMENT_MAX]
-    probe = ("List the distinct TIME-ANCHORED evidence that must be GATHERED before this question can be answered: each year, quarter, fiscal period, date range, or as-of date the question fixes, with what must be found for it. One short noun phrase each that includes the year. JSON only: a list of strings, at most 6." + "\n\nQuestion:\n" + question[:4000])
-    try:
-        raw = await _chat_simple(
-            LLM_LANE_A, ELEMENT_MODEL,
-            "Deep-research planner. Name the evidence to gather. JSON list only.",
-            probe, max_tokens=ELEMENT_MAX_TOKENS,
-            timeout=max(6.0, min(ELEMENT_TIMEOUT_S,
-                                 (deadline - monotonic()) - ELEMENT_MIN_SECONDS + 40.0)))
-        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I | re.M)
-        parsed = json.loads(raw)
-    except Exception:
-        return elements[:ELEMENT_MAX]
-    if isinstance(parsed, dict):
-        for value in parsed.values():
-            if isinstance(value, list):
-                parsed = value
-                break
-    if isinstance(parsed, list):
-        for item in parsed:
-            text = " ".join(str(item).split())
-            if len(text) < 8 or (len(_element_keys(text)) < 2 and not _element_hard_keys(text)):
-                continue
-            if not any(text.lower() == e.lower() for e in elements):
-                elements.append(text)
-    return elements[:ELEMENT_MAX]
-
-def _coverage_order(missing: list[str]) -> str:
-    """The order that sends the loop back to retrieval for uncovered elements."""
-    return (
-        "COVERAGE (temporal): research is NOT complete. Nothing you have gathered carries "
-        "these required elements:\n- " + "\n- ".join(missing[:ELEMENT_MAX]) +
-        "\nSearch or fetch for these specifically now -- query each by its own "
-        "name, not the question as a whole. If one genuinely does not exist, say "
-        "so explicitly in the answer and cite what you checked. Then produce the "
-        "COMPLETE final answer with [n] citations in the required shape."
-    )
-
-def _coverage_steer(missing: list[str]) -> str:
-    return (
-        "COVERAGE CHECK (temporal): the evidence gathered so far does not yet carry:\n- " +
-        "\n- ".join(missing[:ELEMENT_MAX]) +
-        "\nBefore finishing, direct at least one search or fetch at each of these."
-    )
 
 
 async def _audit_patch(question: str, answer: str, messages: list[dict],
@@ -3146,12 +2969,11 @@ def _select_best(draft: str, patched: str) -> str:
 
 
 async def _solve(query: Query, question: str) -> Response:
-    _COVERAGE["reentries"] = 0
-    _COVERAGE["steered"] = False
-    _FAST["on"] = bool(getattr(query, "fast", False))
                                                                                 
                                                                                  
     _reset_run_state()
+    question = question.replace("\u2026", "...")
+    question = question.lstrip("\ufeff")
     deadline = monotonic() + WALL_BUDGET_S
     try:
         info = await tooling_info(timeout=10.0)
@@ -3168,13 +2990,6 @@ async def _solve(query: Query, question: str) -> Response:
         brief = ""
 
     ledger = EvidenceLedger()
-    # Resolve what must be gathered before gathering starts and hand it to the
-    # ledger; from here loop completion is decided by coverage of these elements.
-    if not _FAST["on"]:
-        try:
-            ledger.set_elements(await _required_elements(question, deadline))
-        except Exception:
-            pass
     answer = ""
     messages: list[dict] = []
     try:
@@ -3490,10 +3305,6 @@ def _gx_defects(question: str, answer: str) -> list:
         notes.append("The question asks for a superlative but the answer shows no "
                      "comparison set — name the runner-up and the figure that "
                      "separates it from the winner.")
-    miss = _gx_missing_entities(question, answer)
-    if miss:
-        notes.append("The question names these but the answer never mentions them: "
-                     + ", ".join(miss))
     return notes[:_GX_MAX_NOTES]
 
 
@@ -3516,11 +3327,11 @@ async def _k2_base_query(query: Query) -> Response:
         pass
     return response
 
-VERSION = "c3-409"
-_GX_ACTIVE = ('entity', 'super')
+VERSION = "c7-422"
+_GX_ACTIVE = ('super',)
 
 # ---------------------------------------------------------------------------
-# K2 claim-ledger cycle  [variant u238-k2]
+# K2 claim-ledger cycle  [variant u190-k2]
 #
 # Ordinary successful path after the baseline draft:
 #   draft -> claim-ledger audit -> (if required researched facts are missing,
@@ -3541,7 +3352,7 @@ _GX_ACTIVE = ('entity', 'super')
 from time import monotonic as _k2_monotonic
 from harnyx_miner_sdk.decorators import entrypoint as _k2_entrypoint
 from harnyx_miner_sdk.query import Query as _K2Query, Response as _K2Response
-_K2_SKIP_AFTER_S = 232.0
+_K2_SKIP_AFTER_S = 198.0
 _K2_AUDIT_MODEL = "z-ai/glm-5.2"
 _K2_REWRITE_MODEL = "z-ai/glm-5.2"
 _K2_LLM_PROVIDER = "openrouter"

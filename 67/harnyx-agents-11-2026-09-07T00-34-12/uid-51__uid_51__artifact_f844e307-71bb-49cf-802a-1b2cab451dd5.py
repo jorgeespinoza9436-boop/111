@@ -1,6 +1,5 @@
 
 from __future__ import annotations
-# fork of 4_uid_165_score_0.600.py: added k2 (variant u165)
 
 import asyncio
 import json
@@ -15,14 +14,14 @@ VERSION = "v52-pin-reviewed"
 
                                                                                 
 LLM_LANE_A = "openrouter"                                          
-LLM_LANE_B = "openrouter"   # was openrouter: no credential on our miners
+LLM_LANE_B = "openrouter"   # was ai_gateway: no credential on our miners
                                                                                
                                                                                   
 LOOP_MODEL_A = "z-ai/glm-5.2"
-LOOP_MODEL_B = "z-ai/glm-5.2"   # openrouter-served, verified
-AUDIT_MODEL = "z-ai/glm-5.2"              
-SCHEMA_MODEL = "z-ai/glm-5.2"             
-RESORT_MODEL = "z-ai/glm-5.2"          
+LOOP_MODEL_B = "deepseek/deepseek-v3.2"   # openrouter-served, verified
+AUDIT_MODEL = "openai/gpt-oss-120b"              
+SCHEMA_MODEL = "openai/gpt-oss-120b"             
+RESORT_MODEL = "deepseek/deepseek-v3.2"          
 SEARCH_PROVIDER = "parallel"                                       
                                                                                 
                                                                                   
@@ -30,7 +29,7 @@ SEARCH_PROVIDERS = ("parallel",)   # exa/tavily: no credential
 FETCH_PROVIDERS = ("parallel",)   # exa/firecrawl: no credential
 
                                                                                 
-WALL_BUDGET_S = 210.0                                                               
+WALL_BUDGET_S = 266.0                                                               
                                                                                   
                                                                                  
 BRIEF_TIMEOUT_S = 50.0                                                                           
@@ -49,22 +48,25 @@ WRAPUP_AT_S = 90.0
                                                                                 
                                                                                 
 MIN_TAIL_S = 8.0
-RESCUE_TIMEOUT_S = 55.0
-PAGE_GREP_WINDOW = 700
-PAGE_READ_MAX_CHARS = 12_000
-MAX_TURNS = 15    
-ANSWER_REPAIR_TURNS = 2  
-DIGEST_TAIL_S = 14.0   
-_LEDGER_TEXT_CAP = 400_000                                                                                  
-SEARCH_EXCERPT_CHARS = 550
+MAX_TURNS = 15                                                                              
 AUDIT_EXTRA_TURNS = 2
-                                                                  
+ANSWER_REPAIR_TURNS = 2                                                                             
+RESCUE_TIMEOUT_S = 55.0
+DIGEST_TAIL_S = 14.0                                                                      
+
+                                                                                
+SEARCH_EXCERPT_CHARS = 550
+_LEDGER_TEXT_CAP = 400_000                                                        
+PAGE_GREP_WINDOW = 700
 PAGE_GREP_MAX_HITS = 6
+PAGE_READ_MAX_CHARS = 12_000
+
                                                                                
+RETAIN_MARGIN_CHARS = 260                                                   
+RETAIN_MAX_PER_ROW = 6
 SHOWN_SPAN_MAX_CHARS = 2400                                                                                                               
 RETAIN_MIN_QUOTE = 12
-RETAIN_MARGIN_CHARS = 260                                                   
-RETAIN_MAX_PER_ROW = 6                                                                              
+                                                                              
                                                                               
 FETCH_HEAD_CHARS = 3000                                                          
 FETCH_WINDOW_CHARS = 3600                                                        
@@ -2971,6 +2973,9 @@ async def _solve(query: Query, question: str) -> Response:
                                                                                 
                                                                                  
     _reset_run_state()
+    question = question.removeprefix("\ufeff")
+    question = " ".join((question or "").split())
+    question = question.replace("\u200b", "").strip()
     deadline = monotonic() + WALL_BUDGET_S
     try:
         info = await tooling_info(timeout=10.0)
@@ -3294,6 +3299,19 @@ async def _gx_repair(question: str, answer: str, deadline: float) -> str:
 # ── end gx guards ─────────────────────────────────────────────────────────────
 
 
+def _gx_missing_currency(question: str, answer: str) -> list:
+    wanted = set(re.findall(r"\b(?:USD|EUR|GBP|JPY|AUD|CAD|CHF|CNY)\b", question))
+    wanted |= set(re.findall(r"[$\u20ac\u00a3\u00a5]", question))
+    for word, symbol in (("dollars", "$"), ("euros", "\u20ac"), ("pounds sterling", "\u00a3"), ("yen", "\u00a5")):
+        if word in question.lower():
+            wanted.add(symbol)
+    if not wanted:
+        return []
+    have = set(re.findall(r"\b(?:USD|EUR|GBP|JPY|AUD|CAD|CHF|CNY)\b", answer))
+    have |= set(re.findall(r"[$\u20ac\u00a3\u00a5]", answer))
+    return sorted(wanted - have)
+
+
 def _gx_defects(question: str, answer: str) -> list:
     notes = []
     if not answer or not answer.strip():
@@ -3302,14 +3320,19 @@ def _gx_defects(question: str, answer: str) -> list:
     if unc:
         notes.append("These factual sentences carry no [n] citation; attach the "
                      "marker for the evidence they came from: " + " | ".join(unc[:2]))
-    if _gx_has_superlative(question) and not _gx_comparison_shown(answer):
-        notes.append("The question asks for a superlative but the answer shows no "
-                     "comparison set — name the runner-up and the figure that "
-                     "separates it from the winner.")
+    miss = _gx_missing_entities(question, answer)
+    if miss:
+        notes.append("The question names these but the answer never mentions them: "
+                     + ", ".join(miss))
+    cur = _gx_missing_currency(question, answer)
+    if cur:
+        notes.append("The question prices things in these currencies and the answer "
+                     "never renders them: " + ", ".join(cur))
     return notes[:_GX_MAX_NOTES]
 
 
-async def _k2_base_query(query: Query) -> Response:
+@entrypoint("query")
+async def query(query: Query) -> Response:
     deadline = monotonic() + WALL_BUDGET_S
     response = await _base_agent_query(query)
     # guards run on TEXT answers only: a structured payload has already been
@@ -3328,562 +3351,5 @@ async def _k2_base_query(query: Query) -> Response:
         pass
     return response
 
-VERSION = "c3-405"
-_GX_ACTIVE = ('cite', 'super')
-
-# ---------------------------------------------------------------------------
-# K2 claim-ledger cycle  [variant u165-k2]
-#
-# Ordinary successful path after the baseline draft:
-#   draft -> claim-ledger audit -> (if required researched facts are missing,
-#   contradicted, or unreconciled) targeted fresh search -> regenerate draft
-#
-# The ledger condition is a deep-research gate, not an operational one. It
-# reads the query-required subclaims (entities, values, periods, comparison
-# sides, exclusions, conclusion) and the draft's coverage of those subclaims.
-# Alternative outcomes:
-#   - every required researched fact is already covered and consistent
-#     -> keep the draft; another retrieval would not change the research result
-#   - at least one required researched fact is missing, contradicted, or
-#     unreconciled -> re-enter search for those facts and regenerate the answer
-# That is a substantive difference in whether the returned answer covers and
-# correctly states the query-required researched facts.
-# ---------------------------------------------------------------------------
-
-from time import monotonic as _k2_monotonic
-from harnyx_miner_sdk.decorators import entrypoint as _k2_entrypoint
-from harnyx_miner_sdk.query import Query as _K2Query, Response as _K2Response
-_K2_SKIP_AFTER_S = 232.0
-_K2_AUDIT_MODEL = "z-ai/glm-5.2"
-_K2_REWRITE_MODEL = "z-ai/glm-5.2"
-_K2_LLM_PROVIDER = "openrouter"
-_K2_SEARCH_PROVIDERS = ("parallel", "desearch")
-_K2_SEARCH_TIMEOUT_S = 10.0
-_K2_LLM_TIMEOUT_S = 16.0
-_K2_MAX_DEFICIENT = 2
-_K2_MAX_NEW_CITES = 6
-_K2_DIGEST_CHARS = 4200
-_K2_ANSWER_CHARS = 12000
-_K2_NOTE_CHARS = 1600
-_K2_DEFICIENT_STATUSES = frozenset({"missing", "contradicted", "unreconciled"})
-
-_K2_AUDIT_SYSTEM = (
-    "You audit a research draft against the query's required researched facts. "
-    "Return JSON only.\n"
-    "Decompose the query into the load-bearing subclaims a correct answer must "
-    "establish: named entities, figures, dates, periods and bases, each side of "
-    "a comparison, the reconciled conclusion, roster/pool members, and decisive "
-    "exclusions. Classify each subclaim from the draft text (and note/output if "
-    "present):\n"
-    "- covered: the draft states that fact and it is internally consistent\n"
-    "- missing: the query requires it and the draft does not address it\n"
-    "- contradicted: the draft states a conflicting value or entity\n"
-    "- unreconciled: a comparison, period/basis, source disagreement, or "
-    "pool-exclusion is required and the draft does not complete that move\n"
-    "needs_fresh_research must be true iff any subclaim is missing, "
-    "contradicted, or unreconciled. Those statuses mean the draft has not yet "
-    "finished the required research, so another retrieval pass is needed. "
-    "covered-only ledgers must set needs_fresh_research false.\n"
-    "search_query must be a concrete web query that would retrieve the missing "
-    "or conflicting official fact (named entity + metric + period when known).\n"
-    "Schema: {\"needs_fresh_research\": bool, \"subclaims\": [{\"id\": str, "
-    "\"fact\": str, \"kind\": \"entity|value|period|comparison_side|conclusion|"
-    "exclusion|other\", \"status\": \"covered|missing|contradicted|unreconciled\", "
-    "\"search_query\": str}]}"
-)
-
-_K2_REWRITE_SYSTEM = (
-    "You regenerate a research answer after a second retrieval pass found "
-    "evidence the first draft missed or contradicted.\n"
-    "Keep every correct fact from the original draft. Change a draft claim only "
-    "when the new evidence contradicts it or supplies a required fact the draft "
-    "omitted. Do not add background, filler, or unverified detail.\n"
-    "Cover every query-required subclaim the evidence can support. For "
-    "comparisons, state each side, the shared period/basis, and the reconciled "
-    "conclusion. For pool/roster questions, name the survivors and the decisive "
-    "exclusions. Prefer official or primary sources. If a required fragment stays "
-    "unverified, say so briefly instead of guessing.\n"
-    "Use [[n]] pointers to the numbered NEW EVIDENCE items for every material "
-    "researched claim. Do not use [n]. Do not invent URLs.\n"
-    "Follow any explicit requested form (terse, XML, list order, include/omit "
-    "words) exactly. When no form is specified, write a clear concise answer.\n"
-    "Return JSON only: {\"answer_text\": str, \"note\": str|null}. "
-    "note is optional public supplementary text that explains why the decisive "
-    "values follow from the cited evidence; omit it when the answer already "
-    "explains itself. Factual claims in note also use [[n]]."
-)
-
-_K2_NOTE_SYSTEM = (
-    "You write a short public note for a structured research answer after a "
-    "second retrieval pass. The structured output field stays unchanged. The "
-    "note must explain why the returned values follow from the numbered NEW "
-    "EVIDENCE, including comparison direction, period/basis, or pool "
-    "exclusions when the query required them. Use [[n]] for material claims. "
-    "Do not invent facts. Return JSON only: {\"note\": str}."
-)
-
-
-def _k2_llm_text(result: object) -> str:
-    if result is None:
-        return ""
-    resp = getattr(result, "response", result)
-    raw = getattr(resp, "raw_text", None)
-    if isinstance(raw, str) and raw.strip():
-        return raw.strip()
-    choices = getattr(resp, "choices", None) or ()
-    if choices:
-        message = getattr(choices[0], "message", None)
-        if message is not None:
-            content = getattr(message, "content", None)
-            if isinstance(content, str) and content.strip():
-                return content.strip()
-            if isinstance(content, list):
-                parts = []
-                for item in content:
-                    if isinstance(item, dict) and isinstance(item.get("text"), str):
-                        parts.append(item["text"])
-                    text = getattr(item, "text", None)
-                    if isinstance(text, str):
-                        parts.append(text)
-                joined = "".join(parts).strip()
-                if joined:
-                    return joined
-    return ""
-
-
-def _k2_parse_json(text: str) -> dict:
-    import json
-    import re as _re
-
-    if not text:
-        return {}
-    stripped = text.strip()
-    fenced = _re.search(r"```(?:json)?\s*(\{.*\})\s*```", stripped, _re.S)
-    if fenced:
-        stripped = fenced.group(1)
-    try:
-        parsed = json.loads(stripped)
-        return parsed if isinstance(parsed, dict) else {}
-    except Exception:
-        start = stripped.find("{")
-        end = stripped.rfind("}")
-        if start < 0 or end <= start:
-            return {}
-        try:
-            parsed = json.loads(stripped[start : end + 1])
-            return parsed if isinstance(parsed, dict) else {}
-        except Exception:
-            return {}
-
-
-def _k2_draft_view(response: object) -> str:
-    import json
-
-    parts: list[str] = []
-    text = getattr(response, "text", None)
-    if isinstance(text, str) and text.strip():
-        parts.append(text.strip()[:_K2_ANSWER_CHARS])
-    output = getattr(response, "output", None)
-    if output is not None:
-        try:
-            parts.append("STRUCTURED_OUTPUT:\n" + json.dumps(output, ensure_ascii=False)[:6000])
-        except Exception:
-            parts.append("STRUCTURED_OUTPUT:\n" + str(output)[:6000])
-    note = getattr(response, "note", None)
-    if isinstance(note, str) and note.strip():
-        parts.append("NOTE:\n" + note.strip()[:_K2_NOTE_CHARS])
-    cites = getattr(response, "citations", None) or ()
-    parts.append(f"EXISTING_CITATION_COUNT: {len(tuple(cites))}")
-    return "\n\n".join(parts) if parts else ""
-
-
-def _k2_deterministic_gaps(question: str, draft: str) -> list[dict]:
-    import re as _re
-
-    q = (question or "").strip()
-    d = (draft or "").strip()
-    ql = q.lower()
-    dl = d.lower()
-    gaps: list[dict] = []
-    compare_markers = (
-        "compar",
-        " versus ",
-        " vs ",
-        "vs.",
-        "which two",
-        "both ",
-        "reconcile",
-        "higher",
-        "lower than",
-        "difference between",
-        "agree on",
-    )
-    if any(marker in ql for marker in compare_markers):
-        if "conclusion" not in dl and "higher" not in dl and "lower" not in dl and "same" not in dl:
-            gaps.append(
-                {
-                    "id": "D_COMPARE",
-                    "fact": "reconciled comparison conclusion with both sides and shared basis",
-                    "kind": "conclusion",
-                    "status": "unreconciled",
-                    "search_query": q[:280],
-                }
-            )
-    pool_markers = (
-        "which entries",
-        "which of the",
-        "all of the",
-        "roster",
-        "every ",
-        "exclude",
-        "except",
-        "meet both",
-    )
-    if any(marker in ql for marker in pool_markers) and "exclud" not in dl and "not included" not in dl:
-        gaps.append(
-            {
-                "id": "D_POOL",
-                "fact": "complete survivor set and decisive exclusions for the requested pool",
-                "kind": "exclusion",
-                "status": "missing",
-                "search_query": (q + " official list exclusions")[:280],
-            }
-        )
-    if _re.search(r"\b(20\d{2}|percent|percentage|%|rank|vote|effective|ceo|director)\b", ql):
-        if not _re.search(r"\d", d):
-            gaps.append(
-                {
-                    "id": "D_VALUE",
-                    "fact": "the concrete figure, date, rank, or named official the query asks for",
-                    "kind": "value",
-                    "status": "missing",
-                    "search_query": q[:280],
-                }
-            )
-    if d and "[[" not in d and "STRUCTURED_OUTPUT" not in d:
-        gaps.append(
-            {
-                "id": "D_CITE",
-                "fact": "traceable citation support for each material researched claim",
-                "kind": "other",
-                "status": "missing",
-                "search_query": q[:280],
-            }
-        )
-    return gaps[:_K2_MAX_DEFICIENT]
-
-
-async def _k2_chat(system: str, user: str, *, max_output_tokens: int = 1200) -> dict:
-    from harnyx_miner_sdk.api import llm_chat
-
-    result = await llm_chat(
-        provider=_K2_LLM_PROVIDER,
-        model=_K2_AUDIT_MODEL,
-        messages=(
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ),
-        temperature=0.0,
-        max_output_tokens=max_output_tokens,
-        timeout=_K2_LLM_TIMEOUT_S,
-    )
-    return _k2_parse_json(_k2_llm_text(result))
-
-
-async def _k2_audit_ledger(question: str, draft: str) -> list[dict]:
-    payload = await _k2_chat(
-        _K2_AUDIT_SYSTEM,
-        "Query:\n"
-        + question[:4000]
-        + "\n\nDraft:\n"
-        + draft[:_K2_ANSWER_CHARS]
-        + "\n\nAudit the draft against the query-required researched facts.",
-        max_output_tokens=1400,
-    )
-    rows = payload.get("subclaims") if isinstance(payload, dict) else None
-    ledger: list[dict] = []
-    if isinstance(rows, list):
-        for item in rows:
-            if not isinstance(item, dict):
-                continue
-            status = str(item.get("status") or "").strip().lower()
-            fact = str(item.get("fact") or "").strip()
-            if not fact:
-                continue
-            search_query = str(item.get("search_query") or "").strip() or (question[:200] + " " + fact[:80])
-            ledger.append(
-                {
-                    "id": str(item.get("id") or f"S{len(ledger) + 1}"),
-                    "fact": fact[:400],
-                    "kind": str(item.get("kind") or "other"),
-                    "status": status,
-                    "search_query": search_query[:280],
-                }
-            )
-    flagged = payload.get("needs_fresh_research") if isinstance(payload, dict) else None
-    if flagged is False:
-        ledger = [row for row in ledger if row["status"] in _K2_DEFICIENT_STATUSES]
-    ledger.extend(_k2_deterministic_gaps(question, draft))
-    seen: set[tuple[str, str]] = set()
-    unique: list[dict] = []
-    for row in ledger:
-        key = (row["status"], row["fact"][:80].lower())
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(row)
-    return unique
-
-
-def _k2_deficient(ledger: list[dict]) -> list[dict]:
-    out = [row for row in ledger if row.get("status") in _K2_DEFICIENT_STATUSES]
-    return out[:_K2_MAX_DEFICIENT]
-
-
-async def _k2_search(query_text: str) -> tuple[object | None, list[object]]:
-    from harnyx_miner_sdk.api import search_web
-
-    q = (query_text or "").strip()[:300]
-    if not q:
-        return None, []
-    last_error: Exception | None = None
-    for provider in _K2_SEARCH_PROVIDERS:
-        try:
-            packet = await search_web(
-                q,
-                provider=provider,
-                num=5,
-                timeout=_K2_SEARCH_TIMEOUT_S,
-            )
-        except Exception as exc:
-            last_error = exc
-            continue
-        rows = list(getattr(packet, "results", None) or ())
-        if rows:
-            return packet, rows
-    if last_error is not None:
-        return None, []
-    return None, []
-
-
-def _k2_row_text(row: object) -> tuple[str, str, str, str]:
-    result_id = str(getattr(row, "result_id", "") or "")
-    title = str(getattr(row, "title", "") or "")
-    url = str(getattr(row, "url", "") or "")
-    note = str(getattr(row, "note", "") or getattr(row, "snippet", "") or "")
-    return result_id, title, url, note
-
-
-def _k2_cite(receipt_id: str, row: object):
-    from harnyx_miner_sdk.query import CitationRef, CitationSlice
-
-    result_id, _title, _url, note = _k2_row_text(row)
-    if not receipt_id or not result_id:
-        return None
-    slices = []
-    if note.strip():
-        end = min(len(note), 480)
-        if end > 0:
-            slices.append(CitationSlice(start=0, end=end))
-    return CitationRef(receipt_id=receipt_id, result_id=result_id, slices=slices)
-
-
-async def _k2_targeted_research(question: str, deficient: list[dict]) -> tuple[str, list]:
-    from harnyx_miner_sdk.api import fetch_page
-
-    digest_parts: list[str] = []
-    citations: list = []
-    seen_ids: set[tuple[str, str]] = set()
-    marker = 0
-    for row in deficient:
-        packet, results = await _k2_search(str(row.get("search_query") or question))
-        if packet is None or not results:
-            continue
-        receipt_id = str(getattr(packet, "receipt_id", "") or "")
-        fact = str(row.get("fact") or "")
-        digest_parts.append(f"TARGET: {fact}")
-        official = None
-        for result in results[:4]:
-            result_id, title, url, note = _k2_row_text(result)
-            marker += 1
-            digest_parts.append(
-                f"[{marker}] {title}\nurl: {url}\nexcerpt: {note[:700]}"
-            )
-            key = (receipt_id, result_id)
-            if key not in seen_ids:
-                cite = _k2_cite(receipt_id, result)
-                if cite is not None:
-                    citations.append(cite)
-                    seen_ids.add(key)
-            host = url.lower()
-            if official is None and any(
-                token in host
-                for token in (
-                    ".gov",
-                    ".int",
-                    "europa.eu",
-                    "sec.gov",
-                    "who.int",
-                    "worldbank",
-                    "un.org",
-                    "official",
-                )
-            ):
-                official = url
-        if official and len(citations) < _K2_MAX_NEW_CITES:
-            try:
-                page = await fetch_page(official, provider="parallel", timeout=12.0)
-            except Exception:
-                page = None
-            if page is not None:
-                page_rows = list(getattr(page, "results", None) or ())
-                page_receipt = str(getattr(page, "receipt_id", "") or "")
-                if page_rows:
-                    _pid, ptitle, purl, pnote = _k2_row_text(page_rows[0])
-                    marker += 1
-                    digest_parts.append(
-                        f"[{marker}] OFFICIAL PAGE {ptitle}\nurl: {purl}\nexcerpt: {pnote[:900]}"
-                    )
-                    cite = _k2_cite(page_receipt, page_rows[0])
-                    if cite is not None:
-                        citations.append(cite)
-        if len(citations) >= _K2_MAX_NEW_CITES:
-            break
-    digest = "\n".join(digest_parts)[:_K2_DIGEST_CHARS]
-    return digest, citations[:_K2_MAX_NEW_CITES]
-
-
-def _k2_merge_citations(existing: object, added: list) -> list | None:
-    merged: list = []
-    seen: set[tuple[str, str]] = set()
-    for cite in list(existing or []) + list(added or []):
-        receipt = str(getattr(cite, "receipt_id", "") or "")
-        result = str(getattr(cite, "result_id", "") or "")
-        key = (receipt, result)
-        if not receipt or not result or key in seen:
-            continue
-        seen.add(key)
-        merged.append(cite)
-        if len(merged) >= 60:
-            break
-    return merged or None
-
-
-def _k2_offset_markers(text: str, offset: int) -> str:
-    import re as _re
-
-    if offset <= 0 or not text:
-        return text
-
-    def _bump(match: object) -> str:
-        number = int(match.group(1))  # type: ignore[attr-defined]
-        return f"[[{number + offset}]]"
-
-    return _re.sub(r"\[\[(\d+)\]\]", _bump, text)
-
-
-async def _k2_regenerate(
-    question: str,
-    response: object,
-    deficient: list[dict],
-    digest: str,
-    new_citations: list,
-) -> tuple[str | None, str | None]:
-    import json
-
-    offset = len(tuple(getattr(response, "citations", None) or ()))
-    facts = "; ".join(f"{row.get('status')}: {row.get('fact')}" for row in deficient)
-    user = (
-        "Query:\n"
-        + question[:4000]
-        + "\n\nOriginal draft:\n"
-        + _k2_draft_view(response)[:8000]
-        + "\n\nDeficient required facts:\n"
-        + facts
-        + "\n\nNEW EVIDENCE (use [[n]] against this numbered list; the host will "
-        "shift n by existing citation count):\n"
-        + digest
-    )
-    if getattr(response, "output", None) is not None:
-        payload = await _k2_chat(_K2_NOTE_SYSTEM, user, max_output_tokens=700)
-        note = payload.get("note") if isinstance(payload, dict) else None
-        if isinstance(note, str) and note.strip():
-            return None, _k2_offset_markers(note.strip(), offset)[:_K2_NOTE_CHARS]
-        return None, None
-    payload = await _k2_chat(_K2_REWRITE_SYSTEM, user, max_output_tokens=1800)
-    if not isinstance(payload, dict):
-        return None, None
-    answer = payload.get("answer_text")
-    note = payload.get("note")
-    new_text = answer.strip() if isinstance(answer, str) and answer.strip() else None
-    new_note = note.strip() if isinstance(note, str) and note.strip() else None
-    if new_text:
-        new_text = _k2_offset_markers(new_text, offset)
-    if new_note:
-        new_note = _k2_offset_markers(new_note, offset)[:_K2_NOTE_CHARS]
-    if new_citations and new_text is None:
-        return None, new_note
-    return new_text, new_note
-
-
-def _k2_rebuild(response: object, text: str | None, note: str | None, citations: list | None):
-    from harnyx_miner_sdk.query import Response
-
-    existing_note = getattr(response, "note", None)
-    final_note = note or (existing_note if isinstance(existing_note, str) else None)
-    existing_text = getattr(response, "text", None)
-    output = getattr(response, "output", None)
-    try:
-        if output is not None:
-            return Response(output=output, note=final_note, citations=citations)
-        final_text = text or existing_text
-        if not final_text:
-            return response
-        return Response(text=final_text, note=final_note, citations=citations)
-    except Exception:
-        return response
-
-
-async def _k2_cycle(query: object, response: object) -> object:
-    question = str(getattr(query, "text", "") or "").strip()
-    if not question:
-        return response
-    draft = _k2_draft_view(response)
-    if not draft:
-        return response
-    ledger = await _k2_audit_ledger(question, draft)
-    deficient = _k2_deficient(ledger)
-    # Deep-research branch: only re-enter retrieval when required researched
-    # facts are missing, contradicted, or unreconciled. Covered-only ledgers
-    # keep the baseline draft because another search would not change those facts.
-    if not deficient:
-        return response
-    digest, new_citations = await _k2_targeted_research(question, deficient)
-    if not digest or not new_citations:
-        return response
-    new_text, new_note = await _k2_regenerate(
-        question, response, deficient, digest, new_citations
-    )
-    if new_text is None and new_note is None:
-        merged = _k2_merge_citations(getattr(response, "citations", None), new_citations)
-        if merged is None:
-            return response
-        return _k2_rebuild(response, None, None, merged)
-    merged = _k2_merge_citations(getattr(response, "citations", None), new_citations)
-    return _k2_rebuild(response, new_text, new_note, merged)
-
-
-@_k2_entrypoint("query")
-async def query(query: _K2Query) -> _K2Response:
-    _k2_started = _k2_monotonic()
-    response = await _k2_base_query(query)
-    try:
-        if bool(getattr(query, "fast", False)):
-            return response
-        if _k2_monotonic() - _k2_started >= _K2_SKIP_AFTER_S:
-            return response
-        return await _k2_cycle(query, response)
-    except Exception:
-        return response
-
-
+VERSION = "c10-402"
+_GX_ACTIVE = ('cite', 'entity', 'currency')
