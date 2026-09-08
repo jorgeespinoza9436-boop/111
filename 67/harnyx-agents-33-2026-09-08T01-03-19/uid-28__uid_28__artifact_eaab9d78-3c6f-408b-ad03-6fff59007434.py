@@ -13,12 +13,12 @@ from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
 LLM_PROVIDER = "openrouter"
 MODEL = "z-ai/glm-5.2"
 COMMIT_FALLBACK_MODEL = "deepseek/deepseek-v3.2"
+SEARCH_TIMEOUT_SECONDS = 20.0
+FETCH_TIMEOUT_SECONDS = 15.0
+MAX_RETRY_ATTEMPTS_PER_TURN = 2
+TASK_TOTAL_BUDGET_SECONDS = 235.0
 FETCH_RETRY_ATTEMPTS = 2
 LLM_TURN_TIMEOUT_SECONDS = 90.0
-TASK_TOTAL_BUDGET_SECONDS = 270.0
-SEARCH_TIMEOUT_SECONDS = 20.0
-MAX_RETRY_ATTEMPTS_PER_TURN = 2
-FETCH_TIMEOUT_SECONDS = 15.0
 
 RESEARCH_TURN_CAP = 10
 RESEARCH_TIME_CAP_SECONDS = 140.0
@@ -39,6 +39,10 @@ COMMIT_DIGEST_SOURCES_MAX = 16
 COMMIT_DIGEST_NOTE_CHARS = 2_600
 COMMIT_DIGEST_TOTAL_CHARS = 64_000
 COMMIT_DIGEST_IDENTITY_CHARS = 320
+# A search result in the commit digest is an excerpt; a fetched page is the
+# regions that were read. The allowance is split by kind, so fifteen search
+# hits can no longer shrink the one page that was actually read to a prefix.
+COMMIT_DIGEST_SEARCH_CHARS = 1_200
 
 PAGE_WINDOW_CHARS = 3600
 PAGE_WINDOWS_PER_PAGE = 3
@@ -191,7 +195,9 @@ SYSTEM_PROMPT = (
     "its page, and cite it for the core claims. For each metric, prefer ONE consistent "
     "canonical source across all candidates (same series, same year basis); do not mix "
     "sources for the same metric unless the preferred source is unreachable, and note "
-    "the substitution if you must.\n\n"
+    "the substitution if you must. Do not spend fetches confirming an entity's "
+    "category or identity from third-party sites when the named source's own "
+    "grouping or wording already settles it.\n\n"
     "VERIFY:\n"
     "When told to verify, build a per-candidate x per-constraint table from the numbered "
     "evidence, citing [n] markers. Name the near-miss exclusions and the exact criterion "
@@ -210,9 +216,12 @@ SYSTEM_PROMPT = (
     "FINAL ANSWER:\n"
     "End with a committed, SELF-CONTAINED answer: state the answer first, then a compact "
     "proof — each qualifying entity with the figures that qualify it, and the near-miss "
-    "exclusions with the exact criterion each fails — written as clean prose or short "
-    "bullets with [n] citations. Do NOT reproduce the working table or internal "
-    "scaffolding; rewrite the proof as prose. A reader must be able to see the full "
+    "exclusions with the exact criterion each fails — written as flowing prose "
+    "paragraphs with [n] citations: no markdown bullets, headers, bold or tables "
+    "unless the question itself asks for a list or a table. State the answer in the "
+    "first sentence. Do NOT reproduce the working table or internal scaffolding; "
+    "rewrite the proof as prose. Do NOT end with a summary or recap that restates "
+    "figures already given. A reader must be able to see the full "
     "candidate-pool reasoning from the FINAL ANSWER alone. Scoring is pairwise against a "
     "competitor: an answer that refuses, defers, or hedges to 'insufficient data' loses "
     "outright, and so does a bare answer with no completeness proof. If evidence covers "
@@ -220,7 +229,9 @@ SYSTEM_PROMPT = (
     "may be incomplete.\n\n"
     "CITATION RULE: in the final answer, put the evidence number in brackets immediately "
     "after EVERY factual claim — e.g. 'the total is 4,000 [7, 12].' A claim with no "
-    "bracket after it is assumed uncited."
+    "bracket after it is assumed uncited. Cite the sources that carry the facts the "
+    "question asks for; a page fetched only to confirm a category or identity that "
+    "the named source already settles is not cited."
 )
 
 BRIEFING_NUDGE = (
@@ -243,11 +254,18 @@ TOOL_MARKUP_RE = re.compile(
 )
 # glm-5 sometimes narrates tool calls as prose instead of emitting structured
 # calls; that text must never reach the judge as a final answer
-PSEUDO_CALL_RE = re.compile(r"\b(?:search_web|fetch_page)\s*\(", re.IGNORECASE)
+PSEUDO_CALL_RE = re.compile(r"\b(?:search_web|fetch_page|page_grep|page_read)\s*\(", re.IGNORECASE)
+# a reply that opens by narrating what it will look up next is a plan, not an
+# answer; with tools disabled it can only be retried
+NARRATED_INTENT_RE = re.compile(
+    r"^\s*(?:i need to|i will need to|let me|i'll|i will|first,? i)\s+(?:find|search|read|check|look|fetch|grep|locate|verify)",
+    re.IGNORECASE,
+)
 ABSTENTION_MARKERS = (
     "i could not", "i cannot", "i was unable", "unable to", "cannot answer",
     "insufficient evidence", "no evidence", "could not find", "cannot determine",
     "cannot be determined", "i don't have", "i do not have", "not enough information",
+    "does not contain", "is not shown", "cannot name", "cannot identify",
 )
 CANDIDATE_RE = re.compile(r"^\s*[-*]\s*CANDIDATE:\s*(.+?)\s*$", re.MULTILINE)
 FINAL_SECTION_RE = re.compile(
@@ -997,12 +1015,12 @@ async def _run_fetch_page(url: str, index: _ResultIndex, terms: list[str],
     )
 
 
-BRACKET_RE = re.compile(r"\[([0-9][0-9,\s-]*)\]")
+BRACKET_RE = re.compile(r"\[([0-9][0-9,;\s-]*)\]")
 
 
 def _numbers_from_bracket(value: str, *, max_number: int) -> tuple[int, ...]:
     numbers: list[int] = []
-    for item in value.split(","):
+    for item in re.split(r"[,;]", value):
         text = item.strip()
         if not text:
             continue
@@ -1234,7 +1252,12 @@ def _repoint_markers(text: str, position_of: dict[int, int], *, max_number: int)
             return ""
         return "".join(f"[[{p}]]" for p in positions)
 
-    return BRACKET_RE.sub(_replace, text)
+    # two brackets that resolve to the same entry, written back to back, are one
+    # pointer: "[7][9]" over a page read twice must not ship as "[[1]][[1]]"
+    return _ADJACENT_POINTER_RE.sub(r"\1", BRACKET_RE.sub(_replace, text))
+
+
+_ADJACENT_POINTER_RE = re.compile(r"(\[\[\d+\]\])(?:\1)+")
 
 
 def _parse_candidates(briefing_text: str) -> list[str]:
@@ -1292,7 +1315,11 @@ def _checkpoint_message(candidates: list[str], index: _ResultIndex) -> str:
 
 COMMIT_MESSAGE = (
     "Tools are now DISABLED. Produce the VERIFY table and FINAL ANSWER from the numbered "
-    "evidence you already have, with [n] citations after every claim. Commit."
+    "evidence you already have, with [n] citations after every claim. Write the FINAL "
+    "ANSWER as prose paragraphs: no bullets, headers or bold unless the question asks "
+    "for a list or table, and no closing recap. Cite the question's named source for "
+    "the requested facts; add no descriptions, background or category confirmations "
+    "from other pages, and do not cite pages fetched for that purpose. Commit."
 )
 
 # A `fast` query is judged on component correctness against the reference, from a
@@ -1305,7 +1332,8 @@ FAST_COMMIT_MESSAGE = (
     "Tools are now DISABLED. Answer the question directly and completely from the "
     "numbered evidence you already have. State every part the question asks for, "
     "in the order asked, using the exact names, figures and units the evidence "
-    "gives. No candidate table, no near-miss discussion, no preamble."
+    "gives. No candidate table, no near-miss discussion, no preamble, and no facts "
+    "the question did not ask for."
 )
 _FAST: list = [False]
 # The index of the most recent `_plain_query`, read by the entrypoint to tell a
@@ -1446,14 +1474,21 @@ def _evidence_digest(index: _ResultIndex, terms: list[str]) -> str:
     numbers = _digest_numbers(index)
     if not numbers:
         return ""
-    window = max(COMMIT_DIGEST_NOTE_CHARS, COMMIT_DIGEST_TOTAL_CHARS // len(numbers))
+    n_fetched = sum(1 for n in numbers if (index.get(n) or {}).get("kind") == "fetch")
+    n_searched = len(numbers) - n_fetched
+    fetch_window = max(
+        COMMIT_DIGEST_NOTE_CHARS,
+        (COMMIT_DIGEST_TOTAL_CHARS - n_searched * COMMIT_DIGEST_SEARCH_CHARS) // max(1, n_fetched),
+    )
     parts = ["NUMBERED EVIDENCE (the sources gathered for this question; cite by these numbers):"]
     for n in numbers:
         meta = index.get(n)
         if meta is None:
             continue
         note = meta["note"] or ""
-        spans = _union_spans_same_url(index, n) if meta.get("kind") == "fetch" else index.spans(n)
+        is_fetch = meta.get("kind") == "fetch"
+        window = fetch_window if is_fetch else min(COMMIT_DIGEST_NOTE_CHARS, max(COMMIT_DIGEST_SEARCH_CHARS, len(note)))
+        spans = _union_spans_same_url(index, n) if is_fetch else index.spans(n)
         if not spans:
             # never surfaced in ranges (a search result): give it the same
             # treatment here rather than a bare prefix
@@ -1696,7 +1731,7 @@ AMEND_SYSTEM = (
     "before part of its evidence had been located, so you are given both the draft and "
     "any passages that ARE in the evidence and that the draft does not report.\n"
     "Rules:\n"
-    "1. Keep everything the draft already gets right, in its structure and order.\n"
+    "1. Keep every fact the draft already gets right, in its order.\n"
     "2. Add the located figures where they belong, each with its [n] marker, and remove "
     "any statement that something is unavailable when a passage below states it.\n"
     "3. If the question prescribes an exact output ('output only ...', a required "
@@ -1704,7 +1739,10 @@ AMEND_SYSTEM = (
     "output and keep the supporting proof below it.\n"
     "4. Delete leftover process text: phase markers, working tables, narrated intentions. "
     "Keep every other [n] citation bracket exactly where it stands.\n"
-    "5. Output the complete answer and nothing else — no preamble, no notes about what "
+    "5. Deliver prose paragraphs: turn any bullet list into sentences, drop bold and "
+    "headers, and drop a closing summary that only restates figures already given — "
+    "unless the question itself asks for a list, a table or a fixed output form.\n"
+    "6. Output the complete answer and nothing else — no preamble, no notes about what "
     "you changed. If nothing above applies, return the draft verbatim."
 )
 
@@ -1835,6 +1873,57 @@ def _strip_tool_markup(text: str) -> str:
     return TOOL_MARKUP_RE.sub(" ", text).strip()
 
 
+FORMAT_PRESCRIBED_RE = re.compile(
+    r"\b(?:as an? (?:bulleted |numbered |ordered )?list|in (?:a |the )?(?:list|table|tabular) "
+    r"form|as an? table|bullet points?|bulleted|numbered list|output only|one per line|"
+    r"per line|comma[- ]separated|semicolon[- ]separated|separated by|in the (?:form|format)|"
+    r"json|csv|markdown)\b",
+    re.IGNORECASE,
+)
+PROSE_ASKED_RE = re.compile(r"\bin prose\b|\bas prose\b|\bprose\b", re.IGNORECASE)
+BULLET_LINE_RE = re.compile(r"^\s*(?:[-*\u2022]|\d{1,2}[.)])\s+")
+HEADER_LINE_RE = re.compile(r"^\s*#{1,6}\s*", re.MULTILINE)
+RECAP_HEAD_RE = re.compile(
+    r"^\s*(?:in summary|in short|to summari[sz]e|summary|overall|in conclusion|to conclude)\b",
+    re.IGNORECASE,
+)
+FIGURE_RE = re.compile(r"\d[\d,./%]*")
+
+
+def _prose_shape(text: str, question: str) -> str:
+    """The delivered shape of a plain answer: paragraphs, not markup.
+
+    A bullet list, bold and a closing recap are markup around the same facts;
+    where the question does not ask for a list, a table or a fixed form they are
+    removed and the facts are kept. Evidence brackets are untouched, so the
+    citation build reads the same markers it would have read.
+    """
+    if not text:
+        return text
+    if PROSE_ASKED_RE.search(question or "") is None and FORMAT_PRESCRIBED_RE.search(question or "") is not None:
+        return text
+    out = text.replace("**", "").replace("__", "")
+    out = HEADER_LINE_RE.sub("", out)
+    shaped: list[str] = []
+    for para in re.split(r"\n\s*\n", out):
+        lines = [line for line in para.split("\n") if line.strip()]
+        if sum(1 for line in lines if BULLET_LINE_RE.match(line)) >= 2:
+            pieces: list[str] = []
+            for line in lines:
+                item = BULLET_LINE_RE.sub("", line).strip() if BULLET_LINE_RE.match(line) else line.strip()
+                if item and not item.endswith((".", "!", "?", ":")):
+                    item += "."
+                pieces.append(item)
+            para = " ".join(pieces)
+        shaped.append(para.strip())
+    shaped = [p for p in shaped if p]
+    if len(shaped) >= 2 and RECAP_HEAD_RE.match(shaped[-1]) is not None:
+        earlier = "\n\n".join(shaped[:-1])
+        if all(f in earlier for f in FIGURE_RE.findall(shaped[-1])):
+            shaped = shaped[:-1]
+    return "\n\n".join(shaped).strip() or text
+
+
 def _final_section(text: str) -> str:
     """Deliver only the FINAL ANSWER section; the verification scaffolding that
     precedes it stays in-conversation. Falls back to the full text when the
@@ -1866,12 +1955,19 @@ def _needs_forced_retry(text: str) -> bool:
         return True
     if PSEUDO_CALL_RE.search(text) is not None:
         return True
-    if len(text) < HARD_MIN_ANSWER_CHARS:
+    if NARRATED_INTENT_RE.match(text) is not None:
+        return True
+    if len(text) < HARD_MIN_ANSWER_CHARS and not _fast_mode() and _so_extract_json(text) is None:
         return True
     # an answer that OPENS with a refusal is a refusal regardless of how much
     # explanatory prose follows it
     if any(m in text.lower()[:400] for m in ABSTENTION_MARKERS):
         return True
+    # A bare answer is what a fast or schema-bound query asks for: a 114-char
+    # JSON object that names every field is complete, and sending it through the
+    # length floor replaced it with the evidence dump on `4c76f1b4`.
+    if _fast_mode() or _so_extract_json(text) is not None:
+        return False
     if len(text) < MIN_ANSWER_CHARS:
         if not text.rstrip().endswith((".", "!", "?", ")", "]", '"', "|", "*")):
             return True
@@ -1972,95 +2068,6 @@ def _serializer_evidence(index: "_ResultIndex", limit: int) -> str:
         parts.append(chunk[:room])
         used += min(len(chunk), room)
     return "\n\n".join(parts)
-
-
-
-# ── redundant candidate + A/B judge: a second answer written from the digest ──
-AB_MIN_LEFT_SECONDS = 75.0
-AB_CANDIDATE_TIMEOUT_SECONDS = 34.0
-AB_JUDGE_TIMEOUT_SECONDS = 26.0
-AB_JUDGE_PROVIDER = "openrouter"
-AB_JUDGE_MODEL = "openai/gpt-oss-120b"
-_AB_MARKER_RE = re.compile(r"\[\d+\]")
-
-
-async def _ab_candidate(question: str, index: _ResultIndex, deadline: float) -> str:
-    """A second, independently written answer: straight from the numbered
-    evidence digest, blind to the research conversation's framing."""
-    digest = _evidence_digest(index, _key_terms(question))
-    if not digest:
-        return ""
-    budget = deadline - perf_counter()
-    if budget <= 14:
-        return ""
-    try:
-        result = await llm_chat(
-            provider=LLM_PROVIDER, model=MODEL,
-            messages=[
-                {"role": "system", "content": (
-                    "Write the COMPLETE final answer to the question from the "
-                    "numbered evidence alone. Every load-bearing figure or name "
-                    "carries the [n] marker of the source that states it. No "
-                    "preamble, no process narration -- the answer only.")},
-                {"role": "user", "content": "QUESTION:\n" + (question or "")[:4000] + "\n\n" + digest},
-            ],
-            temperature=0.2, thinking=LlmThinkingConfig(enabled=False),
-            timeout=min(AB_CANDIDATE_TIMEOUT_SECONDS, budget - 2),
-        )
-        return (result.response.raw_text or "").strip()
-    except Exception:
-        return ""
-
-
-async def _ab_judge(question: str, answer_a: str, answer_b: str, deadline: float) -> str:
-    budget = deadline - perf_counter()
-    if budget <= 8:
-        return "A"
-    try:
-        result = await llm_chat(
-            provider=AB_JUDGE_PROVIDER, model=AB_JUDGE_MODEL,
-            messages=[
-                {"role": "system", "content": (
-                    "You are a strict grader. Two candidate answers to the same "
-                    "research question are given. Reply with exactly one letter, "
-                    "A or B, naming the answer that is more complete, specific, "
-                    "and correct.")},
-                {"role": "user", "content": (
-                    "QUESTION:\n" + (question or "")[:4000] +
-                    "\n\nANSWER A:\n" + answer_a[:6000] +
-                    "\n\nANSWER B:\n" + answer_b[:6000] +
-                    "\n\nWhich is better? Reply A or B.")},
-            ],
-            temperature=0.0, thinking=LlmThinkingConfig(enabled=False),
-            timeout=min(AB_JUDGE_TIMEOUT_SECONDS, budget - 2),
-        )
-        verdict = (result.response.raw_text or "").strip().upper()
-        return "B" if verdict.startswith("B") else "A"
-    except Exception:
-        return "A"
-
-
-async def _ab_select(question: str, answer_a: str, index: _ResultIndex, deadline: float) -> str:
-    """Deliverable selection between the conversation's answer and a second
-    candidate written from the evidence digest. The judge only ever sees a
-    candidate shaped like an answer; every failure path keeps A."""
-    try:
-        if not (answer_a or "").strip():
-            return answer_a
-        if deadline - perf_counter() < AB_MIN_LEFT_SECONDS:
-            return answer_a
-        answer_b = await _ab_candidate(question, index, deadline)
-        if not answer_b or not _AB_MARKER_RE.search(answer_b):
-            return answer_a
-        if _needs_forced_retry(answer_b) or _narrates_gap(answer_b):
-            return answer_a
-        if len(answer_b) < int(len(answer_a) * 0.35):
-            return answer_a
-        if await _ab_judge(question, answer_a, answer_b, deadline) == "B":
-            return answer_b
-        return answer_a
-    except Exception:
-        return answer_a
 
 
 async def _plain_query(query: Query, budget: float) -> Response:
@@ -2230,15 +2237,10 @@ async def _plain_query(query: Query, budget: float) -> Response:
             decided = await _amended_answer(
                 query.text, asks, index, display, deadline - 4,
             )
-            try:
-                decided = await _ab_select(query.text, decided, index,
-                                           deadline - 4)
-            except Exception:
-                pass
             # when this stage rewrote the answer, its markers are the ones the
             # delivered text carries, so they are the ones that source citations
             cited_from = cite_text or display if decided == display else decided
-            return _deliverable(decided, index, cite_text=cited_from)
+            return _deliverable(_prose_shape(decided, query.text or ""), index, cite_text=cited_from)
         return _deliverable(None, index)
     except Exception:
         return _deliverable(None, index)
@@ -3490,8 +3492,7 @@ async def _plain_query_with_cold_retry(query: Query, budget: float) -> Response:
     return result
 
 
-@entrypoint("query")
-async def query(query: Query) -> Response:
+async def _w4_baseline_query(query: Query) -> Response:
     """Route on the caller's schema, and record the scoring mode for the run.
 
     Without a schema this is the previous entrypoint with two extra attribute
@@ -3518,3 +3519,429 @@ async def query(query: Query) -> Response:
     except Exception:
         return _so_response(_so_skeleton(schema, schema), None)
 # --- structured output (end) ---
+
+
+# --- w4 answer-contract wrapper (begin) ---
+# The base artifact's `query` entrypoint is demoted to `_w4_baseline_query` and a
+# new `query` coordinates three stages: answer-contract planning, baseline
+# research, and contract verification with authority over the returned answer.
+# The only contract with the demoted base is the platform ABI (`Query`,
+# `Response`, `llm_chat`) plus NameError-guarded probes for optional base
+# constants.
+
+_W2_PLAN_TIMEOUT_SECONDS = 22.0
+_W2_VERIFY_TIMEOUT_SECONDS = 28.0
+_W2_REPAIR_TIMEOUT_SECONDS = 24.0
+_W2_TAIL_RESERVE_SECONDS = 8.0
+_W2_PLAN_TEMPERATURE = 0.1
+_W2_VERIFY_TEMPERATURE = 0.12
+_W2_MIN_REVISION_CHARS = 80
+_W2_MIN_REVISION_RATIO = 0.6
+_W2_MIN_ENTITY_CHARS = 3
+_W2_MAX_CONTRACT_ITEMS = 6
+_W2_DRAFT_PROMPT_CHARS = 6_000
+_W2_DEFAULT_BUDGET_SECONDS = 235.0
+
+_W2_LIST_MARKER_RE = re.compile(r"(?m)^[ \t]*[(\[]?\d{1,2}[.)\]][ \t]+")
+_W2_FIGURE_RE = re.compile(r"\d+(?:[.,]\d+)*")
+_W2_WORD_RE = re.compile(r"[A-Z][A-Za-z0-9&'’.\-]*")
+_W2_CLAUSE_HEAD_CHARS = ".!?:;#*->|•"
+
+_W2_PLAN_SYSTEM = (
+    "You plan the acceptance criteria for a research answer before the research runs.\n"
+    "Read the question and list what a complete, correct answer must contain.\n"
+    "Reply with JSON only, no prose, in this exact shape:\n"
+    '{"deliverable": "<one sentence naming what must be returned>", '
+    '"required": ["<concrete element the answer must state>", ...], '
+    '"pitfalls": ["<a specific way an answer to this question goes wrong>", ...]}\n'
+    "Give at most six `required` entries and at most three `pitfalls`. "
+    "Each entry must be concrete and checkable against a draft answer - name the "
+    "quantity, entity, unit, date range, or enumeration that must appear. "
+    "Never guess the answer itself; describe only what the answer must cover."
+)
+
+_W2_VERIFY_SYSTEM = (
+    "You audit a draft research answer against an answer contract and repair it.\n"
+    "The contract lists what the answer must contain. Check the draft against every "
+    "entry and return the corrected answer.\n"
+    "Rules:\n"
+    "- Repair only concrete, verifiable gaps: a required element the draft never "
+    "states, an internal contradiction, a requested unit or format the draft ignores.\n"
+    "- Use only facts already present in the draft. Never introduce a fact, figure, "
+    "name, or citation that the draft does not contain.\n"
+    "- Every figure, quantity, date, unit, name, and citation marker the draft states "
+    "stands as written. You may not drop one, round one, reword one, or swap one for a "
+    "different value or a different entity. Your edits may only add.\n"
+    "- The draft's own answer to the question is the answer. If you believe a different "
+    "entity or value fits the question better, say so in one added clause and leave the "
+    "draft's answer standing.\n"
+    "- If a required element is genuinely absent from the draft's evidence, say so "
+    "plainly in one clause rather than inventing it.\n"
+    "- Preserve the draft's wording wherever it already satisfies the contract.\n"
+    "- If the draft already satisfies the contract, return it unchanged.\n"
+    "Return the full corrected answer text and nothing else - no preamble, no notes, "
+    "no commentary about what you changed."
+)
+
+_W2_REPAIR_SYSTEM = (
+    "You convert a research answer into the exact JSON object a caller's schema "
+    "requires.\n"
+    "Use only facts stated in the answer text. Do not invent values. If the answer "
+    "does not supply a required field, use null for it.\n"
+    "Reply with a single JSON object and nothing else."
+)
+
+
+class _W2AnswerContract:
+    """The formal state object carried between the plan and verify stages."""
+
+    def __init__(self, deliverable: str, required: list[str], pitfalls: list[str]) -> None:
+        self.deliverable = deliverable
+        self.required = required
+        self.pitfalls = pitfalls
+
+    def is_actionable(self) -> bool:
+        return bool(self.deliverable or self.required)
+
+
+def _w4_provider() -> str:
+    """Resolve the base's LLM provider without globals(); the validator rejects it."""
+    try:
+        return LLM_PROVIDER
+    except NameError:
+        return "openrouter"
+
+
+def _w4_model() -> str:
+    try:
+        return MODEL
+    except NameError:
+        return "z-ai/glm-5"
+
+
+def _w4_total_budget_seconds() -> float:
+    try:
+        return float(TASK_TOTAL_BUDGET_SECONDS)
+    except (NameError, TypeError, ValueError):
+        return _W2_DEFAULT_BUDGET_SECONDS
+
+
+def _w4_remaining(deadline: float) -> float:
+    return deadline - perf_counter()
+
+
+async def _w4_chat(messages: list[dict[str, object]], *, timeout: float, temperature: float) -> str:
+    """One bounded LLM call on the platform ABI; empty string on any failure."""
+    if timeout <= 0:
+        return ""
+    try:
+        result = await llm_chat(
+            provider=_w4_provider(), model=_w4_model(), messages=messages,
+            temperature=temperature, timeout=timeout,
+        )
+    except Exception:
+        return ""
+    try:
+        return (result.response.raw_text or "").strip()
+    except Exception:
+        return ""
+
+
+def _w4_json_object(text: str) -> dict | None:
+    """Tolerant extraction of the first JSON object in a model reply."""
+    if not text:
+        return None
+    body = text.strip()
+    if body.startswith("```"):
+        body = body.split("```")[1] if "```" in body[3:] else body[3:]
+        if body[:4].lower().startswith("json"):
+            body = body[4:]
+    start = body.find("{")
+    end = body.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        parsed = json.loads(body[start:end + 1])
+    except (ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _w4_string_list(value: object, limit: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items = []
+    for entry in value:
+        if isinstance(entry, str) and entry.strip():
+            items.append(entry.strip())
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _w4_schema_hint(schema: object) -> str:
+    """Render the caller's output schema for the planning prompt."""
+    if schema is None:
+        return ""
+    try:
+        rendered = json.dumps(schema, ensure_ascii=False)[:1_200]
+    except (TypeError, ValueError):
+        return ""
+    return f"\n\nThe answer will be returned against this output schema:\n{rendered}"
+
+
+async def _w4_build_answer_contract(
+    question: str, schema: object, *, deadline: float,
+) -> _W2AnswerContract | None:
+    """Stage 1 - plan the acceptance criteria before the baseline research runs."""
+    timeout = min(_W2_PLAN_TIMEOUT_SECONDS, _w4_remaining(deadline) - _W2_TAIL_RESERVE_SECONDS)
+    messages = [
+        {"role": "system", "content": _W2_PLAN_SYSTEM},
+        {"role": "user", "content": f"Question:\n{question}{_w4_schema_hint(schema)}"},
+    ]
+    payload = _w4_json_object(await _w4_chat(
+        messages, timeout=timeout, temperature=_W2_PLAN_TEMPERATURE,
+    ))
+    if payload is None:
+        return None
+    deliverable = payload.get("deliverable")
+    contract = _W2AnswerContract(
+        deliverable=deliverable.strip() if isinstance(deliverable, str) else "",
+        required=_w4_string_list(payload.get("required"), _W2_MAX_CONTRACT_ITEMS),
+        pitfalls=_w4_string_list(payload.get("pitfalls"), 3),
+    )
+    return contract if contract.is_actionable() else None
+
+
+def _w4_contract_block(contract: _W2AnswerContract) -> str:
+    """Render the contract as the audit checklist handed to the verify stage."""
+    lines = []
+    if contract.deliverable:
+        lines.append(f"Deliverable: {contract.deliverable}")
+    if contract.required:
+        lines.append("The answer must state:")
+        lines.extend(f"  - {item}" for item in contract.required)
+    if contract.pitfalls:
+        lines.append("Known ways this question is answered badly:")
+        lines.extend(f"  - {item}" for item in contract.pitfalls)
+    return "\n".join(lines)
+
+
+def _w4_response_text(response: object) -> str:
+    try:
+        text = getattr(response, "text", None)
+    except Exception:
+        return ""
+    return text.strip() if isinstance(text, str) else ""
+
+
+def _w4_with_text(response: object, text: str) -> object:
+    """Rebuild the response around the audited answer, carrying citations over.
+
+    The platform accepts exactly one non-null answer field, so a response that
+    already carries a structured `output` owns no text answer to override and is
+    returned untouched.
+    """
+    if getattr(response, "output", None) is not None:
+        return response
+    citations = getattr(response, "citations", None)
+    try:
+        if citations:
+            return Response(text=text, citations=citations)
+        return Response(text=text)
+    except Exception:
+        return response
+
+
+def _w4_normalize_figure(token: str) -> str:
+    """One numeric literal reduced to the value it states, not how it is typed."""
+    value = token.replace(",", "")
+    if "." in value:
+        value = value.rstrip("0").rstrip(".")
+    return value or "0"
+
+
+def _w4_figures(text: str) -> set:
+    """Every quantity the text asserts, less the ordinals that only number a list."""
+    body = _W2_LIST_MARKER_RE.sub(" ", text)
+    found = set()
+    for match in _W2_FIGURE_RE.finditer(body):
+        found.add(_w4_normalize_figure(match.group(0)))
+    return found
+
+
+def _w4_entities(text: str) -> set:
+    """Every named token the text asserts.
+
+    A capitalized word that opens a sentence, a heading, or a bullet is
+    capitalized by position rather than by being a name, so it is not counted;
+    a real name almost always also occurs somewhere it did not open a clause.
+    """
+    found = set()
+    for match in _W2_WORD_RE.finditer(text):
+        cursor = match.start() - 1
+        while cursor >= 0 and text[cursor] in " \t":
+            cursor -= 1
+        if cursor < 0 or text[cursor] == "\n" or text[cursor] in _W2_CLAUSE_HEAD_CHARS:
+            continue
+        word = match.group(0).strip(".-'’").lower()
+        if len(word) >= _W2_MIN_ENTITY_CHARS:
+            found.add(word)
+    return found
+
+
+def _w4_unmakes_draft(draft: str, revision: str) -> bool:
+    """True when the revision fails to carry forward something the draft asserted."""
+    if not _w4_figures(draft).issubset(_w4_figures(revision)):
+        return True
+    return not _w4_entities(draft).issubset(_w4_entities(revision))
+
+
+def _w4_accept_revision(draft: str, revision: str) -> bool:
+    """Keep the audited answer only when it adds to the draft without unmaking it.
+
+    Length cannot tell a repair from a replacement: a revision that answers with
+    a different entity, or restates a figure as a different figure, is exactly as
+    long as one that fills a gap. The audited text is therefore accepted only
+    when every concrete claim the draft asserted - each quantity, each named
+    token - still stands in it. Additions are free; deletions and substitutions
+    return the draft.
+    """
+    if not revision or revision == draft:
+        return False
+    if len(revision) < _W2_MIN_REVISION_CHARS:
+        return False
+    if len(revision) < len(draft) * _W2_MIN_REVISION_RATIO:
+        return False
+    return not _w4_unmakes_draft(draft, revision)
+
+
+async def _w4_verify_against_contract(
+    contract: _W2AnswerContract, question: str, draft: str, *, deadline: float,
+) -> str:
+    """Stage 3 - audit the draft against the contract and return the answer to deliver."""
+    timeout = min(_W2_VERIFY_TIMEOUT_SECONDS, _w4_remaining(deadline) - _W2_TAIL_RESERVE_SECONDS)
+    messages = [
+        {"role": "system", "content": _W2_VERIFY_SYSTEM},
+        {
+            "role": "user",
+            "content": (
+                f"Question:\n{question}\n\nAnswer contract:\n{_w4_contract_block(contract)}"
+                f"\n\nDraft answer:\n{draft[:_W2_DRAFT_PROMPT_CHARS]}"
+            ),
+        },
+    ]
+    revision = await _w4_chat(messages, timeout=timeout, temperature=_W2_VERIFY_TEMPERATURE)
+    return revision if _w4_accept_revision(draft, revision) else draft
+
+
+def _w4_schema_property_names(schema: object) -> list[str]:
+    if not isinstance(schema, dict):
+        return []
+    properties = schema.get("properties")
+    return [key for key in properties] if isinstance(properties, dict) else []
+
+
+def _w4_is_degenerate_output(output: object, schema: object) -> bool:
+    """True when the base produced a structured payload the scorer will read as empty."""
+    if output is None:
+        return True
+    if isinstance(output, (str, list, tuple, dict)) and len(output) == 0:
+        return True
+    if isinstance(output, dict):
+        names = _w4_schema_property_names(schema)
+        if names and not any(key in output for key in names):
+            return True
+        if all(value in (None, "", [], {}) for value in output.values()):
+            return True
+    return False
+
+
+async def _w4_repair_structured_output(
+    question: str, schema: object, response: object, *, deadline: float,
+) -> object:
+    """Repair-only ladder: a working structured payload is always returned untouched."""
+    output = getattr(response, "output", None)
+    if not _w4_is_degenerate_output(output, schema):
+        return response
+    draft = _w4_response_text(response)
+    recovered = _w4_json_object(draft)
+    if recovered is None:
+        timeout = min(_W2_REPAIR_TIMEOUT_SECONDS, _w4_remaining(deadline) - 2.0)
+        try:
+            rendered = json.dumps(schema, ensure_ascii=False)[:1_500]
+        except (TypeError, ValueError):
+            rendered = ""
+        messages = [
+            {"role": "system", "content": _W2_REPAIR_SYSTEM},
+            {
+                "role": "user",
+                "content": (
+                    f"Question:\n{question}\n\nOutput schema:\n{rendered}"
+                    f"\n\nAnswer text:\n{draft[:_W2_DRAFT_PROMPT_CHARS]}"
+                ),
+            },
+        ]
+        recovered = _w4_json_object(await _w4_chat(messages, timeout=timeout, temperature=0.0))
+    if recovered is None or _w4_is_degenerate_output(recovered, schema):
+        return response
+    citations = getattr(response, "citations", None)
+    try:
+        if citations:
+            return Response(output=recovered, citations=citations)
+        return Response(output=recovered)
+    except Exception:
+        return response
+
+
+async def _w4_research_or_salvage(query_input: Query) -> Response:
+    """Stage 2 - the research stage, held so no failure inside it can escape.
+
+    The demoted base entrypoint is foreign code: it raises whatever its own tool
+    layer raises. A hosted tool call that overruns its own `timeout=` surfaces as
+    `harnyx_commons.errors.ToolInvocationTimeoutError`, which subclasses
+    RuntimeError directly and matches no guard the base installed for itself. Any
+    such escape leaves `@entrypoint`, and the platform charges an escaping
+    exception to the miner as MINER_UNHANDLED_EXCEPTION: the task scores 0 with
+    no retry. Measured on `FB_526bfbe6_w2`, 1 of 3 replays (2026-08-09).
+
+    The stage therefore always resolves to a Response the later stages can work
+    on. A floor answer scores poorly; an escape scores zero and takes the whole
+    task with it.
+    """
+    try:
+        return await _w4_baseline_query(query_input)
+    except Exception:
+        return Response(text="No verifiable source-backed answer was reached for this question.")
+
+
+@entrypoint("query")
+async def query(query: Query) -> Response:
+    """w4 contract wrapper: plan the answer contract, run the baseline, then verify.
+
+    The baseline artifact's own entrypoint is demoted to `_w4_baseline_query` and
+    runs as the research stage of this sequence. Contract planning runs on every
+    ordinary request before the research starts, and the verification stage holds
+    authority over the answer this entrypoint returns.
+    """
+    deadline = perf_counter() + _w4_total_budget_seconds()
+    question = getattr(query, "text", "") or ""
+    schema = getattr(query, "output_schema", None)
+
+    contract = await _w4_build_answer_contract(question, schema, deadline=deadline)
+    response = await _w4_research_or_salvage(query)
+
+    if contract is not None:
+        draft = _w4_response_text(response)
+        if draft:
+            audited = await _w4_verify_against_contract(
+                contract, question, draft, deadline=deadline,
+            )
+            if audited != draft:
+                response = _w4_with_text(response, audited)
+    if schema is not None:
+        response = await _w4_repair_structured_output(
+            question, schema, response, deadline=deadline,
+        )
+    return response
+# --- w4 answer-contract wrapper (end) ---
