@@ -13,12 +13,12 @@ from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
 LLM_PROVIDER = "openrouter"
 MODEL = "z-ai/glm-5.2"
 COMMIT_FALLBACK_MODEL = "deepseek/deepseek-v3.2"
-LLM_TURN_TIMEOUT_SECONDS = 90.0
-TASK_TOTAL_BUDGET_SECONDS = 270.0
 MAX_RETRY_ATTEMPTS_PER_TURN = 2
+LLM_TURN_TIMEOUT_SECONDS = 90.0
+FETCH_TIMEOUT_SECONDS = 15.0
+TASK_TOTAL_BUDGET_SECONDS = 235.0
 SEARCH_TIMEOUT_SECONDS = 20.0
 FETCH_RETRY_ATTEMPTS = 2
-FETCH_TIMEOUT_SECONDS = 15.0
 
 RESEARCH_TURN_CAP = 10
 RESEARCH_TIME_CAP_SECONDS = 140.0
@@ -215,25 +215,14 @@ SYSTEM_PROMPT = (
     "write the qualifying entity's name without that word, not exclude the entity.\n\n"
     "FINAL ANSWER:\n"
     "End with a committed, SELF-CONTAINED answer: state the answer first, then a compact "
-    "proof — each qualifying entity with the figures that qualify it — written as "
-    "flowing prose paragraphs with [n] citations: no markdown bullets, headers, bold or "
-    "tables unless the question itself asks for a list or a table. State the answer in "
-    "the first sentence. SHAPE RULE: when the question splits what it asks into "
-    "labelled parts — (a)/(b)/(c), (1)/(2)/(3), or first/then/finally — answer every "
-    "part under the question's own label, inline in the prose ('(a) …', '(b) …'), in "
-    "the question's order, each part carrying only what that part asks; the labels "
-    "are text the question chose, not markup. LITERAL RULE: a name, title, credit "
-    "or heading the question asks for 'as credited', 'as printed', 'as listed' or "
-    "'exactly as it appears' is the WHOLE line the source prints for it — the name "
-    "together with the nationality, dates or descriptor printed beside it, e.g. "
-    "'A. Example (British, 1901–1980)' — quoted as printed, never shortened. Name "
-    "near-miss exclusions with the criterion each fails ONLY when the question asks "
-    "which of several candidates qualify; a question that names its own entities gets "
-    "no exclusions and no entities it did not ask about. Do NOT reproduce the working "
-    "table or internal scaffolding; rewrite the proof as prose. Do NOT end with a "
-    "summary or recap that restates figures already given. On a candidate-pool "
-    "question a reader must be able to see the full pool reasoning from the FINAL "
-    "ANSWER alone. Scoring is pairwise against a "
+    "proof — each qualifying entity with the figures that qualify it, and the near-miss "
+    "exclusions with the exact criterion each fails — written as flowing prose "
+    "paragraphs with [n] citations: no markdown bullets, headers, bold or tables "
+    "unless the question itself asks for a list or a table. State the answer in the "
+    "first sentence. Do NOT reproduce the working table or internal scaffolding; "
+    "rewrite the proof as prose. Do NOT end with a summary or recap that restates "
+    "figures already given. A reader must be able to see the full "
+    "candidate-pool reasoning from the FINAL ANSWER alone. Scoring is pairwise against a "
     "competitor: an answer that refuses, defers, or hedges to 'insufficient data' loses "
     "outright, and so does a bare answer with no completeness proof. If evidence covers "
     "only part of the pool, commit to the best-supported answer and note that the roster "
@@ -269,20 +258,9 @@ PSEUDO_CALL_RE = re.compile(r"\b(?:search_web|fetch_page|page_grep|page_read)\s*
 # a reply that opens by narrating what it will look up next is a plan, not an
 # answer; with tools disabled it can only be retried
 NARRATED_INTENT_RE = re.compile(
-    r"^\s*(?:i need to|i will need to|let me|i'll|i will|first,? i|now i(?:'ll| will)?)\s+"
-    r"(?:find|search|read|check|look|fetch|grep|locate|verify|carefully|analy[sz]e|examine|"
-    r"compare|compile|review|go through|work through|extract|scan)",
+    r"^\s*(?:i need to|i will need to|let me|i'll|i will|first,? i)\s+(?:find|search|read|check|look|fetch|grep|locate|verify)",
     re.IGNORECASE,
 )
-# a reply that opens by taking stock of its evidence and then works through it in
-# working tables is the reasoning, not the answer: with no FINAL ANSWER section
-# it can only be retried
-COT_DUMP_HEAD_RE = re.compile(
-    r"^\s*(?:i (?:now )?have|now (?:that )?i have|i've (?:now )?(?:got|gathered|collected)|"
-    r"with (?:all )?(?:the|these|this) (?:data|tables?|evidence|results?)|let me|okay,? |ok,? |so,? )",
-    re.IGNORECASE,
-)
-TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$", re.MULTILINE)
 ABSTENTION_MARKERS = (
     "i could not", "i cannot", "i was unable", "unable to", "cannot answer",
     "insufficient evidence", "no evidence", "could not find", "cannot determine",
@@ -1038,16 +1016,6 @@ async def _run_fetch_page(url: str, index: _ResultIndex, terms: list[str],
 
 
 BRACKET_RE = re.compile(r"\[([0-9][0-9,;\s-]*)\]")
-# a bracket that carries the reading coordinates along with the number — the
-# model echoing a page window as "[20, chars 3507–4707]" — is the number
-RAW_POINTER_RE = re.compile(
-    r"\[\s*(\d{1,3})\s*,\s*(?:chars?|offsets?|pos(?:ition)?)\s*[:=]?\s*[\d,]+\s*(?:[-–—]|to)\s*[\d,]+\s*\]",
-    re.IGNORECASE,
-)
-
-
-def _plain_pointers(text: str) -> str:
-    return RAW_POINTER_RE.sub(r"[\1]", text or "")
 
 
 def _numbers_from_bracket(value: str, *, max_number: int) -> tuple[int, ...]:
@@ -1349,15 +1317,9 @@ COMMIT_MESSAGE = (
     "Tools are now DISABLED. Produce the VERIFY table and FINAL ANSWER from the numbered "
     "evidence you already have, with [n] citations after every claim. Write the FINAL "
     "ANSWER as prose paragraphs: no bullets, headers or bold unless the question asks "
-    "for a list or table, and no closing recap. Keep the question's own part labels "
-    "((a), (b), (1), (2) …) inline and in order, each part carrying only what it asks; "
-    "where the question wants a name 'as credited' or 'exactly as it appears', quote "
-    "the whole line the source prints (name plus the descriptor beside it, e.g. "
-    "'A. Example (British, 1901–1980)'); name exclusions only when the "
-    "question asks which of several candidates qualify. Cite the question's named "
-    "source for the requested facts; add no descriptions, background or category "
-    "confirmations from other pages, and do not cite pages fetched for that purpose. "
-    "Commit."
+    "for a list or table, and no closing recap. Cite the question's named source for "
+    "the requested facts; add no descriptions, background or category confirmations "
+    "from other pages, and do not cite pages fetched for that purpose. Commit."
 )
 
 # A `fast` query is judged on component correctness against the reference, from a
@@ -1779,9 +1741,7 @@ AMEND_SYSTEM = (
     "Keep every other [n] citation bracket exactly where it stands.\n"
     "5. Deliver prose paragraphs: turn any bullet list into sentences, drop bold and "
     "headers, and drop a closing summary that only restates figures already given — "
-    "unless the question itself asks for a list, a table or a fixed output form. Keep "
-    "any part labels the question itself uses ((a), (b), (1) …) as inline text, and "
-    "keep names the question wants 'as credited' exactly as the draft quotes them.\n"
+    "unless the question itself asks for a list, a table or a fixed output form.\n"
     "6. Output the complete answer and nothing else — no preamble, no notes about what "
     "you changed. If nothing above applies, return the draft verbatim."
 )
@@ -1997,9 +1957,6 @@ def _needs_forced_retry(text: str) -> bool:
         return True
     if NARRATED_INTENT_RE.match(text) is not None:
         return True
-    if (COT_DUMP_HEAD_RE.match(text) is not None and len(TABLE_ROW_RE.findall(text)) >= 4
-            and FINAL_SECTION_RE.search(text) is None):
-        return True
     if len(text) < HARD_MIN_ANSWER_CHARS and not _fast_mode() and _so_extract_json(text) is None:
         return True
     # an answer that OPENS with a refusal is a refusal regardless of how much
@@ -2043,12 +2000,12 @@ def _dump_floor_answer(index: _ResultIndex) -> str | None:
 
 
 def _deliverable(text: str | None, index: _ResultIndex, *, cite_text: str | None = None) -> Response:
-    answer = _plain_pointers((text or "").strip())
+    answer = (text or "").strip()
     if not answer:
         answer = _dump_floor_answer(index) or INSUFFICIENT_ANSWER
     # citations may be sourced from the fuller pre-extraction text: the marker
     # numbers that justify the final section often live in the verify table
-    citations, position_of = _citations_from_inline_markers(_plain_pointers(cite_text) or answer, index)
+    citations, position_of = _citations_from_inline_markers(cite_text or answer, index)
     answer = _repoint_markers(answer, position_of, max_number=index.max_number())
     return Response(text=answer, citations=list(citations) if citations else None)
 
@@ -2957,16 +2914,10 @@ def _so_proof_messages(question: str, value: object, answer: str, evidence: str,
         "You write the evidence trail for an answer that has already been decided. "
         "You cannot change the answer; you show why it is the answer.\n"
         "Write one claim per line, each line starting with '- '. Rules:\n"
-        "1. FIRST one line per answer value, in the order the question asks for them, "
-        "each stating the value and the source line it is read from.\n"
-        "2. THEN the scope. When the question COUNTS or AGGREGATES a set (how many, "
-        "the total, every entry of ...), list every member of that set with the "
-        "attribute being counted — completeness is the proof. When the question SELECTS "
-        "one item from a set by a condition, list only the members the question's own "
-        "condition keeps and say why each other kept member does not fit; never "
-        "enumerate the whole source table or the members the condition already "
-        "excludes.\n"
-        "3. Show the arithmetic that produces each counted value, written out "
+        "1. Establish the COMPLETE candidate set the question ranges over, and say "
+        "what makes it complete (the source's own count or list).\n"
+        "2. Name the candidates that were considered and RULED OUT, with the reason.\n"
+        "3. Show the arithmetic that produces each answer value, written out "
         "(for example: 8 + 2 + 2 + 3 = 15).\n"
         "4. EVERY line must quote at least one of the ANSWER VALUES verbatim, and "
         "every line must end with a pointer from ALLOWED POINTERS. Use no other "
@@ -3541,8 +3492,7 @@ async def _plain_query_with_cold_retry(query: Query, budget: float) -> Response:
     return result
 
 
-@entrypoint("query")
-async def query(query: Query) -> Response:
+async def _w4_baseline_query(query: Query) -> Response:
     """Route on the caller's schema, and record the scoring mode for the run.
 
     Without a schema this is the previous entrypoint with two extra attribute
@@ -3569,3 +3519,429 @@ async def query(query: Query) -> Response:
     except Exception:
         return _so_response(_so_skeleton(schema, schema), None)
 # --- structured output (end) ---
+
+
+# --- w4 answer-contract wrapper (begin) ---
+# The base artifact's `query` entrypoint is demoted to `_w4_baseline_query` and a
+# new `query` coordinates three stages: answer-contract planning, baseline
+# research, and contract verification with authority over the returned answer.
+# The only contract with the demoted base is the platform ABI (`Query`,
+# `Response`, `llm_chat`) plus NameError-guarded probes for optional base
+# constants.
+
+_W2_PLAN_TIMEOUT_SECONDS = 22.0
+_W2_VERIFY_TIMEOUT_SECONDS = 28.0
+_W2_REPAIR_TIMEOUT_SECONDS = 24.0
+_W2_TAIL_RESERVE_SECONDS = 8.0
+_W2_PLAN_TEMPERATURE = 0.1
+_W2_VERIFY_TEMPERATURE = 0.12
+_W2_MIN_REVISION_CHARS = 80
+_W2_MIN_REVISION_RATIO = 0.6
+_W2_MIN_ENTITY_CHARS = 3
+_W2_MAX_CONTRACT_ITEMS = 6
+_W2_DRAFT_PROMPT_CHARS = 6_000
+_W2_DEFAULT_BUDGET_SECONDS = 235.0
+
+_W2_LIST_MARKER_RE = re.compile(r"(?m)^[ \t]*[(\[]?\d{1,2}[.)\]][ \t]+")
+_W2_FIGURE_RE = re.compile(r"\d+(?:[.,]\d+)*")
+_W2_WORD_RE = re.compile(r"[A-Z][A-Za-z0-9&'’.\-]*")
+_W2_CLAUSE_HEAD_CHARS = ".!?:;#*->|•"
+
+_W2_PLAN_SYSTEM = (
+    "You plan the acceptance criteria for a research answer before the research runs.\n"
+    "Read the question and list what a complete, correct answer must contain.\n"
+    "Reply with JSON only, no prose, in this exact shape:\n"
+    '{"deliverable": "<one sentence naming what must be returned>", '
+    '"required": ["<concrete element the answer must state>", ...], '
+    '"pitfalls": ["<a specific way an answer to this question goes wrong>", ...]}\n'
+    "Give at most six `required` entries and at most three `pitfalls`. "
+    "Each entry must be concrete and checkable against a draft answer - name the "
+    "quantity, entity, unit, date range, or enumeration that must appear. "
+    "Never guess the answer itself; describe only what the answer must cover."
+)
+
+_W2_VERIFY_SYSTEM = (
+    "You audit a draft research answer against an answer contract and repair it.\n"
+    "The contract lists what the answer must contain. Check the draft against every "
+    "entry and return the corrected answer.\n"
+    "Rules:\n"
+    "- Repair only concrete, verifiable gaps: a required element the draft never "
+    "states, an internal contradiction, a requested unit or format the draft ignores.\n"
+    "- Use only facts already present in the draft. Never introduce a fact, figure, "
+    "name, or citation that the draft does not contain.\n"
+    "- Every figure, quantity, date, unit, name, and citation marker the draft states "
+    "stands as written. You may not drop one, round one, reword one, or swap one for a "
+    "different value or a different entity. Your edits may only add.\n"
+    "- The draft's own answer to the question is the answer. If you believe a different "
+    "entity or value fits the question better, say so in one added clause and leave the "
+    "draft's answer standing.\n"
+    "- If a required element is genuinely absent from the draft's evidence, say so "
+    "plainly in one clause rather than inventing it.\n"
+    "- Preserve the draft's wording wherever it already satisfies the contract.\n"
+    "- If the draft already satisfies the contract, return it unchanged.\n"
+    "Return the full corrected answer text and nothing else - no preamble, no notes, "
+    "no commentary about what you changed."
+)
+
+_W2_REPAIR_SYSTEM = (
+    "You convert a research answer into the exact JSON object a caller's schema "
+    "requires.\n"
+    "Use only facts stated in the answer text. Do not invent values. If the answer "
+    "does not supply a required field, use null for it.\n"
+    "Reply with a single JSON object and nothing else."
+)
+
+
+class _W2AnswerContract:
+    """The formal state object carried between the plan and verify stages."""
+
+    def __init__(self, deliverable: str, required: list[str], pitfalls: list[str]) -> None:
+        self.deliverable = deliverable
+        self.required = required
+        self.pitfalls = pitfalls
+
+    def is_actionable(self) -> bool:
+        return bool(self.deliverable or self.required)
+
+
+def _w4_provider() -> str:
+    """Resolve the base's LLM provider without globals(); the validator rejects it."""
+    try:
+        return LLM_PROVIDER
+    except NameError:
+        return "openrouter"
+
+
+def _w4_model() -> str:
+    try:
+        return MODEL
+    except NameError:
+        return "z-ai/glm-5"
+
+
+def _w4_total_budget_seconds() -> float:
+    try:
+        return float(TASK_TOTAL_BUDGET_SECONDS)
+    except (NameError, TypeError, ValueError):
+        return _W2_DEFAULT_BUDGET_SECONDS
+
+
+def _w4_remaining(deadline: float) -> float:
+    return deadline - perf_counter()
+
+
+async def _w4_chat(messages: list[dict[str, object]], *, timeout: float, temperature: float) -> str:
+    """One bounded LLM call on the platform ABI; empty string on any failure."""
+    if timeout <= 0:
+        return ""
+    try:
+        result = await llm_chat(
+            provider=_w4_provider(), model=_w4_model(), messages=messages,
+            temperature=temperature, timeout=timeout,
+        )
+    except Exception:
+        return ""
+    try:
+        return (result.response.raw_text or "").strip()
+    except Exception:
+        return ""
+
+
+def _w4_json_object(text: str) -> dict | None:
+    """Tolerant extraction of the first JSON object in a model reply."""
+    if not text:
+        return None
+    body = text.strip()
+    if body.startswith("```"):
+        body = body.split("```")[1] if "```" in body[3:] else body[3:]
+        if body[:4].lower().startswith("json"):
+            body = body[4:]
+    start = body.find("{")
+    end = body.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        parsed = json.loads(body[start:end + 1])
+    except (ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _w4_string_list(value: object, limit: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items = []
+    for entry in value:
+        if isinstance(entry, str) and entry.strip():
+            items.append(entry.strip())
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _w4_schema_hint(schema: object) -> str:
+    """Render the caller's output schema for the planning prompt."""
+    if schema is None:
+        return ""
+    try:
+        rendered = json.dumps(schema, ensure_ascii=False)[:1_200]
+    except (TypeError, ValueError):
+        return ""
+    return f"\n\nThe answer will be returned against this output schema:\n{rendered}"
+
+
+async def _w4_build_answer_contract(
+    question: str, schema: object, *, deadline: float,
+) -> _W2AnswerContract | None:
+    """Stage 1 - plan the acceptance criteria before the baseline research runs."""
+    timeout = min(_W2_PLAN_TIMEOUT_SECONDS, _w4_remaining(deadline) - _W2_TAIL_RESERVE_SECONDS)
+    messages = [
+        {"role": "system", "content": _W2_PLAN_SYSTEM},
+        {"role": "user", "content": f"Question:\n{question}{_w4_schema_hint(schema)}"},
+    ]
+    payload = _w4_json_object(await _w4_chat(
+        messages, timeout=timeout, temperature=_W2_PLAN_TEMPERATURE,
+    ))
+    if payload is None:
+        return None
+    deliverable = payload.get("deliverable")
+    contract = _W2AnswerContract(
+        deliverable=deliverable.strip() if isinstance(deliverable, str) else "",
+        required=_w4_string_list(payload.get("required"), _W2_MAX_CONTRACT_ITEMS),
+        pitfalls=_w4_string_list(payload.get("pitfalls"), 3),
+    )
+    return contract if contract.is_actionable() else None
+
+
+def _w4_contract_block(contract: _W2AnswerContract) -> str:
+    """Render the contract as the audit checklist handed to the verify stage."""
+    lines = []
+    if contract.deliverable:
+        lines.append(f"Deliverable: {contract.deliverable}")
+    if contract.required:
+        lines.append("The answer must state:")
+        lines.extend(f"  - {item}" for item in contract.required)
+    if contract.pitfalls:
+        lines.append("Known ways this question is answered badly:")
+        lines.extend(f"  - {item}" for item in contract.pitfalls)
+    return "\n".join(lines)
+
+
+def _w4_response_text(response: object) -> str:
+    try:
+        text = getattr(response, "text", None)
+    except Exception:
+        return ""
+    return text.strip() if isinstance(text, str) else ""
+
+
+def _w4_with_text(response: object, text: str) -> object:
+    """Rebuild the response around the audited answer, carrying citations over.
+
+    The platform accepts exactly one non-null answer field, so a response that
+    already carries a structured `output` owns no text answer to override and is
+    returned untouched.
+    """
+    if getattr(response, "output", None) is not None:
+        return response
+    citations = getattr(response, "citations", None)
+    try:
+        if citations:
+            return Response(text=text, citations=citations)
+        return Response(text=text)
+    except Exception:
+        return response
+
+
+def _w4_normalize_figure(token: str) -> str:
+    """One numeric literal reduced to the value it states, not how it is typed."""
+    value = token.replace(",", "")
+    if "." in value:
+        value = value.rstrip("0").rstrip(".")
+    return value or "0"
+
+
+def _w4_figures(text: str) -> set:
+    """Every quantity the text asserts, less the ordinals that only number a list."""
+    body = _W2_LIST_MARKER_RE.sub(" ", text)
+    found = set()
+    for match in _W2_FIGURE_RE.finditer(body):
+        found.add(_w4_normalize_figure(match.group(0)))
+    return found
+
+
+def _w4_entities(text: str) -> set:
+    """Every named token the text asserts.
+
+    A capitalized word that opens a sentence, a heading, or a bullet is
+    capitalized by position rather than by being a name, so it is not counted;
+    a real name almost always also occurs somewhere it did not open a clause.
+    """
+    found = set()
+    for match in _W2_WORD_RE.finditer(text):
+        cursor = match.start() - 1
+        while cursor >= 0 and text[cursor] in " \t":
+            cursor -= 1
+        if cursor < 0 or text[cursor] == "\n" or text[cursor] in _W2_CLAUSE_HEAD_CHARS:
+            continue
+        word = match.group(0).strip(".-'’").lower()
+        if len(word) >= _W2_MIN_ENTITY_CHARS:
+            found.add(word)
+    return found
+
+
+def _w4_unmakes_draft(draft: str, revision: str) -> bool:
+    """True when the revision fails to carry forward something the draft asserted."""
+    if not _w4_figures(draft).issubset(_w4_figures(revision)):
+        return True
+    return not _w4_entities(draft).issubset(_w4_entities(revision))
+
+
+def _w4_accept_revision(draft: str, revision: str) -> bool:
+    """Keep the audited answer only when it adds to the draft without unmaking it.
+
+    Length cannot tell a repair from a replacement: a revision that answers with
+    a different entity, or restates a figure as a different figure, is exactly as
+    long as one that fills a gap. The audited text is therefore accepted only
+    when every concrete claim the draft asserted - each quantity, each named
+    token - still stands in it. Additions are free; deletions and substitutions
+    return the draft.
+    """
+    if not revision or revision == draft:
+        return False
+    if len(revision) < _W2_MIN_REVISION_CHARS:
+        return False
+    if len(revision) < len(draft) * _W2_MIN_REVISION_RATIO:
+        return False
+    return not _w4_unmakes_draft(draft, revision)
+
+
+async def _w4_verify_against_contract(
+    contract: _W2AnswerContract, question: str, draft: str, *, deadline: float,
+) -> str:
+    """Stage 3 - audit the draft against the contract and return the answer to deliver."""
+    timeout = min(_W2_VERIFY_TIMEOUT_SECONDS, _w4_remaining(deadline) - _W2_TAIL_RESERVE_SECONDS)
+    messages = [
+        {"role": "system", "content": _W2_VERIFY_SYSTEM},
+        {
+            "role": "user",
+            "content": (
+                f"Question:\n{question}\n\nAnswer contract:\n{_w4_contract_block(contract)}"
+                f"\n\nDraft answer:\n{draft[:_W2_DRAFT_PROMPT_CHARS]}"
+            ),
+        },
+    ]
+    revision = await _w4_chat(messages, timeout=timeout, temperature=_W2_VERIFY_TEMPERATURE)
+    return revision if _w4_accept_revision(draft, revision) else draft
+
+
+def _w4_schema_property_names(schema: object) -> list[str]:
+    if not isinstance(schema, dict):
+        return []
+    properties = schema.get("properties")
+    return [key for key in properties] if isinstance(properties, dict) else []
+
+
+def _w4_is_degenerate_output(output: object, schema: object) -> bool:
+    """True when the base produced a structured payload the scorer will read as empty."""
+    if output is None:
+        return True
+    if isinstance(output, (str, list, tuple, dict)) and len(output) == 0:
+        return True
+    if isinstance(output, dict):
+        names = _w4_schema_property_names(schema)
+        if names and not any(key in output for key in names):
+            return True
+        if all(value in (None, "", [], {}) for value in output.values()):
+            return True
+    return False
+
+
+async def _w4_repair_structured_output(
+    question: str, schema: object, response: object, *, deadline: float,
+) -> object:
+    """Repair-only ladder: a working structured payload is always returned untouched."""
+    output = getattr(response, "output", None)
+    if not _w4_is_degenerate_output(output, schema):
+        return response
+    draft = _w4_response_text(response)
+    recovered = _w4_json_object(draft)
+    if recovered is None:
+        timeout = min(_W2_REPAIR_TIMEOUT_SECONDS, _w4_remaining(deadline) - 2.0)
+        try:
+            rendered = json.dumps(schema, ensure_ascii=False)[:1_500]
+        except (TypeError, ValueError):
+            rendered = ""
+        messages = [
+            {"role": "system", "content": _W2_REPAIR_SYSTEM},
+            {
+                "role": "user",
+                "content": (
+                    f"Question:\n{question}\n\nOutput schema:\n{rendered}"
+                    f"\n\nAnswer text:\n{draft[:_W2_DRAFT_PROMPT_CHARS]}"
+                ),
+            },
+        ]
+        recovered = _w4_json_object(await _w4_chat(messages, timeout=timeout, temperature=0.0))
+    if recovered is None or _w4_is_degenerate_output(recovered, schema):
+        return response
+    citations = getattr(response, "citations", None)
+    try:
+        if citations:
+            return Response(output=recovered, citations=citations)
+        return Response(output=recovered)
+    except Exception:
+        return response
+
+
+async def _w4_research_or_salvage(query_input: Query) -> Response:
+    """Stage 2 - the research stage, held so no failure inside it can escape.
+
+    The demoted base entrypoint is foreign code: it raises whatever its own tool
+    layer raises. A hosted tool call that overruns its own `timeout=` surfaces as
+    `harnyx_commons.errors.ToolInvocationTimeoutError`, which subclasses
+    RuntimeError directly and matches no guard the base installed for itself. Any
+    such escape leaves `@entrypoint`, and the platform charges an escaping
+    exception to the miner as MINER_UNHANDLED_EXCEPTION: the task scores 0 with
+    no retry. Measured on `FB_526bfbe6_w2`, 1 of 3 replays (2026-08-09).
+
+    The stage therefore always resolves to a Response the later stages can work
+    on. A floor answer scores poorly; an escape scores zero and takes the whole
+    task with it.
+    """
+    try:
+        return await _w4_baseline_query(query_input)
+    except Exception:
+        return Response(text="No verifiable source-backed answer was reached for this question.")
+
+
+@entrypoint("query")
+async def query(query: Query) -> Response:
+    """w4 contract wrapper: plan the answer contract, run the baseline, then verify.
+
+    The baseline artifact's own entrypoint is demoted to `_w4_baseline_query` and
+    runs as the research stage of this sequence. Contract planning runs on every
+    ordinary request before the research starts, and the verification stage holds
+    authority over the answer this entrypoint returns.
+    """
+    deadline = perf_counter() + _w4_total_budget_seconds()
+    question = getattr(query, "text", "") or ""
+    schema = getattr(query, "output_schema", None)
+
+    contract = await _w4_build_answer_contract(question, schema, deadline=deadline)
+    response = await _w4_research_or_salvage(query)
+
+    if contract is not None:
+        draft = _w4_response_text(response)
+        if draft:
+            audited = await _w4_verify_against_contract(
+                contract, question, draft, deadline=deadline,
+            )
+            if audited != draft:
+                response = _w4_with_text(response, audited)
+    if schema is not None:
+        response = await _w4_repair_structured_output(
+            question, schema, response, deadline=deadline,
+        )
+    return response
+# --- w4 answer-contract wrapper (end) ---

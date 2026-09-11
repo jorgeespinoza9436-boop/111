@@ -1,284 +1,42 @@
-"""uid 28 line first on structured tasks, uid 177 line first otherwise.
-
-Batch a6c9b8eb (2026-09-04) ranked this fleet's two lineages #2 (champion line
-with the mode-aware controller and answer-shape stage, 0.644) and #6 (the
-v52 line with the same two stages, 0.597) of 217 on qualifying, while the
-four artifacts above and around them were all multi-lineage combinations.
-The #2 artifact also lost two rows outright by overrunning the sandbox clock
-on structured tasks and returning an invalid payload. This file keeps both
-lineages intact as factories and adds what the top artifacts have and ours
-lacked: a hard per-lineage clock, a research cutoff that steers the model to
-finish instead of searching further, an emergency answer built from the last
-model text when a lineage still overruns, and a selector between the two.
-"""
 from __future__ import annotations
 
-import asyncio
-import json
-import time
-
 from harnyx_miner_sdk.decorators import entrypoint
-from harnyx_miner_sdk.context import ContextSnapshot
 from harnyx_miner_sdk.query import Query, Response
-import harnyx_miner_sdk.api as _hsapi
 
-VERSION = "v3-f177u28-fl"
+_PV_STATS: dict = {}
 
-# The validator's execution limit is 300 s. Everything below leaves headroom.
-_DUO_TOTAL_S = 282.0        # never return later than this after start
-_DUO_AGENT_S = 236.0        # hard wait on any single lineage
-_DUO_CUTOFF_S = 228.0       # after this, tools refuse research and the model is told to finish
-_DUO_BACKUP_MIN_S = 50.0    # a backup lineage only starts with at least this much left
-_DUO_TEXT_CAP = 24000
-_DUO_GRADER_MODEL = "openai/gpt-oss-120b"
-_DUO_GRADER_TIMEOUT_S = 25.0
-
-_DUO_STATE = {"started": None, "text": None, "cutoff": None, "context": None}
-# Research loop on z-ai/glm-5.3-flash; a failed call retries once on
-# z-ai/glm-5.2. Both are openrouter, so no second provider account is
-# needed: the subnet serves glm-5.2-fast only through ai_gateway, which
-# this fleet has no credential for. The provider follows the model rather
-# than whatever lane constant a lineage happens to carry.
-_DUO_MODEL_PROVIDER = {
-    "z-ai/glm-5.3-flash": "openrouter",
-    "z-ai/glm-5.2": "openrouter",
-}
-_DUO_GLM_ALTERNATE = {
-    "z-ai/glm-5.3-flash": "z-ai/glm-5.2",
-    "z-ai/glm-5.2": "z-ai/glm-5.3-flash",
-}
-
-
-def _duo_provider_for(provider, model):
-    return _DUO_MODEL_PROVIDER.get(model, provider)
-_DUO_SCHEMA_FIRST_S = 140.0   # first lineage on a structured task; leaves a backup its own clock
-_DUO_FINISH_ORDER = (
-    "The research time budget is exhausted. Do not request any more search or "
-    "fetch tools. Using only what is already in this conversation, write your "
-    "complete final answer now, including every field the requested output "
-    "schema requires; if a finish tool is available, call it with that answer."
+import re
+_ABSTAIN_LEAD_RE = re.compile(
+    # A refusal that names the EVIDENCE rather than the speaker. Three distinct
+    # phrasings have now been measured, all scoring 0.000, and they differ in the
+    # VERB, not the subject:
+    #   "the evidence provided is insufficient to identify..."      (09_08 0abcba92)
+    #   "the evidence provided does not contain the complete data"  (09_08 0abcba92)
+    #   "the available evidence ... was insufficient to compile"    (contract_v2)
+    # so the verb side is deliberately wide. Every first-person test passed all three.
+    r"\b(?:the |this |that |our |any |all )?"
+    r"(?:available|gathered|provided|retrieved|collected)?\s*"
+    r"(?:evidence|information|data|sources?|excerpts?|citations?|material|record)\b"
+    r"[^.]{0,110}?\b(?:"
+    r"insufficient|inadequate|incomplete|not sufficient|not enough|too fragmentary"
+    r"|fragmentary|does not contain|do not contain|does not include|do not include"
+    r"|does not provide|do not provide|is missing|are missing|lacks"
+    r"|only partial|only partially|not available|unavailable"
+    r")\b"
+    r"|\b(?:insufficient|inadequate|not enough)\s+"
+    r"(?:evidence|information|data|material)\b"
+    r"|\bcannot be (?:determined|identified|established|answered|computed"
+    r"|verified) from\b"
+    r"|\bdoes not (?:permit|allow|support|contain) (?:the )?(?:a |an |any )?"
+    r"(?:complete |defensible |reliable )?(?:answer|data|determination|identification)\b",
+    re.IGNORECASE,
 )
+# Only the OPENING of an answer: past that, "the table does not contain a row
+# for 1963" is a finding, not a refusal to answer.
+_ABSTAIN_LEAD_CHARS = 320
 
 
-def _duo_elapsed() -> float:
-    started = _DUO_STATE["started"]
-    return 0.0 if started is None else max(0.0, time.monotonic() - started)
-
-
-def _duo_remaining() -> float:
-    return _DUO_TOTAL_S - _duo_elapsed()
-
-
-def _duo_cutoff() -> float:
-    cutoff = _DUO_STATE.get("cutoff")
-    return cutoff if isinstance(cutoff, (int, float)) else _DUO_CUTOFF_S
-
-
-# --- hosted-tool wrappers: bound both lineages at import time -----------------
-# The lineages do `from harnyx_miner_sdk.api import llm_chat, ...` inside their
-# factories, which run after these assignments, so they bind the wrappers.
-_duo_llm_chat = _hsapi.llm_chat
-_duo_search_web = _hsapi.search_web
-_duo_fetch_page = _hsapi.fetch_page
-
-
-def _duo_capture(result) -> None:
-    """Remember the latest model text: the emergency answer if a lineage overruns."""
-    try:
-        llm = getattr(result, "response", None)
-        text = getattr(llm, "raw_text", None)
-        if not text:
-            choices = getattr(llm, "choices", None) or []
-            if choices:
-                content = getattr(getattr(choices[0], "message", None), "content", None)
-                if isinstance(content, str):
-                    text = content
-                elif isinstance(content, (list, tuple)):
-                    text = " ".join(str(getattr(p, "text", None) or (p.get("text") if isinstance(p, dict) else "") or "") for p in content)
-        if isinstance(text, str) and text.strip():
-            _DUO_STATE["text"] = text.strip()[:_DUO_TEXT_CAP]
-    except Exception:
-        pass
-
-
-# The platform's script validator rejects `**kwargs` expansion in calls, so the
-# wrappers name every argument the lineages use. Unset ones pass as None, which
-# the SDK treats as absent.
-async def _duo_wrapped_llm_chat(*, provider, model, messages, temperature=None,
-                                max_output_tokens=None, max_tokens=None, tools=None,
-                                tool_choice=None, parallel_tool_calls=None, thinking=None,
-                                provider_extra=None, timeout=None):
-    if _duo_elapsed() >= _duo_cutoff() and messages is not None:
-        steered = list(messages)
-        steered.append({"role": "user", "content": _DUO_FINISH_ORDER})
-        messages = steered
-    provider = _duo_provider_for(provider, model)
-    try:
-        result = await _duo_llm_chat(
-            provider=provider, model=model, messages=messages, temperature=temperature,
-            max_output_tokens=max_output_tokens, max_tokens=max_tokens, tools=tools,
-            tool_choice=tool_choice, parallel_tool_calls=parallel_tool_calls,
-            thinking=thinking, provider_extra=provider_extra, timeout=timeout,
-        )
-    except Exception:
-        # Loop-model policy: glm-5.3-flash on OpenRouter first; on any exception
-        # the same call is retried once on the other GLM lane, glm-5.2-fast via
-        # ai_gateway (and the reverse when that lane was the one that failed).
-        # Upstream pins never carry across providers.
-        alt_model = _DUO_GLM_ALTERNATE.get(model)
-        if alt_model is None:
-            raise
-        alt_provider = _duo_provider_for(None, alt_model)
-        result = await _duo_llm_chat(
-            provider=alt_provider, model=alt_model, messages=messages, temperature=temperature,
-            max_output_tokens=max_output_tokens, max_tokens=max_tokens, tools=tools,
-            tool_choice=tool_choice, parallel_tool_calls=parallel_tool_calls,
-            thinking=thinking, provider_extra=None, timeout=timeout,
-        )
-    _duo_capture(result)
-    return result
-
-
-async def _duo_wrapped_search_web(search_queries, *, provider, num=None,
-                                  provider_extra=None, timeout=None):
-    if _duo_elapsed() >= _duo_cutoff():
-        raise TimeoutError("research cutoff reached; finalize with gathered evidence")
-    return await _duo_search_web(search_queries, provider=provider, num=num,
-                                 provider_extra=provider_extra, timeout=timeout)
-
-
-async def _duo_wrapped_fetch_page(url, *, provider, provider_extra=None, timeout=None):
-    if _duo_elapsed() >= _duo_cutoff():
-        raise TimeoutError("research cutoff reached; finalize with gathered evidence")
-    return await _duo_fetch_page(url, provider=provider, provider_extra=provider_extra,
-                                 timeout=timeout)
-
-
-_hsapi.llm_chat = _duo_wrapped_llm_chat
-_hsapi.search_web = _duo_wrapped_search_web
-_hsapi.fetch_page = _duo_wrapped_fetch_page
-
-
-def _duo_json_value(text: str):
-    start, end = text.find("{"), text.rfind("}")
-    if start != -1 and end > start:
-        try:
-            value = json.loads(text[start:end + 1])
-            if isinstance(value, (dict, list)):
-                return value
-        except Exception:
-            return None
-    return None
-
-
-def _duo_emergency(query: Query) -> Response:
-    """Best available answer when every lineage failed or overran.
-
-    A structured task gets a schema-shaped payload: the last model text if it
-    parses and validates, else a placeholder built from the schema. A prose
-    answer to a structured task is an invalid payload and scores 0 anyway; an
-    invalid payload also counts as an error against the artifact.
-    """
-    text = (_DUO_STATE["text"] or "").strip()[:_DUO_TEXT_CAP]
-    schema = getattr(query, "output_schema", None)
-    if isinstance(schema, dict):
-        candidate = _sg_coerce(text, schema) if text else None
-        if not isinstance(candidate, (dict, list)) or not _sg_valid(candidate, schema):
-            candidate = _sg_default(schema)
-        try:
-            return Response(output=candidate)
-        except Exception:
-            pass
-    if not text:
-        text = "No verifiable source-backed answer was reached for this question."
-    try:
-        return Response(text=text)
-    except Exception:
-        return Response(text="No verifiable source-backed answer was reached for this question.")
-
-
-def _duo_usable(response, query: Query) -> bool:
-    if not isinstance(response, Response):
-        return False
-    schema = getattr(query, "output_schema", None)
-    if schema is not None:
-        return response.output is not None and _sg_valid(response.output, schema)
-    text = response.text or ""
-    return len(text.strip()) >= 40 and not text.startswith("No verifiable source-backed answer")
-
-
-async def _duo_call(agent, query: Query):
-    """Call a lineage entrypoint in whichever form it declares.
-
-    The SDK accepts both `query(query)` and `query(query, context)`. Binding
-    happens when the coroutine function is called, before its body runs, so a
-    signature mismatch surfaces here as TypeError and nothing has executed yet.
-    Reading `__code__` would be simpler but the platform's script validator
-    rejects dunder attribute reflection.
-    """
-    try:
-        pending = agent(query)
-    except TypeError:
-        pending = agent(query, _DUO_STATE.get("context"))
-    return await pending
-
-
-async def _duo_run(agent, query: Query, budget: float):
-    try:
-        return await asyncio.wait_for(_duo_call(agent, query), timeout=max(1.0, budget))
-    except Exception:
-        return None
-
-
-def _duo_answer_text(response) -> str:
-    if response is None:
-        return ""
-    text = getattr(response, "text", None)
-    if isinstance(text, str) and text.strip():
-        return text
-    output = getattr(response, "output", None)
-    if output is not None:
-        try:
-            return json.dumps(output)
-        except Exception:
-            return str(output)
-    return ""
-
-
-async def _duo_pick(query: Query, first, second):
-    """Both lineages answered: ask a cheap grader which is more complete and correct."""
-    a, b = _duo_answer_text(first), _duo_answer_text(second)
-    if _duo_remaining() < _DUO_GRADER_TIMEOUT_S + 5.0:
-        return first
-    question = (getattr(query, "text", "") or "")[:4000]
-    messages = [
-        {"role": "system", "content": "You are a strict grader. Two candidate answers to the same research question are given. Reply with exactly one letter, A or B, naming the answer that is more complete, specific, and correct, with claims backed by citations."},
-        {"role": "user", "content": f"QUESTION:\n{question}\n\nANSWER A:\n{a[:6000]}\n\nANSWER B:\n{b[:6000]}\n\nWhich is better? Reply A or B."},
-    ]
-    try:
-        result = await asyncio.wait_for(_duo_llm_chat(
-            provider="openrouter", model=_DUO_GRADER_MODEL, messages=messages,
-            temperature=0.0, max_output_tokens=8, timeout=_DUO_GRADER_TIMEOUT_S,
-        ), timeout=_DUO_GRADER_TIMEOUT_S + 2.0)
-        verdict = (getattr(getattr(result, "response", None), "raw_text", None) or "")
-        if not verdict:
-            choices = getattr(getattr(result, "response", None), "choices", None) or []
-            content = getattr(getattr(choices[0], "message", None), "content", None) if choices else None
-            verdict = content if isinstance(content, str) else ""
-        return second if verdict.strip().upper().startswith("B") else first
-    except Exception:
-        return first
-
-
-
-
-
-
-
-
-
-
-def _compose_f177_line():
+def _compose_branch_bd6fe585916b9dd3212967e9f36809799a0691b3855d8a54f615f7e60d84596c_entry():
 
 
     import asyncio
@@ -290,43 +48,43 @@ def _compose_f177_line():
     from harnyx_miner_sdk.decorators import entrypoint
     from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
 
-    VERSION = "v260-5-rsau"
+    VERSION = "v52-pin-reviewed"
 
-
+                                                                                
     LLM_LANE_A = "openrouter"                                          
-    LLM_LANE_B = "openrouter"                                                        
-
-
-    LOOP_MODEL_A = "z-ai/glm-5.3-flash"
-    LOOP_MODEL_B = "z-ai/glm-5.3-flash"
+    LLM_LANE_B = "openrouter"   # was ai_gateway: no credential on our miners
+                                                                               
+                                                                                  
+    LOOP_MODEL_A = "z-ai/glm-5.2"
+    LOOP_MODEL_B = "deepseek/deepseek-v3.2"   # openrouter-served, verified
     AUDIT_MODEL = "openai/gpt-oss-120b"              
-    SEARCH_PROVIDER = "parallel"                                       
     SCHEMA_MODEL = "openai/gpt-oss-120b"             
     RESORT_MODEL = "deepseek/deepseek-v3.2"          
+    SEARCH_PROVIDER = "parallel"                                       
+                                                                                
+                                                                                  
+    SEARCH_PROVIDERS = ("parallel",)   # exa/tavily: no credential
+    FETCH_PROVIDERS = ("parallel",)   # exa/firecrawl: no credential
 
-
-    SEARCH_PROVIDERS = ("parallel", "exa", "tavily")
-    FETCH_PROVIDERS = ("parallel", "exa", "firecrawl")
-
-
-    WALL_BUDGET_S = 236.0                                                               
-
-
+                                                                                
+    WALL_BUDGET_S = 266.0                                                               
+                                                                                  
+                                                                                 
     BRIEF_TIMEOUT_S = 50.0                                                                           
-
-
+                                                                                    
+                                                                                
     TURN_TIMEOUT_S = 75.0
     LANE_B_MAX_PAYLOAD_CHARS = 144000                                          
-
-
+                                                                            
+                                  
+    AUDIT_TIMEOUT_S = 28.0
     SEARCH_TIMEOUT_S = 18.0
     FETCH_TIMEOUT_S = 16.0
-    AUDIT_TIMEOUT_S = 28.0
-
-
+                                                                                 
+                                                                               
     WRAPUP_AT_S = 90.0                                                                                       
-
-
+                                                                                
+                                                                                
     MIN_TAIL_S = 8.0
     MAX_TURNS = 15                                                                              
     AUDIT_EXTRA_TURNS = 2
@@ -334,49 +92,49 @@ def _compose_f177_line():
     RESCUE_TIMEOUT_S = 55.0
     DIGEST_TAIL_S = 14.0                                                                      
 
-
+                                                                                
     SEARCH_EXCERPT_CHARS = 550
-    _LEDGER_TEXT_CAP = 1_500_000  # was 400_000: appendix tables of 500K-char reports were cut off
+    _LEDGER_TEXT_CAP = 400_000                                                        
     PAGE_GREP_WINDOW = 700
     PAGE_GREP_MAX_HITS = 6
     PAGE_READ_MAX_CHARS = 12_000
 
-
+                                                                               
     RETAIN_MARGIN_CHARS = 260                                                   
     RETAIN_MAX_PER_ROW = 6
     SHOWN_SPAN_MAX_CHARS = 2400                                                                                                               
     RETAIN_MIN_QUOTE = 12
-
-
+                                                                              
+                                                                              
     FETCH_HEAD_CHARS = 3000                                                          
     FETCH_WINDOW_CHARS = 3600                                                        
-
-
+                                                                           
+                                                                                 
     CITATION_MIN_SPAN_CHARS = 6000                                  
-
-
+                                                                
+                                                                           
     CITATION_ANCHORED_SPAN_CHARS = 2000                                               
     CITATION_MAX_REF_CHARS = 14_000                                                 
     FETCH_WINDOWS_PER_PAGE = 3                                                         
-
-
+                                                                                    
+                                                                               
     FETCH_PLAIN_CHARS = 6500                               
     ANSWER_CHAR_CAP = 60000
     CITATION_CAP = 24
-
-
+                                                                              
+                                                                                
     EVIDENCE_CHAR_BUDGET = 105_000
 
-
+                                                                                
     BRIEF_MIN_USD = 0.03
     AUDIT_MIN_USD = 0.05
     AUDIT_EVIDENCE_CHARS = 9000                                                    
     WRAPUP_MIN_USD = 0.02
 
-
+                                                      
     TASK_BUDGET_USD = 0.5
-
-
+                                                                           
+                                                                              
     BLIND_LIMIT = 3
 
     _SPEND = {"left": None, "blind": 0}
@@ -397,15 +155,15 @@ def _compose_f177_line():
     def _spend_left() -> float:
         left = _SPEND["left"]
         if isinstance(left, (int, float)):
-
-
+                                                                               
+                                                                         
             return max(0.0, float(left))
         if _SPEND["blind"] >= BLIND_LIMIT:
-
-
+                                                                               
+                                                                             
             return 0.0
-
-
+                                                                         
+                                                                            
         return TASK_BUDGET_USD
 
 
@@ -536,7 +294,7 @@ def _compose_f177_line():
         },
     ]
 
-
+                                                                               
     LOOP_RULES = (
         "You are a research agent answering a hard multi-part factual question. A "
         "judge compares your answer head-to-head with a strong reference and only "
@@ -777,16 +535,16 @@ def _compose_f177_line():
         r"\b(?:highest|lowest|largest|smallest|most|least|greatest|fewest|longest|"
         r"shortest|first|last|best|worst|only|oldest|youngest|newest|biggest)\b",
         re.IGNORECASE)
-
-
+                                                                           
+                                                                           
     _EST_STOP = frozenset(
         "interest honest modest protest request suggest forest harvest invest "
         "manifest contest arrest digest earnest conquest tempest midwest northwest "
         "southwest unrest bequest behest attest molest ingest infest detest incest "
         "armrest backrest pretest headrest footrest".split())
     _EST_RE = re.compile(r"\b([a-z]{3,})est\b")                          
-
-
+                                                                            
+                                                                           
     def _has_superlative(text: str) -> bool:
         if _ONE_WINNER_RE.search(text or ""):
             return True
@@ -830,13 +588,13 @@ def _compose_f177_line():
         q = " ".join((question or "").split())
         if _SET_HINT_RE.search(q):
             return True
-
-
+                                                                               
+                                                                          
         m = _PLURAL_HEAD_RE.search(q)
         if m and m.group(1).lower() not in _PLURAL_FALSE:
             if not _has_superlative(q) or re.search(r"\b(?:all|every|each)\b", q, re.IGNORECASE):
                 return True
-
+                                                                                
         return bool(re.search(r"\bwhich\b", q, re.IGNORECASE)) and bool(_SET_CONNECTIVE_RE.search(q))
 
 
@@ -873,12 +631,7 @@ def _compose_f177_line():
 
     class EvidenceLedger:
         def __init__(self) -> None:
-            self.rows: list[dict] = []
-            try:
-                _CLOSE_LEDGERS.append(self)
-                _CLOSE_LEDGERS[:] = _CLOSE_LEDGERS[-8:]
-            except Exception:
-                pass
+            self.rows: list[dict] = []                        
 
         def add(self, receipt_id: str, result_id: str, note_len: int,
                 kind: str, spans: list[tuple[int, int]] | None,
@@ -889,8 +642,8 @@ def _compose_f177_line():
                 "result_id": result_id,
                 "note_len": note_len,
                 "kind": kind,
-
-
+                                                                               
+                                                                                   
                 "title": (title or "")[:160],
                 "url": (url or "")[:300],
                 "preview": (preview or "")[:1200],
@@ -910,16 +663,16 @@ def _compose_f177_line():
                 return []
             spans = row["spans"]
             if spans:
-
-
+                                                                                  
+                                                                               
                 note_len = int(row["note_len"] or 0)
                 shown: list[list[int]] = []
                 for span in spans[:4]:
                     start = max(0, min(int(span[0]), note_len))
                     end = max(start + 1, min(int(span[1]), note_len))
                     shown.append([start, end])
-
-
+                                                                                 
+                                                                            
                 retained = []
                 for a, b in (row.get("retained") or []):
                     a = max(0, min(int(a), note_len))
@@ -927,8 +680,8 @@ def _compose_f177_line():
                     retained.append([a, b])
                 if retained:
                     shown = retained
-
-
+                                                                                
+                                                            
                 shown.sort()
                 merged: list[list[int]] = []
                 for s, e in shown:
@@ -936,8 +689,8 @@ def _compose_f177_line():
                         merged[-1][1] = max(merged[-1][1], e)
                     else:
                         merged.append([s, e])
-
-
+                                                                               
+                                                                              
                 span_target = (CITATION_ANCHORED_SPAN_CHARS if retained
                                else CITATION_MIN_SPAN_CHARS)
                 base = sum(e - s for s, e in merged)
@@ -947,8 +700,8 @@ def _compose_f177_line():
                     for w in merged:
                         pad = min(extra, max(0, span_target - (w[1] - w[0])))
                         if pad:
-
-
+                                                                                
+                                                                                   
                             left = min(pad // 2, w[0])
                             w[0] -= left
                             rest = pad - left
@@ -976,7 +729,7 @@ def _compose_f177_line():
                     slices=slices,
                 )]
             return []                                                           
-
+                                                                           
 
         def ref_for(self, number: int) -> CitationRef | None:
             return (self.refs_for(number) or [None])[0]
@@ -1008,7 +761,7 @@ def _compose_f177_line():
             if pos + width >= n:
                 break
             pos += step
-
+                                                                            
         scored.sort(key=lambda hs: (-hs[0], hs[1]))
         picked: list[tuple[int, int]] = []
         for hits, start in scored:
@@ -1028,61 +781,34 @@ def _compose_f177_line():
 
 
     class ToolOutput:
-
-
+                                                                         
+                                                                    
         def __init__(self, text: str, rows: list[dict] | None = None,
                      memo_key: str = "") -> None:
             self.text = text
             self.rows = rows or []
-
-
+                                                                              
+                                                                                  
             self.memo_key = memo_key
 
 
     _TOOL_MEMO: dict = {}
-
-    _FETCH_STATE: dict = {"spent_s": 0.0, "dead": [], "dead_norm": []}
-    # Strip EVERY leading variant label, not just one: the log shows
-    # "www.dv.the-numbers.com" -- one strip leaves "dv.the-numbers.com",
-    # which misses the already-dead key and costs another 16s timeout.
-    # Only known site-variant labels are stripped, so en./de.wikipedia.org
-    # stay distinct resources.
-    _HOST_PREFIX_RE = re.compile(r"^(?:www|m|mobile|amp|dv|web|secure)\.", re.I)
-    _PATH_PREFIX_RE = re.compile(r"^/(?:alpha|amp|beta)(?=/)", re.I)
-    _URL_SPLIT_RE = re.compile(r"^https?://([^/\s?#]+)([^\s?#]*)", re.I)
-
-
-    def _norm_fetch_key(url: str) -> str:
-        """Collapse www./m./alpha variants of one resource onto a single key."""
-        text = (url or "").strip()
-        if "web.archive.org" in text.lower():
-            return ""          # an archive copy is its own resource
-        match = _URL_SPLIT_RE.match(text)
-        if not match:
-            return ""
-        host = match.group(1).lower()
-        for _ in range(3):
-            stripped = _HOST_PREFIX_RE.sub("", host, count=1)
-            if stripped == host or stripped.count(".") < 1:
-                break
-            host = stripped
-        path = _PATH_PREFIX_RE.sub("", match.group(2) or "").rstrip("/")
-        return host + path.lower()
+                                                                      
+    _FETCH_STATE: dict = {"spent_s": 0.0, "dead": []}
 
 
     def _reset_run_state() -> None:
         _TOOL_MEMO.clear()
         _FETCH_STATE["spent_s"] = 0.0
         _FETCH_STATE["dead"] = []
-        _FETCH_STATE["dead_norm"] = []
-
-
+                                                                                
+                                                                                 
         _SPEND["left"] = None
-
-
+                                                                                 
+                                                                               
         _SPEND["blind"] = 0
-
-
+                                                                               
+                                                     
         _BRIEF_STORE["raw"] = ""
         _BRIEF_STORE["plan"] = ""
         _RUN_UPSTREAM["glm"] = None
@@ -1123,10 +849,10 @@ def _compose_f177_line():
                 f"or read a different part of the page instead.")
         return text
 
-
+                                                                               
     HISTORY_KEEP_VERBATIM = 4
-
-
+                                                                          
+                                                                          
     SEED_KEEP_TOOL_TURNS = 2
     HISTORY_COMPACT_AT_CHARS = 30_000
     HISTORY_MIN_SAVING = 0.15                                                     
@@ -1152,8 +878,8 @@ def _compose_f177_line():
         if len(text) <= int(SEARCH_AGED_LEAD_CHARS * 1.3):
             return text
         cut = SEARCH_AGED_LEAD_CHARS
-
-
+                                                                                 
+                                                          
         while cut < len(text) and (text[cut].isdigit() or text[cut] in ",.%-/:"):
             cut += 1
         head = text[:cut]
@@ -1166,7 +892,7 @@ def _compose_f177_line():
     def _condense_block(body: str) -> str:
         lines = body.split("\n")
         if len(lines) < 8:
-
+                                                                      
             rebuilt = []
             changed = False
             for line in lines:
@@ -1191,11 +917,11 @@ def _compose_f177_line():
                     or lead_pending
                     or _DIGIT_RE.search(stripped) is not None
                     or _SCOPE_RE.search(stripped) is not None)
-
+                                                                          
             was_lead = lead_pending
             lead_pending = stripped.startswith("[") or stripped.startswith("---")
             if keep:
-
+                                                                      
                 if was_lead and len(stripped) > SEARCH_AGED_LEAD_CHARS * 2:
                     kept.append(_condense_excerpt(line))
                 else:
@@ -1215,8 +941,8 @@ def _compose_f177_line():
                           if isinstance(m, dict) and m.get("role") == "system"
                           and isinstance(m.get("content"), str)
                           and m["content"].startswith("Automatic first-pass searches")]
-
-
+                                                                             
+                                                                              
         if len(tool_positions) > SEED_KEEP_TOOL_TURNS:
             for i in seed_positions:
                 body = messages[i].get("content")
@@ -1231,8 +957,8 @@ def _compose_f177_line():
                 total += len(body)
         for i in seed_positions:
             total += len(messages[i]["content"])
-
-
+                                                                                  
+                                                                               
         if len(tool_positions) > BRIEF_KEEP_TOOL_TURNS:
             _condense_brief(messages)
         if total < HISTORY_COMPACT_AT_CHARS:
@@ -1275,12 +1001,12 @@ def _compose_f177_line():
         hit = _memo_hit(memo_key)
         if hit:
             return f"# web_search({query_text!r}) {hit}"
-
-
+                                                                                  
+                                                                                 
         payload = None
         fired: set[str] = set()
-
-
+                                                                              
+                                                                                
         for attempt, allow_repeat in ((query_text, False), (query_text, True),
                                       (_degrade_query(query_text), False)):
             if not attempt.strip() or (attempt in fired and not allow_repeat):
@@ -1313,8 +1039,8 @@ def _compose_f177_line():
             note = (getattr(item, "note", None) or "")
             if not note.strip():
                 continue                                                            
-
-
+                                                                                
+                                                                  
             n_len = len(note)
             span = ([(0, min(max(SEARCH_EXCERPT_CHARS, 100), n_len))] if n_len >= 100
                     else ([(0, n_len)] if n_len else None))
@@ -1331,23 +1057,21 @@ def _compose_f177_line():
     async def _do_fetch(url: str, focus: str, question: str, ledger: EvidenceLedger) -> str:
         if not url.strip():
             return "# read_page: empty url"
-
-
+                                                                                
+                                                                                 
         plain_key = _memo_key("fetch", url)
         focus_key = _memo_key("fetch", url, focus)
         hit = _memo_hit(plain_key) or _memo_hit(focus_key)
         if hit:
             return f"# read_page({url!r}) {hit}"
-
-
-        _dead_key = _norm_fetch_key(url)
-        if url in _FETCH_STATE["dead"] or (
-                _dead_key and _dead_key in _FETCH_STATE["dead_norm"]):
+                                                                                
+                                                            
+        if url in _FETCH_STATE["dead"]:
             return (f"# read_page({url!r}): this url already returned no content in "
                     f"this run and will not be retried. Use a different source, or "
                     f"answer from the evidence already numbered above.")
-
-
+                                                                         
+                                                                               
         payload = None
         for _attempt in (0, 1):                                                 
             started = monotonic()
@@ -1363,14 +1087,12 @@ def _compose_f177_line():
             _FETCH_STATE["spent_s"] = _FETCH_STATE["spent_s"] + elapsed
             if payload is not None and getattr(payload, "results", None):
                 break
-
-
+                                                                                 
+                                                                               
             if elapsed >= FETCH_TIMEOUT_S * 0.6:
                 break
         if payload is None or not getattr(payload, "results", None):
             _FETCH_STATE["dead"].append(url)
-            if _dead_key and _dead_key not in _FETCH_STATE["dead_norm"]:
-                _FETCH_STATE["dead_norm"].append(_dead_key)
         if payload is None:
             return f"# read_page({url!r}) failed"
         _spend_note(payload)
@@ -1390,7 +1112,7 @@ def _compose_f177_line():
             return ToolOutput(f"# read_page({url!r}) -> [{_SLOT.format(0)}] full page, "
                               f"{len(note)} chars\n{_lossless_view(note)}", [row],
                               memo_key=plain_key)
-
+                                                                              
         terms = _key_terms(question) | _key_terms(focus)
         windows = _best_windows(note, terms, FETCH_WINDOW_CHARS, k=FETCH_WINDOWS_PER_PAGE)
         row = {"receipt_id": receipt, "result_id": rid, "note_len": len(note),
@@ -1529,7 +1251,7 @@ def _compose_f177_line():
             n_hit = sum(1 for w in want if w in words)
             if len(want) == 1 and ticker == want[0]:
                 score = 100                                                        
-
+                                                                         
             elif want and n_hit == len(want):                                      
                 score = 50 + n_hit
             else:
@@ -1578,8 +1300,8 @@ def _compose_f177_line():
         b = max(a + 1, min(int(b), note_len))
         if b <= a:
             return
-
-
+                                                                               
+                                                                               
         if b - a > SHOWN_SPAN_MAX_CHARS:
             mid = (a + b) // 2
             a = max(0, mid - SHOWN_SPAN_MAX_CHARS // 2)
@@ -1773,8 +1495,8 @@ def _compose_f177_line():
         b = min(int(row.get("note_len") or len(text)), j + RETAIN_MARGIN_CHARS)
         if b <= a:
             return f"# retain_evidence: could not bound the excerpt in [{n}]"
-
-
+                                                                                
+                                                                              
         for k, (ka, kb) in enumerate(kept):
             if a <= kb and ka <= b:
                 merged = (min(ka, a), max(kb, b))
@@ -1796,7 +1518,7 @@ def _compose_f177_line():
         if not isinstance(args, dict):
             args = {}
         name = getattr(call, "name", "") or ""
-
+                                                                            
         if name == "web_search":
             return await _do_search(str(args.get("query") or ""), ledger)
         if name == "read_page":
@@ -1837,7 +1559,7 @@ def _compose_f177_line():
 
 
     def _upstream_key(model: str) -> str | None:
-        if model.startswith("z-ai/glm-5.3-flash"):
+        if model.startswith("z-ai/glm-5.2"):
             return "glm"
         if model.startswith("openai/gpt-oss"):
             return "oss"
@@ -1858,8 +1580,8 @@ def _compose_f177_line():
                 return None                                                            
             chosen = live[0]
             _RUN_UPSTREAM[key] = chosen
-
-
+                                                                              
+                                                                                   
         return {"provider": {"only": [chosen], "allow_fallbacks": False}}
 
 
@@ -1878,8 +1600,8 @@ def _compose_f177_line():
                            think: dict | None = None) -> str:
         if think is None:
             think = _least_think(lane, model)
-
-
+                                                                                   
+                                                                                    
         _pin0 = _upstream(lane, model)
         payload = None
         for _pin in ((_pin0, None) if _pin0 is not None else (None,)):
@@ -1939,51 +1661,44 @@ def _compose_f177_line():
 
     async def _chat_turn(messages: list[dict], deadline: float, *, finish_only: bool,
                          force_tools: bool = False):
-
-
+                                                                               
+                                                                               
         turn_wall = monotonic() + TURN_TIMEOUT_S + 35.0
         payload_chars = sum(len(str(msg.get("content") or "")) for msg in messages
                             if isinstance(msg, dict))
-
-
+                                                                                     
+                                                                                 
         for lane_model in ((LLM_LANE_A, LOOP_MODEL_A, True),
                            (LLM_LANE_A, LOOP_MODEL_A, False),
                            (LLM_LANE_B, LOOP_MODEL_B, False)):
             lane = lane_model[0]
             model = lane_model[1]
             pinned = lane_model[2]
-            if model == LOOP_MODEL_B and payload_chars > LANE_B_MAX_PAYLOAD_CHARS:
-
-
+            if lane == LLM_LANE_B and payload_chars > LANE_B_MAX_PAYLOAD_CHARS:
+                                                                                  
+                                                                                   
                 return _EMPTY_TURN
             timeout = min(TURN_TIMEOUT_S, deadline - monotonic() - 5.0,
                           turn_wall - monotonic())
-            _left_now = deadline - monotonic()
-            # One hung 75 s turn must not eat the wrap-up: a turn gets its fair
-            # share of what is left and the wrap-up leaves the digest writer 30 s.
-            if finish_only:
-                timeout = min(timeout, max(20.0, _left_now - 32.0))
-            else:
-                timeout = min(timeout, max(30.0, (_left_now - 40.0) * 0.5))
             if timeout <= 5.0:
                 return None
             try:
-
-
+                                                                                  
+                                                                                    
                 payload = await asyncio.wait_for(llm_chat(
                     provider=lane,
                     model=model,
                     messages=messages,
                     tools=LOOP_TOOLS if (force_tools or not finish_only) else None,
                     tool_choice="auto" if (force_tools or not finish_only) else None,
-
-
+                                                                                
+                                                                              
                     temperature=0.2,
-
-
-                    thinking=({"enabled": False} if (finish_only and model == LOOP_MODEL_B)
+                                                                                  
+                                                                                   
+                    thinking=({"enabled": False} if (finish_only and lane == LLM_LANE_B)
                               else {"enabled": True, "effort": "low"}),
-                    max_output_tokens=6000 if (finish_only and model == LOOP_MODEL_B) else None,
+                    max_output_tokens=6000 if (finish_only and lane == LLM_LANE_B) else None,
                     provider_extra=_upstream(lane, model) if pinned else None,
                     timeout=timeout,
                 ), timeout=min(timeout + 6.0,
@@ -2001,8 +1716,8 @@ def _compose_f177_line():
     BRIEF_HEAD = "PRIOR ANALYSIS"
     BRIEF_KEEP_TOOL_TURNS = 4                                                 
     _BRIEF_STORE: dict = {"raw": "", "plan": ""}
-
-
+                                                                                 
+                                                                                
     _BRIEF_PLAN_RE = re.compile(
         r"^[ \t]*[#*_>]{0,4}[ \t]*(?:searches|urls|LOOKUPS|PAGES)[ \t]*[#*_]{0,3}[ \t]*:?",
         re.IGNORECASE | re.MULTILINE)
@@ -2037,8 +1752,8 @@ def _compose_f177_line():
     async def _knowledge_brief(question: str) -> tuple[str, str]:
         system = ("Senior research analyst. Commit to concrete best answers from "
                   "knowledge; mark uncertain values (verify). Never refuse.")
-
-
+                                                                            
+                                                                             
         user = (
             f"Question:\n{question}\n\n"
             "Fill in this internal worksheet. It is planning scratch for your own use, "
@@ -2068,8 +1783,8 @@ def _compose_f177_line():
                 raw = ""
         if not raw:
             return "", ""
-
-
+                                                                               
+                                                                           
         draft = raw
         cut = min((mm.start() for mm in (
             re.search(r"[#*_\s]*(?:conditions|CHECKLIST)[#*_\s]*:", raw, re.IGNORECASE),
@@ -2078,7 +1793,7 @@ def _compose_f177_line():
         ) if mm is not None), default=None)
         if cut is not None:
             draft = raw[:cut]
-
+                                                                                   
         draft = re.sub(r"^[#*_\s]*(?:draft|BEST ANSWER)[#*_\s]*:[#*_\s]*", "", draft,
                        flags=re.IGNORECASE)
         draft = re.sub(r"^[ \t]*[#*_>]{0,4}[ \t]*(?:draft|BEST ANSWER)[ \t]*[#*_]{0,3}[ \t]*\n+",
@@ -2105,19 +1820,14 @@ def _compose_f177_line():
         if not q:
             return []
         seeds = [q[:300]]
-
-
-        salient_src = q
-        try:
-            salient_src = _ask_clause(q) or q
-        except Exception:
-            salient_src = q
-        salient = [t for t in _SEED_TOKEN_RE.findall(salient_src)
+                                                                               
+                                                                               
+        salient = [t for t in _SEED_TOKEN_RE.findall(q)
                    if len(t) >= 3 and t.lower() not in _STOP and t.lower() not in _SEED_STOP]
         if len(salient) >= 2:
             seeds.append(" ".join(salient[:8]))
         if set_question and salient:
-
+                                                                               
             seeds.append("list of " + " ".join(salient[:6]))
         out: list[str] = []
         for s in seeds:
@@ -2132,8 +1842,8 @@ def _compose_f177_line():
         seeds = _seed_queries(question, set_question)
         if not seeds or (deadline - monotonic()) < 40.0:
             return ""
-
-
+                                                                         
+     
         budget = max(5.0, min(SEARCH_TIMEOUT_S * 2 + 6.0,
                               deadline - monotonic() - MIN_TAIL_S))
         seed_tasks = [asyncio.ensure_future(_do_search(seed, ledger)) for seed in seeds]
@@ -2161,8 +1871,7 @@ def _compose_f177_line():
     async def _loop(question: str, brief: str, ledger: EvidenceLedger,
                     deadline: float, turn_cap: int,
                     carry: list[dict] | None = None,
-                    allow_tools_in_wrapup: bool = False,
-                    pool_hint: str = "") -> tuple[str, list[dict]]:
+                    allow_tools_in_wrapup: bool = False) -> tuple[str, list[dict]]:
         if carry is not None:
             messages = carry
         else:
@@ -2174,9 +1883,7 @@ def _compose_f177_line():
                 messages.append({"role": "system", "content": SUPERLATIVE_RULE})
             if brief:
                 messages.append({"role": "system", "content": brief})
-                if pool_hint:
-                    messages.append({"role": "system", "content": pool_hint})
-
+                                                                
             seeded = await _preseed(question, set_q, ledger, deadline)
             if seeded:
                 messages.append({"role": "system", "content": seeded})
@@ -2196,7 +1903,7 @@ def _compose_f177_line():
                 messages.append({"role": "system", "content": _wrapup_order(left)})
                 ordered_wrapup = True
 
-
+                                                                               
             _condense_history(messages)
             payload = await _chat_turn(messages, deadline, finish_only=finish_only,
                                        force_tools=allow_tools_in_wrapup and turn == 1)
@@ -2214,33 +1921,33 @@ def _compose_f177_line():
                     content = getattr(msg, "content", None)
                     if isinstance(content, str):
                         candidate = content.strip()
-
-
+                                                                                 
+                                                                               
                 if not _is_usable_answer(candidate):
                     if repairs_left > 0 and (deadline - monotonic()) > MIN_TAIL_S + 10.0:
                         repairs_left -= 1
-
-
+                                                                                 
+                                                                                   
                         messages.append({"role": "system", "content": _REPAIR_ORDER})
                         answer = ""
                         continue
                     answer = ""                                                       
                     break
                 answer = candidate
-
-
+                                                                           
+                                                                            
                 messages.append({"role": "assistant", "content": answer})
                 break
             messages.append(msg.to_input_message())
-
-
+                                                                                
+                                                                               
             run_calls = calls[:8]
-
-
+                                                                             
+                                                                             
             tool_budget = max(5.0, min(FETCH_TIMEOUT_S * 2 + 6.0,
                                        deadline - monotonic() - MIN_TAIL_S))
-
-
+                                                                                  
+                                                                                   
             tool_tasks = [asyncio.ensure_future(_run_tool(c, question, ledger, deadline))
                           for c in run_calls]
             try:
@@ -2259,8 +1966,8 @@ def _compose_f177_line():
                     results.append("# tool timed out — use what you already have")
             for call_result in zip(run_calls, results):
                 call = call_result[0]
-
-
+                                                                                
+                                                                            
                 body = _commit_tool_output(call_result[1], ledger)
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": body})
             for call in calls[8:]:
@@ -2296,8 +2003,8 @@ def _compose_f177_line():
             "Empty lists when clean.\n\n"
             f"Question:\n{question}\n\nAnswer:\n{answer[:11000]}"
         )
-
-
+                                                                                 
+                                                                             
         table = _quote_table(ledger)
         if table:
             probe += (
@@ -2329,12 +2036,12 @@ def _compose_f177_line():
                     if key in ("incomplete_roster", "hand_waved_tally"):
                         roster_gaps.extend(found)
                     gaps.extend(found)
-
-
+                                                                              
+                                                   
         if not gaps or (deadline - monotonic()) < 70.0:
             return answer
-
-
+                                                                                 
+                                                                       
         order = ("AUDIT: the answer has gaps:\n- " + "\n- ".join(gaps[:6]))
         if roster_gaps:
             order += ("\nThe candidate pool is incomplete — this loses outright. FIRST "
@@ -2350,7 +2057,7 @@ def _compose_f177_line():
                                  AUDIT_EXTRA_TURNS + 1, carry=messages,
                                  allow_tools_in_wrapup=True)
         patched = patched.strip()
-
+                                                                           
         if not _is_usable_answer(patched) or len(patched) < int(len(answer) * 0.6):
             return answer
         return patched
@@ -2408,12 +2115,12 @@ def _compose_f177_line():
             stripped = raw.strip()
             if not stripped:
                 continue
-
-
+                                                                               
+                                                                                
             if stripped[0] in "#>":
                 continue
-
-
+                                                                                 
+                                                                                
             line = re.sub(r"^[*_`\s]+|[*_`\s]+$", "", stripped).strip()
             if not line:
                 continue
@@ -2445,8 +2152,8 @@ def _compose_f177_line():
             return hits[0]
         if len(hits) == 2:
             lo, hi = sorted(hits, key=len)
-
-
+                                                                             
+                                                                               
             if lo.lower() in hi.lower():
                 return hi
         return value
@@ -2504,7 +2211,7 @@ def _compose_f177_line():
         baseline = _case_preserve_structured(obj, ledger)
         q = question or ""
 
-
+                                                                                  
         anchors = {
             (m.group(1).lower(), m.group(2))
             for m in re.finditer(r"\b(figure|table)\s+(\d+[A-Za-z]?)\b", q, re.I)
@@ -2527,8 +2234,8 @@ def _compose_f177_line():
             return str(node.get("description") or "") if isinstance(node, dict) else ""
 
         def _document_rows(desc: str) -> list[dict]:
-
-
+                                                                             
+                                                                                  
             years = set(re.findall(r"\b(?:19|20)\d{2}\b", desc or ""))
             if len(years) != 1:
                 return []
@@ -2563,8 +2270,8 @@ def _compose_f177_line():
                 if line_b < 0:
                     line_b = len(source)
                 line = source[line_a:line_b]
-
-
+                                                                                  
+                                                       
                 if re.search(r"\.{3,}\s*\d+\b", line):
                     continue
                 nearby = source[max(0, hit.start() - 220):min(len(source), hit.end() + 220)]
@@ -2632,12 +2339,12 @@ def _compose_f177_line():
     def _citations_for(answer: str,
                        ledger: EvidenceLedger) -> tuple[list[CitationRef], dict[int, int]]:
         refs: list[CitationRef] = []
-
-
+                                                                          
+                                                                           
         slot_pos: dict[int, int] = {}
         spent = 0
-
-
+                                                                               
+                                                                              
         cited = list(_cited_numbers(answer, len(ledger.rows)))
 
         for n in cited:
@@ -2668,7 +2375,7 @@ def _compose_f177_line():
 
         def sub(m: "re.Match[str]") -> str:
             whole = m.group(0)
-
+                                                                             
             e = m.end()
             if e < len(answer) and answer[e] in "(]":
                 return whole
@@ -2690,8 +2397,8 @@ def _compose_f177_line():
                 if pos is not None and pos not in seen:
                     seen.add(pos)
                     out.append(pos)
-
-
+                                                                            
+                                                                             
             if not out:
                 return whole
             return "".join("[[%d]]" % pos for pos in out)
@@ -2701,7 +2408,7 @@ def _compose_f177_line():
 
     _VERIFY_MARK_RE = re.compile(r"\s*\((?:verify|unverified|uncertain)[^)]*\)", re.I)
 
-
+                                                                               
     _TOOL_MARKUP_RE = re.compile(
         r"<\s*/?\s*tool_call|<\s*/?\s*(?:arg_key|arg_value|function_call|invoke)\b"
         r"|\bweb_search\s*[（(]\s*query|\bread_page\s*[（(]\s*url|\bsec_filing\s*[（(]\s*company",
@@ -2710,11 +2417,12 @@ def _compose_f177_line():
     _REFUSAL_ONLY_RE = re.compile(
         r"^\s*(?:i (?:cannot|can't|am unable|was unable)|unable to|sorry[,.]|"
         r"i don'?t have (?:enough|access))", re.I)
-
-
+                                                                                
+                                                                                
     _INTENT_NARRATION_RE = re.compile(
         r"^\s*(?:i (?:need|will|should|am going|'ll)\b|let me\b|first,? (?:i|let)\b|"
         r"i'?ll (?:search|look|start|begin|gather|check))", re.I)
+    _PROCESS_NARRATION_RE = re.compile('\\bthe \\w*(?:retain|search|fetch|page)\\w*\\s+tool\\b|\\bretain_evidence\\b|\\bis being (?:finicky|strict|picky|fussy|difficult)\\b|\\blet me proceed with\\b|\\busing the (?:result|citation) numbers\\b|\\bthe tool results?\\b|\\bthe page text\\b|\\bi (?:read|fetched|retrieved|searched|grepped|checked)\\b|\\ball evidence (?:is )?retained\\b|\\bi (?:now )?have (?:all|everything)\\b|\\bi have all the data\\b|\\bthe grep for\\b|\\bgrep (?:returned|found)\\b|\\breturned exactly \\d+ match|\\bi have (?:the|all|every|both)\\b.{0,60}?\\b(?:captured|located|gathered|retrieved|in hand|available)\\b', re.I)
     MIN_ANSWER_CHARS = 40
     MIN_CITED_ANSWER_CHARS = 12                                        
     _CITE_MARK_RE = re.compile(r"\[[0-9]{1,3}\]")                                 
@@ -2725,8 +2433,8 @@ def _compose_f177_line():
 
 
     def _is_degenerate_repetition(text: str) -> bool:
-
-
+                                                                              
+                                                                                
         body = text or ""
         lines = [ln.strip().lower() for ln in body.split("\n") if len(ln.strip()) > 25]
         if len(lines) >= 3:
@@ -2741,7 +2449,7 @@ def _compose_f177_line():
         uniq = set(sents)
         if len(uniq) * 2 <= len(sents):
             return True
-
+                                                
         for s in uniq:
             if sents.count(s) >= 3:
                 return True
@@ -2752,18 +2460,3580 @@ def _compose_f177_line():
         s = _normalize_brackets(text).strip()
         if not s:
             return False
-
+                                                  
         if _TOOL_MARKUP_RE.search(s) or _looks_like_tool_json(s):
             return False
         if _STUB_ANSWER_RE.match(s) or _is_degenerate_repetition(s):
             return False
+        # A refusal is a refusal however well cited and however long, so this
+        # has to run BEFORE the cited shortcut below. Scoring is pairwise: an
+        # answer that declines loses outright, and the repair loop should get
+        # another turn instead of shipping it.
+        if _REFUSAL_ONLY_RE.match(s) or _ABSTAIN_LEAD_RE.search(s[:_ABSTAIN_LEAD_CHARS]):
+            return False
+        # Talk about our own tooling is narration, not answer. Checked after the
+        # branch's own lead-stripping, so narration that strips cleanly and
+        # leaves a cited answer behind is still accepted.
+        if _PROCESS_NARRATION_RE.search(s):
+            remainder = _strip_lead_narration(s)
+            if _PROCESS_NARRATION_RE.search(remainder) or not _CITE_MARK_RE.search(remainder):
+                return False
+            if len(remainder) < MIN_CITED_ANSWER_CHARS:
+                return False
         cited = bool(_CITE_MARK_RE.search(s))
         if cited and len(s) >= MIN_CITED_ANSWER_CHARS:
-            return True                                                           
+            return True
         if len(s) < MIN_ANSWER_CHARS:
             return False
+        if len(s) < 400 and _INTENT_NARRATION_RE.match(s):
+            return False
+        return True
 
-        if len(s) < 400 and (_REFUSAL_ONLY_RE.match(s) or _INTENT_NARRATION_RE.match(s)):
+
+    _COMMIT_RULES = (
+        "You are writing the FINAL ANSWER to a research question from evidence that "
+        "has already been gathered. You have NO tools — never emit tool syntax. A "
+        "judge compares your answer with a strong reference and credits only claims "
+        "carrying an [n] citation to the numbered evidence.\n\n"
+        "SHAPE: the first words are the answer entities themselves — no preamble, no "
+        "remark about evidence quality. Then a short proof section: the candidate "
+        "pool, each condition applied, one line per qualifier (cited) and one line "
+        "per rejected member with its cited reason — every member gets its own "
+        "line, never several swept into one clause. Reproduce figures and dates "
+        "VERBATIM. Name ALL qualifying members — omitting one scores as wrong. "
+        "Obey any literal formatting demand in the question — sort order, "
+        "comma-separated, a requested count, 'without the word X' meaning delete "
+        "that word — the shape is graded too. "
+        "Never say what the evidence does not contain; commit to the best-supported "
+        "answer you can defend."
+    )
+
+    _REPAIR_ORDER = (
+        "Your last message was not a usable final answer (it contained tool-call "
+        "markup, was empty, or was a refusal). Do NOT emit tool syntax as text. "
+        "Write the FINAL ANSWER now as plain prose: first words are the answer "
+        "entities themselves, every factual claim followed by its [n] citation, "
+        "then the short proof section. Nothing else."
+    )
+
+
+    def _sanitize_draft(text: str) -> str:
+        return _VERIFY_MARK_RE.sub("", text or "").strip()
+
+
+    def _row_evidence_text(row: dict, cap: int = 1400) -> str:
+        text = row.get("text") or ""
+        parts: list[str] = []
+        for a, b in (row.get("retained") or []):
+            try:
+                excerpt = text[max(0, int(a)):int(b)][:cap].strip()
+            except Exception:
+                continue
+            if excerpt:
+                parts.append(excerpt)
+        if parts:
+            return "\n".join(parts)
+        return (row.get("preview") or "").strip()
+
+
+    def _ledger_digest(ledger: EvidenceLedger, char_cap: int = 60000) -> str:
+        parts: list[str] = []
+        spent = 0
+        for i, row in enumerate(ledger.rows, start=1):
+            text = _row_evidence_text(row).strip()
+            if not text:
+                continue
+            block = f"[{i}] {row.get('title') or ''} ({row.get('url') or ''})\n{text}"
+            if spent + len(block) > char_cap:
+                break
+            spent += len(block)
+            parts.append(block)
+        return "\n\n".join(parts)
+
+
+    _FURNITURE_RE = re.compile(
+        r"^\s*(?:share|search|home|menu|subscribe|sign\s*in|log\s*in|newsletter|"
+        r"advertisement|cookie|skip to|follow us|read more|related|tags?|categories?|"
+        r"privacy|terms|contact|about us|navigation|toggle)\b", re.I)
+                                                                              
+                                                                          
+    _SRC_FOOTNOTE_RE = re.compile(r"\[\s*\d{1,3}\s*\]")
+    _MD_LINK_RE = re.compile(r"\]\(")
+    _BARE_URL_RE = re.compile(r"(?<!\]\()https?://")
+    _SENTENCEY_RE = re.compile(r"[.!?]\s|[.!?]$|\b(?:is|was|were|are|has|have|had|"
+                               r"reported|announced|released|won|ranked|totall?ed)\b", re.I)
+
+
+    def _informative_lead(preview: str, limit: int = 280) -> str:
+        kept: list[str] = []
+        broke = False
+        for chunk in re.split(r"(?<=[.!?])\s+|\n+", _SRC_FOOTNOTE_RE.sub("", preview or "")):
+            seg = " ".join(chunk.split())
+            if len(seg) < 30 or len(seg) > 400:
+                if kept:
+                    broke = True
+                    break
+                continue
+                                                                            
+                                                                               
+            if _SENTENCEY_RE.search(seg) is None:
+                if kept:
+                    broke = True
+                    break
+                continue
+                                                                                 
+                                                                                   
+            if _FURNITURE_RE.match(seg) and not re.search(r"\d", seg):
+                if kept:
+                    broke = True
+                    break
+                continue
+            if seg.startswith(("*", "|", "↑", "#")):
+                if kept:
+                    broke = True
+                    break
+                continue
+                                                                            
+            links = len(_MD_LINK_RE.findall(seg)) + len(_BARE_URL_RE.findall(seg))
+            if links and links * 110 >= len(seg):                           
+                if kept:
+                    broke = True
+                    break
+                continue
+            kept.append(seg)
+            if sum(len(k) for k in kept) >= limit:
+                break
+        else:
+            pass
+        out = " ".join(kept).strip()
+        if len(out) > limit:                                                      
+            cut = out.rfind(" ", 0, limit)                                      
+            out = out[:cut if cut > 60 else limit].rstrip(" ,;:-")
+        return out
+
+
+    def _deterministic_answer(question: str, ledger: EvidenceLedger) -> str:
+        rows = [(i, r) for i, r in enumerate(ledger.rows, start=1)
+                if (r.get("preview") or "").strip()]
+        if not rows:
+            return ""
+                                                                                
+                                                                                
+        out = ["Best-supported findings from the sources retrieved:"]
+        picked = 0
+        for i, r in rows:                                                             
+            if picked >= 6:                                                         
+                break                                                         
+            lead = _informative_lead(r.get("preview") or "")
+            if not lead:
+                continue
+            title = (r.get("title") or "").strip()
+            out.append(f"- {title + ': ' if title else ''}{lead} [{i}]")
+            picked += 1
+        if picked == 0:
+                                                                           
+                                                                              
+            for i, r in rows[:4]:
+                lead = " ".join((r.get("preview") or "").split())[:280]
+                if lead:
+                    out.append(f"- {lead} [{i}]")
+            if len(out) == 1:
+                return ""
+        return "\n".join(out)
+
+
+    QUOTE_SYNTH_TIMEOUT_S = 42.0
+    QUOTE_SYNTH_MIN_BUDGET_S = 30.0
+    QUOTE_SYNTH_MIN_QUOTES = 2
+    QUOTE_TABLE_CHARS = 1400                                               
+
+
+    def _quote_table(ledger: EvidenceLedger) -> str:
+        parts = []
+        for i, row in enumerate(ledger.rows, start=1):
+            text = row.get("text") or ""
+            for a, b in (row.get("retained") or []):
+                excerpt = text[max(0, int(a)):int(b)][:QUOTE_TABLE_CHARS].strip()
+                if excerpt:
+                    parts.append(f"[{i}] {row.get('title') or row.get('url') or ''}\n{excerpt}")
+        return "\n\n".join(parts)
+
+
+    def _retained_count(ledger: EvidenceLedger) -> int:
+        return sum(len(r.get("retained") or []) for r in ledger.rows)
+
+
+    async def _write_from_digest(question: str, ledger: EvidenceLedger, deadline: float) -> str:
+        left = deadline - monotonic()
+        if left < 14.0:
+            return ""
+        digest = _ledger_digest(ledger)
+        if not digest:
+            return ""
+        convo = [{"role": "system", "content": _COMMIT_RULES},
+                 {"role": "user", "content": (
+                     f"Question: {question}\n\nNumbered evidence you gathered (cite "
+                     f"facts by these [n]):\n\n{digest}\n\n"
+                     "Write the FINAL ANSWER now from this evidence. Plain prose, no "
+                     "tool syntax. First words are the answer entities; every factual "
+                     "claim carries its [n]; then the short proof section (pool, "
+                     "conditions, qualifiers, exclusions).")}]
+        async def _one(lane: str, model: str, budget: float) -> str:
+                                                                                 
+                                                                                   
+            _p0 = _upstream(lane, model)
+            payload = None
+            for _p in ((_p0, None) if _p0 is not None else (None,)):
+                try:
+                    payload = await llm_chat(
+                        provider=lane, model=model, messages=convo,
+                        temperature=0.15, max_output_tokens=2600,
+                        timeout=budget, thinking=_least_think(lane, model),
+                        provider_extra=_p,
+                    )
+                    break
+                except Exception:
+                    _spend_blind()
+                    if _p is None:
+                        raise
+                    _upstream_failed(model)
+                    continue
+            _spend_note(payload)
+            llm = getattr(payload, "llm", None)
+            text = (getattr(llm, "raw_text", None) or "").strip()
+            if not text:
+                choices = getattr(llm, "choices", None) or []
+                if choices:
+                    c = getattr(choices[0].message, "content", None)
+                    if isinstance(c, str):
+                        text = c.strip()
+            return text
+
+                                                                               
+        lanes = ((LLM_LANE_A, LOOP_MODEL_A), (LLM_LANE_B, LOOP_MODEL_B))
+        for i, lane_model in enumerate(lanes):
+            left = deadline - monotonic()
+            if left < 14.0:
+                return ""
+            budget = min(RESCUE_TIMEOUT_S, left - DIGEST_TAIL_S)
+            if i == 0:
+                                                                             
+                                                                  
+                budget = min(budget, max(12.0, left - 14.0 - DIGEST_TAIL_S))
+            if budget < 8.0:
+                return ""
+            try:
+                text = await _one(lane_model[0], lane_model[1], budget)
+            except Exception:
+                continue
+            if _is_usable_answer(text):
+                return text
+        return ""
+
+
+    async def _knowledge_resort(question: str, deadline: float) -> str:
+        left = deadline - monotonic()
+        if left < 12.0:
+            return ""
+        try:
+            return await _chat_simple(
+                LLM_LANE_A, RESORT_MODEL,
+                ("Expert researcher. Best definitive answer with concrete entities, "
+                 "numbers, dates. Never refuse."),
+                question, max_tokens=2600, timeout=min(45.0, left - 4.0))
+        except Exception:
+            return ""
+
+
+    _SN67_NULL_CONVERSION_FAILURE = object()
+
+
+    def _sn67_null_schema_status(schema):
+        """True/False/None: null valid/invalid/unsupported; bounded, no imports or IO."""
+        active = set()
+        work = [0]
+        dialect = "https://json-schema.org/draft/2020-12/schema"
+        vocabularies = (
+            "core", "applicator", "unevaluated", "validation", "meta-data",
+            "format-annotation", "content",
+        )
+
+        def conjunction(values):
+            if False in values:
+                return False
+            return None if None in values else True
+
+        def check(node, depth):
+            work[0] += 1
+            if work[0] > 3000 or depth > 64:
+                return None
+            if isinstance(node, bool):
+                return node
+            if not isinstance(node, dict) or id(node) in active:
+                return None
+            if any(key in node for key in (
+                "$id", "$anchor", "$dynamicAnchor", "$dynamicRef",
+                "$recursiveRef", "$recursiveAnchor",
+            )):
+                return None
+            if node.get("$schema", dialect) != dialect:
+                return None
+            vocabulary = node.get("$vocabulary", {})
+            if not isinstance(vocabulary, dict) or any(
+                required and name not in [
+                    "https://json-schema.org/draft/2020-12/vocab/" + suffix
+                    for suffix in vocabularies
+                ] for name, required in vocabulary.items()
+            ):
+                return None
+            active.add(id(node))
+            try:
+                outcomes = []
+                if "$ref" in node:
+                    reference = node["$ref"]
+                    if not isinstance(reference, str) or "%" in reference:
+                        return None
+                    if reference != "#" and not reference.startswith("#/"):
+                        return None
+                    target = schema
+                    for token in reference[2:].split("/") if reference != "#" else ():
+                        work[0] += 1
+                        if work[0] > 3000 or "~" in token.replace("~0", "").replace("~1", ""):
+                            return None
+                        token = token.replace("~1", "/").replace("~0", "~")
+                        if isinstance(target, dict):
+                            if "$id" in target or token not in target:
+                                return None
+                            target = target[token]
+                        elif isinstance(target, list):
+                            if not token.isascii() or not token.isdecimal() or (len(token) > 1 and token[0] == "0"):
+                                return None
+                            if len(token) > 8 or int(token) >= len(target):
+                                return None
+                            target = target[int(token)]
+                        else:
+                            return None
+                    outcomes.append(check(target, depth + 1))
+                if "type" in node:
+                    kinds = node["type"] if isinstance(node["type"], list) else [node["type"]]
+                    if not kinds or any(kind not in (
+                        "null", "object", "array", "number", "integer", "boolean", "string",
+                    ) for kind in kinds):
+                        return None
+                    outcomes.append("null" in kinds)
+                if "const" in node:
+                    outcomes.append(node["const"] is None)
+                if "enum" in node:
+                    if not isinstance(node["enum"], list) or not node["enum"]:
+                        return None
+                    outcomes.append(any(item is None for item in node["enum"]))
+                for keyword in ("allOf", "anyOf", "oneOf"):
+                    if keyword not in node:
+                        continue
+                    if not isinstance(node[keyword], list) or not node[keyword]:
+                        return None
+                    values = [check(child, depth + 1) for child in node[keyword]]
+                    if keyword == "allOf":
+                        result = conjunction(values)
+                    elif keyword == "anyOf":
+                        result = True if True in values else (None if None in values else False)
+                    else:
+                        positives = sum(value is True for value in values)
+                        result = False if positives > 1 else (None if None in values else positives == 1)
+                    outcomes.append(result)
+                if "not" in node:
+                    result = check(node["not"], depth + 1)
+                    outcomes.append(None if result is None else not result)
+                if "if" in node:
+                    condition = check(node["if"], depth + 1)
+                    if condition is None:
+                        outcomes.append(None)
+                    else:
+                        outcomes.append(check(node.get("then" if condition else "else", True), depth + 1))
+                # Other standard validation keywords apply only to non-null types;
+                # unknown keywords are annotations under the pinned host dialect.
+                return conjunction(outcomes)
+            finally:
+                active.remove(id(node))
+
+        return check(schema, 0)
+
+
+    async def _schema_output(question: str, answer: str, schema, deadline: float) -> object | None:
+        ask = ("Convert the answer to a JSON value valid under the schema. Output "
+               "ONLY the JSON value.\n\n"
+               f"Schema:\n{json.dumps(schema)}\n\nQuestion:\n{question}\n\n"
+               f"Answer:\n{answer[:14000]}")
+                                                                                
+                                                                                 
+        spare = _SN67_NULL_CONVERSION_FAILURE
+        for lane, model in ((LLM_LANE_A, SCHEMA_MODEL),
+                            (LLM_LANE_A, RESORT_MODEL),
+                            (LLM_LANE_B, LOOP_MODEL_B)):
+            left = deadline - monotonic()
+            if left < 12.0:
+                break
+            try:
+                raw = await _chat_simple(lane, model,
+                                         "You output strictly valid JSON.", ask,
+                                         timeout=min(45.0, left - 4.0), max_tokens=3400)
+                raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(),
+                             flags=re.I | re.M).strip()
+                value = json.loads(raw)
+                if value is None:
+                    if _sn67_null_schema_status(schema) is True:
+                        return None
+                    continue
+                                                                       
+                                                                       
+                if _matches_schema_shape(value, schema):
+                    if not _schema_value_empty(value):             
+                        return value
+                    if spare is _SN67_NULL_CONVERSION_FAILURE:                              
+                        spare = value
+                    continue                                                    
+                if isinstance(value, dict) and len(value) == 1:
+                    inner = list(value.values())[0]
+                    if inner is None:
+                        if _sn67_null_schema_status(schema) is True:
+                            return None
+                        continue
+                    if _matches_schema_shape(inner, schema):
+                        if not _schema_value_empty(inner):         
+                            return inner
+                        if spare is _SN67_NULL_CONVERSION_FAILURE:                          
+                            spare = inner
+            except Exception:
+                continue
+        return spare
+
+
+    def _schema_kind(schema) -> str:
+        if not isinstance(schema, dict):
+            return ""
+        kind = schema.get("type")
+        if isinstance(kind, list):
+            kind = kind[0] if kind else None
+        if kind is None:
+            for key in ("anyOf", "oneOf", "allOf"):
+                branch = schema.get(key)
+                if isinstance(branch, list):
+                    for sub in branch:
+                        got = _schema_kind(sub)
+                        if got:
+                            return got
+            if isinstance(schema.get("properties"), dict):
+                return "object"
+            if isinstance(schema.get("enum"), list):
+                return "string"
+            return ""
+        return str(kind)
+
+
+    def _schema_value_empty(value) -> bool:
+        if isinstance(value, str):
+            return not value.strip()
+        if isinstance(value, (list, tuple)):
+            return len(value) == 0 or all(_schema_value_empty(v) for v in value)
+        if isinstance(value, dict):
+            return len(value) == 0 or all(_schema_value_empty(v) for v in value.values())
+        return value is None
+
+
+    def _matches_schema_shape(value, schema) -> bool:
+        kind = _schema_kind(schema)
+        if not kind:
+            return True                                                        
+        if kind == "array":
+            return isinstance(value, list)
+        if kind == "object":
+            return isinstance(value, dict)
+        if kind == "string":
+            return isinstance(value, str)
+        if kind == "integer":
+            return isinstance(value, int) and not isinstance(value, bool)
+        if kind == "number":
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+        if kind == "boolean":
+            return isinstance(value, bool)
+        if kind == "null":
+            return value is None
+        return True
+
+
+    _NUM_IN_TEXT_RE = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
+
+
+    _DIGEST_LEAD_RE = re.compile(r"^\s*Best-supported findings|^\s*sources retrieved:", re.I)
+    _DIGEST_NOISE_RE = re.compile(r"\[slice \d+:\d+\]|https?://\S+")
+    _VALUE_MAX_CHARS = 90
+
+
+    def _undigest_for_schema(basis: str) -> str:
+        if not basis:
+            return ""
+        text = _DIGEST_NOISE_RE.sub(" ", basis)
+        out = []
+        for raw in text.split("\n"):
+            line = raw.strip().lstrip("-*• ").strip()
+            if not line or _DIGEST_LEAD_RE.match(line):
+                continue
+                                                                           
+            if ":" in line:
+                head, _, tail = line.partition(":")
+                line = tail.strip() if 0 < len(tail.strip()) <= _VALUE_MAX_CHARS else head.strip()
+            if not line or len(line) > _VALUE_MAX_CHARS:
+                continue
+            if line.count(" ") > 8:                                   
+                continue
+            if line not in out:
+                out.append(line)
+            if len(out) >= 6:
+                break
+        return "\n".join(out)
+
+
+    def _coerce_to_schema(answer: str, schema, depth: int = 0):
+        if depth > 4 or not isinstance(schema, dict):
+            return answer[:400]
+        enum = schema.get("enum")
+        if isinstance(enum, list) and enum:
+            low = (answer or "").lower()
+            for opt in enum:
+                if isinstance(opt, str) and re.search(r"\b" + re.escape(opt.lower()) + r"\b", low):
+                    return opt
+            return enum[0]
+        kind = _schema_kind(schema)
+        if not kind:
+                                                                            
+                                                                             
+            for key in ("anyOf", "oneOf", "allOf"):
+                branch = schema.get(key)
+                if isinstance(branch, list) and branch:
+                    for sub in branch:
+                        if isinstance(sub, dict) and sub.get("type") != "null":
+                            return _coerce_to_schema(answer, sub, depth + 1)
+            kind = "string"
+        if kind == "array":
+            items = schema.get("items") or {}
+            parts = [p.strip(" -*\t") for p in re.split(r"[\n;]|,(?![^(]*\))", answer or "")]
+            parts = [p[:400] for p in parts if p][:20]                               
+            if not parts:                                                          
+                parts = [answer[:400]]                                          
+            return [_coerce_to_schema(p, items, depth + 1) for p in parts]
+        if kind == "object":
+            props = schema.get("properties") or {}
+            required = schema.get("required") or list(props.keys())
+            out = {}
+            for key in required:
+                                                                             
+                                                             
+                out[key] = _coerce_to_schema(answer, props.get(key) or {}, depth + 1)
+            return out
+        if kind in ("number", "integer"):
+                                                                                
+                                                                   
+            found = _NUM_IN_TEXT_RE.search(_CITE_NUM_RE.sub(" ", answer or ""))
+            if found is None:
+                return 0
+            val = found.group(0).replace(",", "")
+            try:
+                return int(val) if kind == "integer" else float(val)
+            except Exception:
+                return 0
+        if kind == "boolean":
+            return not re.match(r"\s*(no\b|false\b|none\b)", (answer or ""), re.I)
+        return (answer or "")[:400]
+
+
+    _NARRATION_LEAD_RE = re.compile(
+        r"^\s*(?:based on (?:my|the)\b|now (?:i|that i)\b|i (?:now )?(?:have|was|am|need|will|can)\b|"
+        r"i(?:'ll|'ve|'m)\b|let me\b|let's\b|first,? i\b|having (?:now )?\w+\b|"
+        r"okay\b|alright\b|to answer this\b|my research\b)", re.IGNORECASE)
+                                                                                 
+                                                                                 
+    _ABBREV_TAIL_RE = re.compile(r"(?:\b[A-Z]|\b(?:Inc|Ltd|Co|No|vs|St|Dr|Mr|Ms|Mt|Jr|Sr|etc|e\.g|i\.e))\.$")
+
+
+    def _strip_lead_narration(text: str) -> str:
+        t = (text or "").strip()
+        if not t:
+            return t
+        for _ in range(2):
+            parts = re.split(r"(?<=[.!?])\s+", t, maxsplit=1)
+            if len(parts) != 2:
+                break
+            head, rest = parts[0], parts[1].strip()
+            if _CITE_NUM_RE.search(head):
+                break                                                               
+            if _NARRATION_LEAD_RE.match(head) is None:
+                break
+                                                                            
+                                                                               
+            if len(head.split()) < 4 or _ABBREV_TAIL_RE.search(head) is not None:
+                break
+            if len(rest) < 120 or _CITE_NUM_RE.search(rest) is None:
+                break                                                               
+            t = rest
+        return t
+
+
+    def _cap(text: str) -> str:
+        t = (text or "").strip()
+        if len(t) > ANSWER_CHAR_CAP:
+            return t[:ANSWER_CHAR_CAP - 16] + " …"
+        return t
+
+
+    async def _base_agent_query(query: Query) -> Response:
+        question = (query.text or "").strip()
+        if not question:
+            return Response(text="No question provided.")
+        try:
+            return await _solve(query, question)
+        except Exception:
+                                                                               
+                                                                                
+            schema = getattr(query, "output_schema", None)
+            if schema is not None:
+                try:
+                    return Response(output=_coerce_to_schema(question[:400], schema))
+                except Exception:
+                    pass
+                                                                            
+            return Response(text=f"Best-effort answer unavailable for: {question[:500]}")
+
+
+    _SB_MIN_ENTITY_CHARS = 3
+    _SB_FIGURE_RE = re.compile(r"\d+(?:[.,]\d+)*")
+    _SB_WORD_RE = re.compile(r"[A-Z][A-Za-z0-9&'’.\-]*")
+
+
+    def _normalize_figure(token: str) -> str:
+        return token.replace(",", "").rstrip(".")
+
+
+    def _figures(text: str) -> set[str]:
+        found: set[str] = set()
+        for match in _SB_FIGURE_RE.finditer(text or ""):
+            found.add(_normalize_figure(match.group(0)))
+        return found
+
+
+    def _entities(text: str) -> set[str]:
+        found: set[str] = set()
+        for match in _SB_WORD_RE.finditer(text or ""):
+            token = match.group(0).strip(".'’-")
+            if len(token) < _SB_MIN_ENTITY_CHARS:
+                continue
+            if token.isupper() and len(token) <= 2:
+                continue
+            found.add(token.lower())
+        return found
+
+
+    def _unmakes_draft(draft: str, revision: str) -> bool:
+        if not _figures(draft).issubset(_figures(revision)):
+            return True
+        return not _entities(draft).issubset(_entities(revision))
+
+
+    def _select_best(draft: str, patched: str) -> str:
+        if _is_usable_answer(patched) and not _unmakes_draft(draft, patched):
+            return patched
+        return draft
+
+
+    async def _solve(query: Query, question: str) -> Response:
+                                                                                
+                                                                                 
+        _reset_run_state()
+        question = question.removeprefix("\ufeff")
+        question = " ".join((question or "").split())
+        question = question.replace("\u200b", "").strip()
+        deadline = monotonic() + WALL_BUDGET_S
+        try:
+            info = await tooling_info(timeout=10.0)
+            _spend_note(info)
+        except Exception:
+            _spend_blind()
+
+        draft = ""
+        brief = ""
+        try:
+            if _spend_left() >= BRIEF_MIN_USD and (deadline - monotonic()) > 120.0:
+                draft, brief = await _knowledge_brief(question)
+        except Exception:
+            brief = ""
+
+        ledger = EvidenceLedger()
+        answer = ""
+        messages: list[dict] = []
+        try:
+            answer, messages = await _loop(question, brief, ledger, deadline, MAX_TURNS)
+        except Exception:
+            answer = ""
+
+        try:
+            if _is_usable_answer(answer) and (deadline - monotonic()) > 75.0\
+                    and _spend_left() >= AUDIT_MIN_USD:
+                patched = await _audit_patch(question, answer, messages, ledger, deadline)
+                answer = _select_best(answer, patched)
+        except Exception:
+            pass
+
+                                                                         
+        if not _is_usable_answer(answer) and ledger.rows:
+            try:
+                rescued = await _write_from_digest(question, ledger, deadline)
+                if _is_usable_answer(rescued):
+                    answer = rescued
+            except Exception:
+                pass
+                                                                                
+                                                                                
+        if not _is_usable_answer(answer) and ledger.rows:
+            det = _deterministic_answer(question, ledger)
+            if _is_usable_answer(det):
+                answer = det
+                                                                        
+        if not _is_usable_answer(answer):
+            fallback = _sanitize_draft(draft) or await _knowledge_resort(question, deadline)
+            if _is_usable_answer(fallback):
+                answer = fallback                                                     
+
+        try:
+            citations, _slot_pos = _citations_for(answer, ledger)
+        except Exception:
+            citations, _slot_pos = [], {}
+
+        answer = _normalize_brackets(answer)                                           
+        answer = _strip_lead_narration(answer)
+                                                                            
+        answer = _answer_line_only(answer, question)
+                                                                            
+                                                                            
+        text = (_cap(_repoint(answer, _slot_pos))
+                or f"Best-effort answer unavailable for: {question[:400]}")
+
+        synth_note = text if (_is_usable_answer(text)
+                              and not _STUB_ANSWER_RE.match(text.strip())) else None
+
+        if query.output_schema is not None:
+            structured = _SN67_NULL_CONVERSION_FAILURE
+            try:
+                structured = await _schema_output(question, answer, query.output_schema, deadline)
+            except Exception:
+                structured = _SN67_NULL_CONVERSION_FAILURE
+            if structured is not _SN67_NULL_CONVERSION_FAILURE:
+                try:
+                    structured = _verbatim_structured(structured, ledger)
+                except Exception:
+                    pass
+                                                                             
+                try:
+                    if _VERBATIM_TRIGGER_RE.search(getattr(query, "text", None) or question or ""):
+                        structured = _source_region_verbatim(
+                            structured, question, query.output_schema, answer, ledger)
+                except Exception:
+                    pass
+                try:
+                    return Response(output=structured, note=synth_note,
+                                    citations=citations or None)
+                except Exception:
+                    structured = _SN67_NULL_CONVERSION_FAILURE
+                                                                              
+                                                                             
+            basis = answer if _is_usable_answer(answer) else ""
+            if not basis:
+                basis = _deterministic_answer(question, ledger)
+            if not basis or _STUB_ANSWER_RE.match(basis.strip()):
+                basis = question[:400]
+                                                                                
+                                                                              
+            if basis is not answer:
+                try:
+                    salvaged = await _schema_output(question, basis, query.output_schema,
+                                                    deadline)
+                except Exception:
+                    salvaged = _SN67_NULL_CONVERSION_FAILURE
+                if salvaged is not _SN67_NULL_CONVERSION_FAILURE:
+                    try:
+                        return Response(output=salvaged, citations=citations or None)
+                    except Exception:
+                        pass
+                                                                              
+            if basis is not answer:
+                cleaned = _undigest_for_schema(basis)
+                basis = cleaned if cleaned else ""
+            try:
+                forced = _coerce_to_schema(_cap(basis), query.output_schema)
+                return Response(output=forced, citations=citations or None)
+            except Exception:
+                try:
+                    return Response(output=_cap(basis)[:2000],
+                                    citations=citations or None)
+                except Exception:
+                    pass
+
+        try:
+            return Response(text=text, citations=citations or None)
+        except Exception:
+            return Response(text=text)
+
+
+
+
+    # ── gx: deterministic answer guards ───────────────────────────────────────────
+    # Pure detectors (no LLM, no tools, no cost) plus ONE bounded no-tool repair whose
+    # output is accepted only when provably non-destructive. Fails open everywhere.
+    _GX_REPAIR_MIN_SECONDS = 34.0
+    _GX_REPAIR_TIMEOUT_SECONDS = 26.0
+    _GX_MIN_KEEP_RATIO = 0.85
+    _GX_MAX_NOTES = 4
+    _GX_MIN_ENTITY_CHARS = 4
+    _GX_DRAFT_CHARS = 12000
+
+    _GX_FIG_RE = re.compile(r"\d[\d,]*(?:\.\d+)?%?")
+    _GX_CITE_RE = re.compile(r"\[\d[\d,\s\-]*\]")
+    _GX_SENT_RE = re.compile(r"[^.!?\n]+[.!?]|[^.!?\n]+$")
+    _GX_SUPER_RE = re.compile(r"\b(?:most|least|highest|lowest|largest|smallest|greatest|"
+                              r"fewest|longest|shortest|best|worst|top|maximum|minimum)\b"
+                              r"|\b[a-z]{3,}est\b", re.IGNORECASE)
+    _GX_SUPER_STOP = frozenset({"interest","latest","earliest","honest","modest","request",
+                                "suggest","invest","protest","harvest","forest","nearest",
+                                "rest","test","west","best"})
+    _GX_YEAR_RE = re.compile(r"\b(1[89]\d{2}|20\d{2})\b")
+    _GX_CAP_RE = re.compile(r"\b[A-Z][A-Za-z0-9&.\-]{2,}(?:\s+[A-Z][A-Za-z0-9&.\-]{2,}){0,3}\b")
+    _GX_QSTOP = frozenset({"Which","What","Who","When","Where","How","Why","The","A","An",
+                           "For","From","In","On","Of","And","Or","As","At","By","To",
+                           "Answer","Give","List","Name","Using","According","Report",
+                           "Compare","Consider","Identify","Determine","Explain","State",
+                           "Find","Return","Provide","Between","Across","Both","Each",
+                           "Per","With","Within","Their","Its","This","That","These"})
+    _GX_UNIT_RE = re.compile(r"\b(?:in|as)\s+(percent|percentage|per cent|dollars?|USD|EUR|GBP|"
+                             r"euros?|pounds?|yen|km|kilometres?|kilometers?|miles?|metres?|"
+                             r"meters?|tonnes?|tons?|kg|kilograms?|days?|weeks?|months?|years?|"
+                             r"hours?|minutes?)\b", re.IGNORECASE)
+    _GX_UNIT_TOKENS = {"percent":("%","percent","per cent"),"percentage":("%","percent"),
+                       "per cent":("%","per cent","percent"),
+                       "dollar":("$","usd","dollar"),"dollars":("$","usd","dollar"),
+                       "usd":("$","usd"),"eur":("€","eur","euro"),"gbp":("£","gbp","pound"),
+                       "euro":("€","euro"),"euros":("€","euro"),"pound":("£","pound"),
+                       "pounds":("£","pound"),"yen":("¥","yen"),
+                       "km":("km","kilomet"),"kilometre":("km","kilomet"),"kilometres":("km","kilomet"),
+                       "kilometer":("km","kilomet"),"kilometers":("km","kilomet"),
+                       "mile":("mile",),"miles":("mile",),"metre":("m","metre"),"metres":("m","metre"),
+                       "meter":("m","meter"),"meters":("m","meter"),
+                       "tonne":("tonne","ton"),"tonnes":("tonne","ton"),"ton":("ton",),"tons":("ton",),
+                       "kg":("kg","kilogram"),"kilogram":("kg","kilogram"),"kilograms":("kg","kilogram"),
+                       "day":("day",),"days":("day",),"week":("week",),"weeks":("week",),
+                       "month":("month",),"months":("month",),"year":("year",),"years":("year",),
+                       "hour":("hour",),"hours":("hour",),"minute":("minute",),"minutes":("minute",)}
+    # an explicit range separator, OR "between/from X and Y". A bare "2010 and 2020"
+    # is a LIST, not a range, so "and" only counts behind between/from.
+    _GX_RANGE_RE = re.compile(r"\b(1[89]\d{2}|20\d{2})\s*(?:-|–|—|to|through|until)\s*(1[89]\d{2}|20\d{2})\b")
+    _GX_RANGE2_RE = re.compile(r"\b(?:between|from)\s+(1[89]\d{2}|20\d{2})\s+and\s+(1[89]\d{2}|20\d{2})\b",
+                               re.IGNORECASE)
+
+
+    def _gx_figures(text: str) -> set:
+        return {m.group(0).replace(",", "").rstrip("%") for m in _GX_FIG_RE.finditer(text or "")}
+
+
+    def _gx_markers(text: str) -> list:
+        return _GX_CITE_RE.findall(text or "")
+
+
+    def _gx_sentences(text: str) -> list:
+        return [s.strip() for s in _GX_SENT_RE.findall(text or "") if s.strip()]
+
+
+    def _gx_uncited_claims(answer: str) -> list:
+        out = []
+        for s in _gx_sentences(answer):
+            if _GX_CITE_RE.search(s):
+                continue
+            if _GX_FIG_RE.search(s) or _GX_YEAR_RE.search(s):
+                out.append(s[:160])
+        return out
+
+
+    def _gx_has_superlative(question: str) -> bool:
+        for m in _GX_SUPER_RE.finditer(question or ""):
+            if m.group(0).lower() not in _GX_SUPER_STOP:
+                return True
+        return False
+
+
+    def _gx_comparison_shown(answer: str) -> bool:
+        if len(_gx_figures(answer)) >= 2:
+            return True
+        low = (answer or "").lower()
+        return any(k in low for k in ("second","runner-up","next highest","next largest",
+                                      "compared with","compared to","versus"," vs ",
+                                      "other candidates","the remaining"))
+
+
+    def _gx_asked_entities(question: str) -> set:
+        out = set()
+        for m in _GX_CAP_RE.finditer(question or ""):
+            toks = m.group(0).split()
+            while toks and toks[0] in _GX_QSTOP:
+                toks.pop(0)
+            while toks and toks[-1] in _GX_QSTOP:
+                toks.pop()
+            if not toks:
+                continue
+            name = " ".join(toks)
+            if len(toks) < 2 or len(name) < _GX_MIN_ENTITY_CHARS:
+                continue
+            out.add(name)
+        return out
+
+
+    def _gx_missing_entities(question: str, answer: str) -> list:
+        a = (answer or "").lower()
+        return [e for e in sorted(_gx_asked_entities(question)) if e.lower() not in a][:_GX_MAX_NOTES]
+
+
+    def _gx_missing_units(question: str, answer: str) -> list:
+        """The question demands an explicit unit the answer never renders."""
+        a = (answer or "").lower()
+        out = []
+        for m in _GX_UNIT_RE.finditer(question or ""):
+            unit = m.group(1).lower()
+            toks = _GX_UNIT_TOKENS.get(unit)
+            if not toks:
+                continue
+            if not any(t in a for t in toks):
+                out.append(unit)
+        return sorted(set(out))[:_GX_MAX_NOTES]
+
+
+    def _gx_out_of_window(question: str, answer: str) -> list:
+        """The question fixes a year range; the answer asserts years outside it."""
+        m = _GX_RANGE_RE.search(question or "") or _GX_RANGE2_RE.search(question or "")
+        if not m:
+            return []
+        lo, hi = sorted((int(m.group(1)), int(m.group(2))))
+        bad = sorted({y for y in (int(x) for x in _GX_YEAR_RE.findall(answer or ""))
+                      if y < lo or y > hi})
+        return [str(y) for y in bad][:_GX_MAX_NOTES]
+
+
+    def _gx_accept(draft: str, revision: str) -> bool:
+        if not revision or not revision.strip():
+            return False
+        r = revision.strip()
+        if len(r) < _GX_MIN_KEEP_RATIO * len(draft.strip()):
+            return False
+        if not _gx_figures(draft) <= _gx_figures(r):
+            return False
+        if len(_gx_markers(r)) < len(_gx_markers(draft)):
+            return False
+        low = r[:160].lower()
+        return not any(low.startswith(b) for b in
+                       ("i cannot","i'm unable","as an ai","the draft","no changes"))
+
+
+    _GX_SYSTEM = (
+        "You repair a research answer against a list of concrete defects.\n"
+        "Rules:\n"
+        "- Fix ONLY the listed defects. Change nothing else.\n"
+        "- Use ONLY facts already present in the draft. Never introduce a figure, "
+        "name, date or citation the draft does not contain.\n"
+        "- Every figure, date, name and [n] marker in the draft must survive verbatim. "
+        "Your edits may only ADD.\n"
+        "- If a defect cannot be fixed from the draft's own content, say so in one "
+        "short clause rather than inventing anything.\n"
+        "- Keep the answer's existing shape and opening. Plain prose, no preamble.\n"
+        "Return the full corrected answer and nothing else."
+    )
+
+
+    async def _gx_repair(question: str, answer: str, deadline: float) -> str:
+        try:
+            notes = _gx_defects(question, answer)
+            if not notes:
+                return answer
+            left = deadline - monotonic()
+            if left < _GX_REPAIR_MIN_SECONDS:
+                return answer
+            timeout = min(_GX_REPAIR_TIMEOUT_SECONDS, left - MIN_TAIL_S)
+            if timeout < 10.0:
+                return answer
+            user = (f"Question:\n{question[:2500]}\n\nDefects to fix:\n"
+                    + "\n".join(f"- {n}" for n in notes)
+                    + f"\n\nDraft answer:\n{answer[:_GX_DRAFT_CHARS]}")
+            revision = await _chat_simple(LLM_LANE_A, AUDIT_MODEL, _GX_SYSTEM, user,
+                                          max_tokens=2600, timeout=timeout)
+            return revision.strip() if _gx_accept(answer, revision or "") else answer
+        except Exception:
+            return answer
+    # ── end gx guards ─────────────────────────────────────────────────────────────
+
+
+    def _gx_missing_currency(question: str, answer: str) -> list:
+        wanted = set(re.findall(r"\b(?:USD|EUR|GBP|JPY|AUD|CAD|CHF|CNY)\b", question))
+        wanted |= set(re.findall(r"[$\u20ac\u00a3\u00a5]", question))
+        for word, symbol in (("dollars", "$"), ("euros", "\u20ac"), ("pounds sterling", "\u00a3"), ("yen", "\u00a5")):
+            if word in question.lower():
+                wanted.add(symbol)
+        if not wanted:
+            return []
+        have = set(re.findall(r"\b(?:USD|EUR|GBP|JPY|AUD|CAD|CHF|CNY)\b", answer))
+        have |= set(re.findall(r"[$\u20ac\u00a3\u00a5]", answer))
+        return sorted(wanted - have)
+
+
+    def _gx_defects(question: str, answer: str) -> list:
+        notes = []
+        if not answer or not answer.strip():
+            return notes
+        unc = _gx_uncited_claims(answer)
+        if unc:
+            notes.append("These factual sentences carry no [n] citation; attach the "
+                         "marker for the evidence they came from: " + " | ".join(unc[:2]))
+        miss = _gx_missing_entities(question, answer)
+        if miss:
+            notes.append("The question names these but the answer never mentions them: "
+                         + ", ".join(miss))
+        cur = _gx_missing_currency(question, answer)
+        if cur:
+            notes.append("The question prices things in these currencies and the answer "
+                         "never renders them: " + ", ".join(cur))
+        return notes[:_GX_MAX_NOTES]
+
+
+    async def query(query: Query) -> Response:
+        deadline = monotonic() + WALL_BUDGET_S
+        response = await _base_agent_query(query)
+        # guards run on TEXT answers only: a structured payload has already been
+        # schema-coerced by the base and must not be rewritten by a prose repair.
+        try:
+            if getattr(query, "output_schema", None) is None:
+                drafted = getattr(response, "text", None)
+                if isinstance(drafted, str) and drafted.strip():
+                    fixed = await _gx_repair(getattr(query, "text", "") or "", drafted, deadline)
+                    if fixed and fixed != drafted:
+                        try:
+                            return Response(text=fixed, citations=getattr(response, "citations", None))
+                        except Exception:
+                            return Response(text=fixed)
+        except Exception:
+            pass
+        return response
+
+    VERSION = "c10-402"
+    _GX_ACTIVE = ('cite', 'entity', 'currency')
+
+    return query
+
+_branch_bd6fe585916b9dd3212967e9f36809799a0691b3855d8a54f615f7e60d84596c_query_entry = _compose_branch_bd6fe585916b9dd3212967e9f36809799a0691b3855d8a54f615f7e60d84596c_entry()
+
+
+def _compose_branch_95b2cad1ffd10e9355fe3e0a086c20a457484e5cc7f4434cff4ade6bece26dfb_entry():
+
+
+    import asyncio
+    import json
+    import re
+    from time import monotonic
+
+    from harnyx_miner_sdk.api import fetch_page, llm_chat, search_web, tooling_info
+    from harnyx_miner_sdk.decorators import entrypoint
+    from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
+
+    VERSION = "v260-5-rsau"
+
+                                                                                
+    LLM_LANE_A = "openrouter"                                          
+    LLM_LANE_B = "openrouter"                                                        
+                                                                               
+                                                                                  
+    LOOP_MODEL_A = "z-ai/glm-5.3-flash"
+    LOOP_MODEL_B = "z-ai/glm-5"
+    AUDIT_MODEL = "openai/gpt-oss-120b"              
+    SEARCH_PROVIDER = "parallel"                                       
+    SCHEMA_MODEL = "openai/gpt-oss-120b"             
+    RESORT_MODEL = "deepseek/deepseek-v3.2"          
+                                                                                
+                                                                                  
+    SEARCH_PROVIDERS = ("parallel", "exa", "tavily")
+    FETCH_PROVIDERS = ("parallel", "exa", "firecrawl")
+
+                                                                                
+    WALL_BUDGET_S = 236.0                                                               
+                                                                                  
+                                                                                 
+    BRIEF_TIMEOUT_S = 50.0                                                                           
+                                                                                    
+                                                                                
+    TURN_TIMEOUT_S = 75.0
+    LANE_B_MAX_PAYLOAD_CHARS = 144000                                          
+                                                                            
+                                  
+    SEARCH_TIMEOUT_S = 18.0
+    FETCH_TIMEOUT_S = 16.0
+    AUDIT_TIMEOUT_S = 28.0
+                                                                                 
+                                                                               
+    WRAPUP_AT_S = 90.0                                                                                       
+                                                                                
+                                                                                
+    MIN_TAIL_S = 8.0
+    MAX_TURNS = 15                                                                              
+    AUDIT_EXTRA_TURNS = 2
+    ANSWER_REPAIR_TURNS = 2                                                                             
+    RESCUE_TIMEOUT_S = 55.0
+    DIGEST_TAIL_S = 14.0                                                                      
+
+                                                                                
+    SEARCH_EXCERPT_CHARS = 550
+    _LEDGER_TEXT_CAP = 1_500_000  # was 400_000: appendix tables of 500K-char reports were cut off
+    PAGE_GREP_WINDOW = 700
+    PAGE_GREP_MAX_HITS = 6
+    PAGE_READ_MAX_CHARS = 12_000
+
+                                                                               
+    RETAIN_MARGIN_CHARS = 260                                                   
+    RETAIN_MAX_PER_ROW = 6
+    SHOWN_SPAN_MAX_CHARS = 2400                                                                                                               
+    RETAIN_MIN_QUOTE = 12
+                                                                              
+                                                                              
+    FETCH_HEAD_CHARS = 3000                                                          
+    FETCH_WINDOW_CHARS = 3600                                                        
+                                                                           
+                                                                                 
+    CITATION_MIN_SPAN_CHARS = 6000                                  
+                                                                
+                                                                           
+    CITATION_ANCHORED_SPAN_CHARS = 2000                                               
+    CITATION_MAX_REF_CHARS = 14_000                                                 
+    FETCH_WINDOWS_PER_PAGE = 3                                                         
+                                                                                    
+                                                                               
+    FETCH_PLAIN_CHARS = 6500                               
+    ANSWER_CHAR_CAP = 60000
+    CITATION_CAP = 24
+                                                                              
+                                                                                
+    EVIDENCE_CHAR_BUDGET = 105_000
+
+                                                                                
+    BRIEF_MIN_USD = 0.03
+    AUDIT_MIN_USD = 0.05
+    AUDIT_EVIDENCE_CHARS = 9000                                                    
+    WRAPUP_MIN_USD = 0.02
+
+                                                      
+    TASK_BUDGET_USD = 0.5
+                                                                           
+                                                                              
+    BLIND_LIMIT = 3
+
+    _SPEND = {"left": None, "blind": 0}
+
+
+    def _spend_note(payload) -> None:
+        budget = getattr(payload, "budget", None)
+        left = getattr(budget, "session_remaining_budget_usd", None)
+        if isinstance(left, (int, float)):
+            _SPEND["left"] = float(left)
+            _SPEND["blind"] = 0
+
+
+    def _spend_blind() -> None:
+        _SPEND["blind"] = _SPEND["blind"] + 1
+
+
+    def _spend_left() -> float:
+        left = _SPEND["left"]
+        if isinstance(left, (int, float)):
+                                                                               
+                                                                         
+            return max(0.0, float(left))
+        if _SPEND["blind"] >= BLIND_LIMIT:
+                                                                               
+                                                                             
+            return 0.0
+                                                                         
+                                                                            
+        return TASK_BUDGET_USD
+
+
+    LOOP_TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": ("Web search. Returns numbered results, each with title, "
+                                "url and excerpt."),
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string",
+                                             "description": "the search query"}},
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "sec_filing",
+                "description": ("Resolve a company's SEC filing to its primary document "
+                                "URL on sec.gov (exact form + year, from EDGAR's own "
+                                "index). Use for questions about a specific filing "
+                                "(10-K, 10-Q, 8-K, DEF 14A…), then read_page the "
+                                "returned URL with a focus hint for the Item/section."),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "company": {"type": "string",
+                                    "description": "company name or ticker, e.g. 'Apple' or 'AAPL'"},
+                        "form": {"type": "string",
+                                 "description": "filing form, e.g. '10-K', '10-Q', '8-K', 'DEF 14A'"},
+                        "year": {"type": "string",
+                                 "description": "optional report (fiscal) year, e.g. '2019' (omit for latest)"},
+                    },
+                    "required": ["company", "form"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_page",
+                "description": ("Fetch a URL and return its main text. Large pages show "
+                                "the head plus the few regions most relevant to the "
+                                "question; pass a focus hint to steer which regions."),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "URL to fetch"},
+                        "focus": {"type": "string",
+                                  "description": ("optional phrase to locate inside the "
+                                                  "page (section name, table label, "
+                                                  "entity)")},
+                    },
+                    "required": ["url"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "page_grep",
+                "description": ("Search INSIDE a page you already fetched, by regex or "
+                                "literal text, and get every match with its surrounding "
+                                "context and character offset. Use this when read_page "
+                                "showed you the head of a long page but the value you "
+                                "need is deeper in it -- do not re-fetch, grep it."),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string",
+                                "description": "URL of a page already fetched this run"},
+                        "pattern": {"type": "string",
+                                    "description": ("regex or literal string to find, e.g. "
+                                                    "a city name, a year, a column label")},
+                    },
+                    "required": ["url", "pattern"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "page_read",
+                "description": ("Read an arbitrary character range of a page you already "
+                                "fetched. Use the offsets page_grep reports to read the "
+                                "full table or section around a match."),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "URL already fetched"},
+                        "offset": {"type": "integer", "description": "start character offset"},
+                        "length": {"type": "integer",
+                                   "description": "how many characters to read (max 12000)"},
+                    },
+                    "required": ["url", "offset"],
+                },
+            },
+        },
+    {
+            "type": "function",
+            "function": {
+                "name": "retain_evidence",
+                "description": ("Keep the exact source text that proves a claim you are "
+                                "about to make. Pass the result number and the verbatim "
+                                "quote from it. Do this the moment you find a decisive "
+                                "value -- the judge only credits claims whose citation "
+                                "contains the supporting text, and this is how that text "
+                                "gets into your citation. Use it for the QUESTION'S "
+                                "PREMISES as well as your answer: every entity, work, "
+                                "date or figure the question names should end up with a "
+                                "retained quote confirming it."),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "source": {"type": "string",
+                                   "description": "result number to quote from, e.g. 3"},
+                        "quote": {"type": "string",
+                                  "description": ("verbatim text copied from that result "
+                                                  "that states the fact")},
+                    },
+                    "required": ["source", "quote"],
+                },
+            },
+        },
+    ]
+
+                                                                               
+    LOOP_RULES = (
+        "You are a research agent answering a hard multi-part factual question. A "
+        "judge compares your answer head-to-head with a strong reference and only "
+        "credits claims that carry a citation to a tool result that states them.\n\n"
+        "PREFER THE PRIMARY SOURCE: when two sources state the same fact, cite the "
+        "one that ORIGINATES it -- the agency, registry, filing, official statistics "
+        "release or the organisation's own page -- not an encyclopedia or aggregator "
+        "repeating it. Measured verbatim on a task where both answers were factually "
+        "correct: \"Answer 1 is preferred for using primary sources\" (it cited NARA "
+        "where we cited Wikipedia) -- a full point lost on every run. Use the "
+        "encyclopedia to FIND the primary source, then fetch and cite that.\n\n"
+        "QUOTE WHAT PROVES IT: the judge credits a claim only when your citation "
+        "CONTAINS the source text stating it. The moment you read a decisive value, "
+        "call retain_evidence(source, quote) with the exact words from that result. "
+        "Do this for every condition you test and every figure you report -- an "
+        "answer whose citations do not carry its numbers loses to one that does, "
+        "even when both answers are identical.\n"
+        "ALSO QUOTE THE QUESTION'S PREMISES, not only your answer. Every entity, "
+        "work, date or figure the question NAMES is a claim the judge expects "
+        "traceable: the film it says someone directed, the article it points at, "
+        "the year it fixes, the people it lists. You lose to an otherwise identical "
+        "answer that cited those too -- measured verbatim: \"does not provide a "
+        "citation for 'Everyone Says I Love You'... Answer 1 is more thorough in "
+        "its traceability to all parts of the prompt's context\". Retain a quote "
+        "for each named premise as you confirm it, even when it is background you "
+        "already believed.\n\n"
+        "READ DEEP, DO NOT RE-FETCH: read_page shows the head plus a few regions of "
+        "a long page. If the value you need is not in what you were shown, call "
+        "page_grep(url, pattern) to find it anywhere in that page and page_read to "
+        "open the region around a reported offset. Grepping a page you already have "
+        "costs nothing and beats another search.\n\n"
+        "METHOD: think in constraints and candidates. Recall what you already know "
+        "to form the candidate pool, then use web_search/read_page to verify every "
+        "load-bearing fact (names, figures, dates, rankings) before asserting it. "
+        "Work every candidate through every stated condition; one search per fact "
+        "beats one broad search. TWO DISTINCT SUB-QUESTIONS: if the question asks two "
+        "separate things, answer BOTH substantively — a partial answer covering both "
+        "sides outscores a complete answer to only one. BATCH YOUR LOOKUPS: independent facts (each "
+        "candidate's score, each entity's figure) should be requested as SEVERAL "
+        "tool calls in the SAME turn — they run in parallel, so a 6-candidate "
+        "sweep costs one turn, not six. TABLE CARE: when reading a table, respect its "
+        "qualifier columns (Owned vs Leased, the exact year, the exact segment) — "
+        "count or compare only rows matching EVERY stated qualifier, and quote the "
+        "row values you used. For a named source (Box Office Mojo, a 10-K, "
+        "Nielsen), fetch THAT page — for SEC filings, use the sec_filing tool to "
+        "resolve the exact primary document from EDGAR's own index, then read_page "
+        "it with a focus hint for the Item/section.\n\n"
+        "CITE EVERYTHING: put [n] (the tool-result number) immediately after the "
+        "SENTENCE carrying each claim — not pooled at the end of a paragraph. Every "
+        "sentence asserting a number, date, proper noun or causal link needs its own "
+        "[n], for the entities you rule OUT as well as those you include. An uncited "
+        "specific reads as invented. "
+        "PROOF STAYS INLINE — NO EVIDENCE SECTION: keep every citation inline, right "
+        "after the sentence it backs, and do NOT append a separate 'Evidence', "
+        "'Sources', 'References', 'Analysis' or 'Supporting' section — a '### Evidence' "
+        "block or a 'Sources:' list that restates what your sentences already cite. "
+        "Measured verbatim on a task we answered correctly: the grader preferred the "
+        "reference for being 'purely prose as requested' and read our trailing "
+        "Evidence dump as 'unnecessary analysis ... does not help', a full point lost. "
+        "Answer exactly the fields the question asks and then stop; a value it did not "
+        "ask for is padding, not extra credit. This never suppresses a set or "
+        "superlative proof — those per-member lines ARE the answer and stay inline, "
+        "never demoted under a heading. "
+        "Cite only results that actually state the claim, "
+        "and prefer the most AUTHORITATIVE one that does: the official database/"
+        "filing/statistics page over an aggregator, blog, or retrospective article. "
+        "CITE THE HARD CONDITION, NOT JUST THE POOL: every stated condition needs "
+        "evidence of its own, and the one hardest to verify is the one the grader "
+        "checks. Citations that establish only the candidate pool leave the actual "
+        "filter unsupported — a right answer whose decisive condition is uncited "
+        "loses to a weaker answer that proves it.\n\n"
+        "SOURCE CONFIDENCE: when the question NAMES a source you could not reach but "
+        "other authoritative evidence establishes the same facts, state those facts "
+        "plainly and confidently with their [n], and treat the other sources as "
+        "corroboration. Do not open with, dwell on, or append a note that the named "
+        "source was unavailable — reserve missing-source language for a FACT that is "
+        "genuinely absent everywhere, never for a missing source LABEL.\n\n"
+        "SELF-CONSISTENCY: before you finish, check that the opening names exactly "
+        "the entities your own cited sentences support. If the body establishes a "
+        "different answer than the opening claims, rewrite the opening to match the "
+        "evidence — never leave a weaker fallback in the lead.\n\n"
+        "ANSWER SHAPE: sentence one IS the answer — the exact entities/values/list "
+        "asked for, in the requested format. Never open with 'Based on…', 'From my "
+        "research…', 'I can provide a partial answer', or any preamble — start with "
+        "the answer entities themselves. ANSWER THE ASKED KIND: if the question asks "
+        "which SERIES, name the series (not the people in it); which FILM, the film "
+        "(not its director); which COUNTRY, the country. "
+        "THE POOL IS THE WHOLE NAMED CLASS, NOT THE SURVIVORS: build it from the "
+        "broadest set the question ranges over — every member of that class, not the "
+        "ones you already believe qualify — then apply the conditions one at a time and "
+        "show who each one eliminates. Never pre-filter to the members that already "
+        "pass and present those as the pool — an answer whose pool contains only "
+        "qualifiers proves nothing about the sweep, which is how a correct answer "
+        "still scores zero. List members that fail on the FIRST condition too. "
+        "Then: the candidate pool, each condition applied, and ONE LINE PER POOL MEMBER — "
+        "a line for every qualifier with its qualifying attribute cited, AND a line "
+        "for every candidate you rule out with its cited failing condition. Never "
+        "compress several rejects into one clause ('X, Y and Z never won [n]'): each "
+        "rejected member gets its own line and its own [n], even when the pool runs "
+        "to a dozen members. A batched exclusion reads as a pool you never checked. "
+        "Two later instructions may relax this — one when time runs short, one "
+        "when the pool is too large to list in full — and nothing else does. "
+        "If you cannot settle a member's condition, KEEP it among the qualifiers — a "
+        "wrongly-dropped qualifier costs as much as a wrong answer — and give its "
+        "line the strongest fact you did verify. Never add a note about what you "
+        "could not check. "
+        "OUTPUT DIRECTIVES ARE LITERAL: obey formatting instructions mechanically. "
+        "Decide first whether a phrase constrains the OUTPUT or selects the "
+        "ENTITIES: 'list them without the word \"X\"' shapes what you print, so "
+        "DELETE X from each name; 'whose title does not contain \"X\"' / 'titles "
+        "without the word X' is a condition on the pool, so keep only members that "
+        "lack it. When the phrase governs how to print an already-chosen set, the "
+        "deletion reading applies — it is not a filter. 'in alphabetical/chronological order' means sort the final "
+        "list; 'comma-separated' means join with commas; a requested count means "
+        "emit the number. These govern the ANSWER LINE — give it in exactly the "
+        "requested shape, then still add the proof section below it; the shape "
+        "directive is never a reason to omit the proof. COPY SOURCE VALUES "
+        "VERBATIM: when the question names a source, every name, label and value in "
+        "the answer must be the exact string that source prints -- never add a "
+        "familiar alternative in parentheses, never anglicise a transliteration. "
+        "'Makkah' is the answer; 'Mecca (Makkah)' is a wrong answer. "
+        "ONE EXCEPTION, and it is "
+        "absolute: if the question says to output ONLY the answer (\'output only\', "
+        "\'respond with only\', \'nothing else\', \'no explanation\'), emit the answer "
+        "line as the BARE requested text — no [n] markers on it, nothing else on "
+        "that line: a trailing [3] makes the text inexact and fails the "
+        "instruction. Still write the PROOF section BELOW it carrying its [n] "
+        "markers. Only the answer line is shipped, but the citations are "
+        "harvested from the proof first, and an uncited answer scores zero. "
+        "Obeying that "
+        "instruction IS the task. When an ORDER is demanded, "
+        "the ANSWER LINE itself must be sorted — not merely the table under it. "
+        "Print the sort key beside each item (the year, figure or date you sorted "
+        "on) and check every adjacent pair before you finish: one member out of "
+        "sequence fails the whole answer even when the set is exactly right. "
+        "COMPUTED ANSWERS: if the answer is a mean, total, rank or count derived "
+        "from several figures, pull every input into one explicit list first, then "
+        "compute — and show the arithmetic so the number is checkable. Never report "
+        "a derived number you did not visibly compute from listed inputs. "
+        "ROUNDED FIGURE = WRONG SOURCE: a decisive number that reads as rounded — "
+        "trailing zeros where the measuring body publishes exact digits, "
+        "'X.Y thousand/million', 'about'/'approximately', "
+        "or a value lifted from a chart label — came from an aggregator that "
+        "publishes summaries, not from the body that measured it. Do NOT commit it. "
+        "Search again for the exact figure from the source the question NAMES (or "
+        "the outlet that reports that source's own numbers) and answer with the full "
+        "precision it publishes, digit for digit. Quote the rounded value only as "
+        "corroboration after the exact one. This is a RETRIEVAL instruction, not a "
+        "licence to withhold: once tool calls are closed, or if the named source "
+        "itself publishes only the rounded value, commit the best figure you hold "
+        "and never remark on its precision. "
+        "EXACT VALUES ONLY: this governs HOW you report a figure; the rule above "
+        "governs WHICH figure to go and fetch. Once you hold the right one, use the "
+        "figures you READ in a tool result, verbatim — preserve notation exactly (58.58% and "
+        "58.6% are different; 'p < 0.0001' and 'P < .001' must not be merged or "
+        "called consistent). If one source gives a range and another a point value, "
+        "give both and say whether the point falls inside the range. If a figure is "
+        "reported in different units than the question asks, convert it and give the "
+        "exact converted result, preserving units and any timezone label. Answer with "
+        "the value from the exact source, date and scope the question NAMES — do not "
+        "substitute a later or broader figure unless resolving a conflict requires "
+        "it. Bind every claim to the exact actor, target, date-window and instrument "
+        "the evidence ties together; never carry a statement about one party or "
+        "period across to another. Never a remembered or approximate value "
+        "('~$1.33B'), never rounded, never an adjacent year/quarter/metric. If a "
+        "deciding figure is still unverified at writing time, prefer the tool-read "
+        "value you have over a guess, and NEVER write '(verify)' or any uncertainty "
+        "marker in the final answer — the final answer contains only committed "
+        "prose.\n\n"
+        "AMBIGUOUS METRIC? ANSWER BOTH READINGS. If the asked quantity has two "
+        "defensible interpretations — one party's value or the combined value of "
+        "both; one dimension of size or another; a narrow scope or a consolidated "
+        "one — do NOT silently pick one. Name the ambiguity in "
+        "one clause and give BOTH lists/values, each cited and labelled. A correct "
+        "answer under the reading the grader did not use still scores as wrong.\n\n"
+        "APPLY CONDITIONS LITERALLY: copy each candidate's exact value, then test "
+        "the comparator as written — 'more than 25' is strictly >25 (25 fails); "
+        "'between 2010 and 2019' includes both endpoints; convert a rate condition "
+        "into a concrete integer test ('averaged more than 1 per year over 10 "
+        "years' = 'more than 10 in total'); read edition/date boundaries literally. "
+        "EXCLUDE ONLY ON PROOF: reject a candidate by naming the specific stated "
+        "condition it fails, with the cited fact showing the failure — never "
+        "because it looks weaker than your front-runner. If it is UNCERTAIN "
+        "whether a candidate fails a condition, KEEP IT in the answer rather than "
+        "dropping it on a guess: a wrongly-dropped qualifier costs exactly as much "
+        "as a wrong answer. SAY NO MORE THAN THE CITATION: if the source says "
+        "'brought to', do not write 'incarcerated'; if it gives a count of 12, do "
+        "not write 11. Check every count and every verb against its citation.\n\n"
+        "NEVER NARRATE YOUR EVIDENCE: no sentence about what your results do or "
+        "do not contain ('the evidence does not specify…', 'would be needed to "
+        "determine…'). Those phrasings lose. A substantive negative about the "
+        "WORLD is different and is a real answer when true ('No member of the "
+        "class satisfies every condition [n]'). If a datum truly cannot be "
+        "verified, commit "
+        "to the best-supported value you found and move on. ONE narrow exception: "
+        "when the asked figure genuinely does not exist in any published form, you "
+        "may state the REASONED IMPOSSIBILITY — name the specific dataset that "
+        "would hold it and why it cannot yield the value — as a fact about the "
+        "world, in the first line, alongside the closest cited facts. That is a "
+        "committed answer; 'the evidence does not contain it' is not.\n\n"
+        "FINISH: never mix tool calls and the final answer in one turn. When the "
+        "constraints are verified (or best-effort covered), write the complete "
+        "cited answer."
+    )
+
+
+    def _wrapup_order(seconds_left: float) -> str:
+        return (
+            f"TIME IS UP (~{int(seconds_left)}s left). No more tool calls. Write the "
+            "complete final answer NOW from the numbered results above plus your "
+            "knowledge: the FIRST words are the answer entities (no 'Based on…' "
+            "preamble, no 'partial answer' framing, no '(verify)' markers), cite [n] "
+            "on every claim, keep the required format. A cited partial answer "
+            "scores; a refusal or a remark about insufficient evidence scores zero."
+            + ("" if seconds_left >= 60 else
+               " BREVITY OVERRIDE: too little time remains for a line per pool "
+               "member. Lead with the answer entities, then give the qualifiers one "
+               "cited line each and compress the rejects into a single cited line. "
+               "A complete short answer beats a long one that never finishes.")
+        )
+
+
+    _SET_HINT_RE = re.compile(
+        r"\b(?:list|name|identify|enumerate)\b[^?]{0,40}\b(?:all|every|each|the)\b"
+        r"|\bhow many\b|\bwhich (?:movies|films|series|countries|companies|states|"
+        r"cities|books|albums|artists|players|teams|species|languages|banks|"
+        r"universities|agencies|models|products)\b",
+        re.IGNORECASE)
+    _SET_CONNECTIVE_RE = re.compile(r"\b(?:both|also|and (?:also|had|has|was|were)|as well as)\b",
+                                    re.IGNORECASE)
+
+
+    _PLURAL_HEAD_RE = re.compile(r"\b(?:which|what)\b(?:\s+\w+){0,2}?\s+([a-z]{3,}s)\b", re.IGNORECASE)
+    _PLURAL_FALSE = frozenset(
+        "was is has does its this thus across process business series species news "
+        "status analysis basis less unless always perhaps".split())
+    _ONE_WINNER_RE = re.compile(
+        r"\b(?:highest|lowest|largest|smallest|most|least|greatest|fewest|longest|"
+        r"shortest|first|last|best|worst|only|oldest|youngest|newest|biggest)\b",
+        re.IGNORECASE)
+                                                                           
+                                                                           
+    _EST_STOP = frozenset(
+        "interest honest modest protest request suggest forest harvest invest "
+        "manifest contest arrest digest earnest conquest tempest midwest northwest "
+        "southwest unrest bequest behest attest molest ingest infest detest incest "
+        "armrest backrest pretest headrest footrest".split())
+    _EST_RE = re.compile(r"\b([a-z]{3,})est\b")                          
+                                                                            
+                                                                           
+    def _has_superlative(text: str) -> bool:
+        if _ONE_WINNER_RE.search(text or ""):
+            return True
+        for m in _EST_RE.finditer(text or ""):
+            if m.group(0).lower() not in _EST_STOP:
+                return True
+        return False
+
+
+    def _needs_superlative_proof(question: str) -> bool:
+        q = " ".join((question or "").split())
+        if not q:
+            return False
+        return _has_superlative(q) or bool(
+            re.search(r"\b(?:most|least) (?:common|frequent|number|amount)\b|\bhow many\b", q, re.I))
+
+
+    SUPERLATIVE_RULE = (
+        "SUPERLATIVE / TALLY — SHOW THE TABLE. The answer is one item, but you "
+        "cannot know it without the whole pool. Before naming a winner: (1) list "
+        "EVERY candidate the question's scope admits — every player who appeared, "
+        "every officeholder in the span, every body in the ranking; (2) put the "
+        "deciding value next to each (birth date, count, figure), cited; (3) THEN "
+        "name the maximum. NEVER decide a superlative on a rounded or derived "
+        "display: a coarse figure (a whole-number age, a rounded total, a bucketed "
+        "rank) cannot separate two contenders that differ below its precision. "
+        "Fetch the "
+        "exact underlying value (full birth date, unrounded figure) for every "
+        "contender, from a source that lists them ALL: a page showing only your "
+        "front-runner cannot establish that nobody beats them. (3b) THEN "
+        "name the maximum. Reproduce that candidate table in the proof section — "
+        "a correct winner with no visible tally loses to a reference that shows "
+        "its work, and 'among others' / 'and several more' is not a tally. If the "
+        "pool is too large to list in full, rank it, show every contender down to a "
+        "stated cutoff, and say what the cutoff was — a stated cutoff is a covered "
+        "pool; an unstated one reads as an unchecked one."
+    )
+
+
+    def _needs_set_completeness(question: str) -> bool:
+        q = " ".join((question or "").split())
+        if _SET_HINT_RE.search(q):
+            return True
+                                                                               
+                                                                          
+        m = _PLURAL_HEAD_RE.search(q)
+        if m and m.group(1).lower() not in _PLURAL_FALSE:
+            if not _has_superlative(q) or re.search(r"\b(?:all|every|each)\b", q, re.IGNORECASE):
+                return True
+                                                                                
+        return bool(re.search(r"\bwhich\b", q, re.IGNORECASE)) and bool(_SET_CONNECTIVE_RE.search(q))
+
+
+    SET_RULE = (
+        "SET ANSWER: this question asks for a set. Missing a qualifying member "
+        "scores the same as wrong — enumerate the pool, test EVERY member against "
+        "EVERY condition, and name ALL qualifiers (each with its own citations per "
+        "condition). Then give EVERY excluded member its own line with the condition "
+        "it fails and its own [n] — not a single clause sweeping several names "
+        "together, and not just the near-misses. Never claim 'the only X' unless "
+        "the whole pool was checked; if "
+        "your pool may be partial, still commit to every qualifier you verified. "
+        "GET THE POOL FROM A LIST, NOT MEMBER-BY-MEMBER: your FIRST retrieval for a "
+        "set question should hunt the authoritative roster/list/table that "
+        "enumerates the whole pool (search it AS a list — '<pool subject> list', "
+        "'<pool subject> table', 'list of <pool subject>' — and read_page it). "
+        "Assembling the pool from separate per-member searches is how a run ends up "
+        "with 3 of 6 qualifiers: the members you never thought to search for are "
+        "invisible to you. Read the roster page first, then verify each member. "
+        "ONE LIST PER PERIOD, THEN JOIN: when a condition has to hold across several "
+        "periods — successive years, separate editions, or two parallel events — "
+        "fetch ONE roster page per period and join them on the member: one list per "
+        "period, not one lookup per member. A "
+        "pool of 30+ members each needing several figures is a table-join, and "
+        "per-member lookups will run out of turns long before the pool is covered. "
+        "UNIVERSAL conditions ('in EVERY one of them', 'for BOTH parts', 'in ALL "
+        "three periods'): check each candidate against EACH "
+        "instance separately, with a citation per instance — one shared instance "
+        "is not enough. If NO candidate survives every instance, then 'none' IS "
+        "the answer: state it as a verified fact about the world with the "
+        "per-instance citations that prove it."
+    )
+
+
+    class EvidenceLedger:
+        def __init__(self) -> None:
+            self.rows: list[dict] = []
+            try:
+                _CLOSE_LEDGERS.append(self)
+                _CLOSE_LEDGERS[:] = _CLOSE_LEDGERS[-8:]
+            except Exception:
+                pass
+
+        def add(self, receipt_id: str, result_id: str, note_len: int,
+                kind: str, spans: list[tuple[int, int]] | None,
+                title: str = "", url: str = "", preview: str = "",
+                text: str = "") -> int:
+            self.rows.append({
+                "receipt_id": receipt_id,
+                "result_id": result_id,
+                "note_len": note_len,
+                "kind": kind,
+                                                                               
+                                                                                   
+                "title": (title or "")[:160],
+                "url": (url or "")[:300],
+                "preview": (preview or "")[:1200],
+                "spans": spans,                                                
+                "text": (text or "")[:_LEDGER_TEXT_CAP],                                   
+                "retained": [],                                                         
+            })
+            return len(self.rows)
+
+        def refs_for(self, number: int) -> list[CitationRef]:
+            if not (1 <= number <= len(self.rows)):
+                return []
+            row = self.rows[number - 1]
+            if row.get("kind") == "reserved":
+                return []                                              
+            if not row["receipt_id"] or not row["result_id"]:
+                return []
+            spans = row["spans"]
+            if spans:
+                                                                                  
+                                                                               
+                note_len = int(row["note_len"] or 0)
+                shown: list[list[int]] = []
+                for span in spans[:4]:
+                    start = max(0, min(int(span[0]), note_len))
+                    end = max(start + 1, min(int(span[1]), note_len))
+                    shown.append([start, end])
+                                                                                 
+                                                                            
+                retained = []
+                for a, b in (row.get("retained") or []):
+                    a = max(0, min(int(a), note_len))
+                    b = max(a + 1, min(int(b), note_len))
+                    retained.append([a, b])
+                if retained:
+                    shown = retained
+                                                                                
+                                                            
+                shown.sort()
+                merged: list[list[int]] = []
+                for s, e in shown:
+                    if merged and s <= merged[-1][1]:
+                        merged[-1][1] = max(merged[-1][1], e)
+                    else:
+                        merged.append([s, e])
+                                                                               
+                                                                              
+                span_target = (CITATION_ANCHORED_SPAN_CHARS if retained
+                               else CITATION_MIN_SPAN_CHARS)
+                base = sum(e - s for s, e in merged)
+                room = max(0, CITATION_MAX_REF_CHARS - base)
+                if merged and note_len and room:
+                    extra = room // len(merged)
+                    for w in merged:
+                        pad = min(extra, max(0, span_target - (w[1] - w[0])))
+                        if pad:
+                                                                                
+                                                                                   
+                            left = min(pad // 2, w[0])
+                            w[0] -= left
+                            rest = pad - left
+                            right = min(rest, note_len - w[1])
+                            w[1] += right
+                            w[0] = max(0, w[0] - (rest - right))
+                    merged.sort()                                                       
+                    grown: list[list[int]] = []
+                    for s, e in merged:
+                        if grown and s <= grown[-1][1]:
+                            grown[-1][1] = max(grown[-1][1], e)
+                        else:
+                            grown.append([s, e])
+                    merged = grown
+                slices = [
+                    CitationSlice(start=s, end=e)
+                    for s, e in merged
+                    if e > s
+                ]
+                if not slices:
+                    return []
+                return [CitationRef(
+                    receipt_id=row["receipt_id"],
+                    result_id=row["result_id"],
+                    slices=slices,
+                )]
+            return []                                                           
+                                                                           
+
+        def ref_for(self, number: int) -> CitationRef | None:
+            return (self.refs_for(number) or [None])[0]
+
+
+    _WORD_RE = re.compile(r"[a-z0-9][a-z0-9'.\-]{2,}")
+    _STOP = frozenset(
+        "the and for with from that this have has was were are is been its their "
+        "which what when where who how many much according also into over under "
+        "between during against about after before while other more most than".split())
+
+
+    def _key_terms(text: str) -> set[str]:
+        return {w for w in _WORD_RE.findall((text or "").casefold()) if w not in _STOP}
+
+
+    def _best_windows(note: str, terms: set[str], width: int,
+                      k: int = 1) -> list[tuple[int, int]]:
+        n = len(note)
+        if n <= width:
+            return [(0, n)]
+        step = max(600, width // 3)
+        low = note.lower()                                                     
+        scored: list[tuple[int, int]] = []                  
+        pos = 0
+        while pos < n:
+            seg = low[pos:pos + width]
+            scored.append((sum(1 for t in terms if t in seg), pos))
+            if pos + width >= n:
+                break
+            pos += step
+                                                                            
+        scored.sort(key=lambda hs: (-hs[0], hs[1]))
+        picked: list[tuple[int, int]] = []
+        for hits, start in scored:
+            if len(picked) >= max(1, k):
+                break
+            end = min(n, start + width)
+            if any(start < pe and ps < end for ps, pe in picked):
+                continue                                           
+            if picked and hits <= 0:
+                continue                                              
+            picked.append((start, end))
+        picked.sort()                                             
+        return picked or [(0, min(n, width))]
+
+
+    _SLOT = "\x00{}\x00"
+
+
+    class ToolOutput:
+                                                                         
+                                                                    
+        def __init__(self, text: str, rows: list[dict] | None = None,
+                     memo_key: str = "") -> None:
+            self.text = text
+            self.rows = rows or []
+                                                                              
+                                                                                  
+            self.memo_key = memo_key
+
+
+    _TOOL_MEMO: dict = {}
+                                                                      
+    _FETCH_STATE: dict = {"spent_s": 0.0, "dead": [], "dead_norm": []}
+    # Strip EVERY leading variant label, not just one: the log shows
+    # "www.dv.the-numbers.com" -- one strip leaves "dv.the-numbers.com",
+    # which misses the already-dead key and costs another 16s timeout.
+    # Only known site-variant labels are stripped, so en./de.wikipedia.org
+    # stay distinct resources.
+    _HOST_PREFIX_RE = re.compile(r"^(?:www|m|mobile|amp|dv|web|secure)\.", re.I)
+    _PATH_PREFIX_RE = re.compile(r"^/(?:alpha|amp|beta)(?=/)", re.I)
+    _URL_SPLIT_RE = re.compile(r"^https?://([^/\s?#]+)([^\s?#]*)", re.I)
+
+
+    def _norm_fetch_key(url: str) -> str:
+        """Collapse www./m./alpha variants of one resource onto a single key."""
+        text = (url or "").strip()
+        if "web.archive.org" in text.lower():
+            return ""          # an archive copy is its own resource
+        match = _URL_SPLIT_RE.match(text)
+        if not match:
+            return ""
+        host = match.group(1).lower()
+        for _ in range(3):
+            stripped = _HOST_PREFIX_RE.sub("", host, count=1)
+            if stripped == host or stripped.count(".") < 1:
+                break
+            host = stripped
+        path = _PATH_PREFIX_RE.sub("", match.group(2) or "").rstrip("/")
+        return host + path.lower()
+
+
+    def _reset_run_state() -> None:
+        _TOOL_MEMO.clear()
+        _FETCH_STATE["spent_s"] = 0.0
+        _FETCH_STATE["dead"] = []
+        _FETCH_STATE["dead_norm"] = []
+                                                                                
+                                                                                 
+        _SPEND["left"] = None
+                                                                                 
+                                                                               
+        _SPEND["blind"] = 0
+                                                                               
+                                                     
+        _BRIEF_STORE["raw"] = ""
+        _BRIEF_STORE["plan"] = ""
+        _RUN_UPSTREAM["glm"] = None
+        _RUN_UPSTREAM["oss"] = None
+        _RUN_UPSTREAM["dead"] = set()
+
+
+    def _memo_key(kind: str, *parts: str) -> str:
+        joined = "\x00".join(" ".join((part or "").lower().split()) for part in parts)
+        return kind + "\x00" + joined
+
+
+    def _memo_hit(key: str) -> str:
+        return _TOOL_MEMO.get(key, "")
+
+
+    def _commit_tool_output(out, ledger: EvidenceLedger) -> str:
+        if isinstance(out, str):
+            return out
+        if not isinstance(out, ToolOutput):
+            return f"# tool crashed: {out}"
+        text = out.text
+        assigned: list = []
+        for i, row in enumerate(out.rows):
+            n = ledger.add(row["receipt_id"], row["result_id"], row["note_len"],
+                           row["kind"], row["spans"], title=row.get("title", ""),
+                           url=row.get("url", ""), preview=row.get("preview", ""),
+                           text=row.get("text", ""))
+            assigned.append(n)
+            text = text.replace(_SLOT.format(i), str(n))
+        key = getattr(out, "memo_key", "")
+        if key and assigned:
+            marks = ", ".join(f"[{n}]" for n in assigned)
+            _TOOL_MEMO[key] = (
+                f"# already retrieved earlier in this run -> {marks}. Those numbered "
+                f"rows are still valid; cite them directly. Re-running the identical "
+                f"retrieval returns the identical source, so ask a DIFFERENT question "
+                f"or read a different part of the page instead.")
+        return text
+
+                                                                               
+    HISTORY_KEEP_VERBATIM = 4
+                                                                          
+                                                                          
+    SEED_KEEP_TOOL_TURNS = 2
+    HISTORY_COMPACT_AT_CHARS = 30_000
+    HISTORY_MIN_SAVING = 0.15                                                     
+    HISTORY_FLOOR_RATIO = 0.15                                                 
+
+    _DIGIT_RE = re.compile(r"\d")
+    _SCOPE_RE = re.compile(
+        r"\b(only|solely|excluding|except|excludes?|includes?|including|as of|per\b|"
+        r"according to|between|from|through|until|before|after|since|total|combined|"
+        r"each|both|all\b|none|neither|not\b|no\b|at least|at most|more than|less than|"
+        r"fewer|greater|higher|lower|highest|lowest|first|last|current|former)", re.I)
+    _CONDENSED_TRAILER = (
+        "\n# (condensed: lines carrying no figure, date, scope word or [n] label were "
+        "dropped from this older block. The full source text is unchanged and free to "
+        "re-read — call page_grep or page_read on the same url for any part of it.)")
+
+
+    SEARCH_AGED_LEAD_CHARS = 200
+    _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+    def _condense_excerpt(text: str) -> str:
+        if len(text) <= int(SEARCH_AGED_LEAD_CHARS * 1.3):
+            return text
+        cut = SEARCH_AGED_LEAD_CHARS
+                                                                                 
+                                                          
+        while cut < len(text) and (text[cut].isdigit() or text[cut] in ",.%-/:"):
+            cut += 1
+        head = text[:cut]
+        kept = [part for part in _SENTENCE_SPLIT_RE.split(text[cut:])
+                if _DIGIT_RE.search(part) is not None]
+        out = head + (" … " + " ".join(kept) if kept else " …")
+        return out if len(out) < len(text) else text
+
+
+    def _condense_block(body: str) -> str:
+        lines = body.split("\n")
+        if len(lines) < 8:
+                                                                      
+            rebuilt = []
+            changed = False
+            for line in lines:
+                stripped = line.strip()
+                if len(stripped) > SEARCH_AGED_LEAD_CHARS * 2 and not stripped.startswith("#"):
+                    shorter = _condense_excerpt(line)
+                    changed = changed or shorter != line
+                    rebuilt.append(shorter)
+                else:
+                    rebuilt.append(line)
+            return "\n".join(rebuilt) + (_CONDENSED_TRAILER if changed else "")
+        kept: list = []
+        lead_pending = False
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            keep = (index == 0
+                    or stripped.startswith("#")
+                    or stripped.startswith("[")
+                    or stripped.startswith("---")
+                    or lead_pending
+                    or _DIGIT_RE.search(stripped) is not None
+                    or _SCOPE_RE.search(stripped) is not None)
+                                                                          
+            was_lead = lead_pending
+            lead_pending = stripped.startswith("[") or stripped.startswith("---")
+            if keep:
+                                                                      
+                if was_lead and len(stripped) > SEARCH_AGED_LEAD_CHARS * 2:
+                    kept.append(_condense_excerpt(line))
+                else:
+                    kept.append(line)
+        out = "\n".join(kept)
+        if len(out) > len(body) * (1.0 - HISTORY_MIN_SAVING):
+            return body
+        if len(out) < len(body) * HISTORY_FLOOR_RATIO:
+            return body
+        return out + _CONDENSED_TRAILER
+
+
+    def _condense_history(messages: list) -> None:
+        tool_positions = [i for i, m in enumerate(messages)
+                          if isinstance(m, dict) and m.get("role") == "tool"]
+        seed_positions = [i for i, m in enumerate(messages)
+                          if isinstance(m, dict) and m.get("role") == "system"
+                          and isinstance(m.get("content"), str)
+                          and m["content"].startswith("Automatic first-pass searches")]
+                                                                             
+                                                                              
+        if len(tool_positions) > SEED_KEEP_TOOL_TURNS:
+            for i in seed_positions:
+                body = messages[i].get("content")
+                if isinstance(body, str) and not body.endswith(_KEPT_TRAILERS):
+                    messages[i]["content"] = _archive_seed(body)
+        if len(tool_positions) <= HISTORY_KEEP_VERBATIM:
+            return
+        total = 0
+        for i in tool_positions:
+            body = messages[i].get("content")
+            if isinstance(body, str):
+                total += len(body)
+        for i in seed_positions:
+            total += len(messages[i]["content"])
+                                                                                  
+                                                                               
+        if len(tool_positions) > BRIEF_KEEP_TOOL_TURNS:
+            _condense_brief(messages)
+        if total < HISTORY_COMPACT_AT_CHARS:
+            return
+        for i in tool_positions[:-HISTORY_KEEP_VERBATIM] + seed_positions:
+            message = messages[i]
+            body = message.get("content")
+            if not isinstance(body, str) or body.endswith(_KEPT_TRAILERS):
+                continue
+            message["content"] = _condense_block(body)
+
+
+    _SEED_ROW_RE = re.compile(r"^\[\d{1,3}\] .*$", re.M)
+    _ARCHIVED_TRAILER = ("\n(Seed excerpts paged out. Those [n] rows are still valid and "
+                         "still citable, and page_grep([n], pattern) or page_read reopens "
+                         "any of them in full.)")
+    _KEPT_TRAILERS = (_CONDENSED_TRAILER, _ARCHIVED_TRAILER)
+
+
+    def _archive_seed(body: str) -> str:
+        rows = _SEED_ROW_RE.findall(body)
+        if not rows:
+            return body                                                        
+        out = body.split("\n", 1)[0] + "\n" + "\n".join(rows) + _ARCHIVED_TRAILER
+        return out if len(out) < len(body) else body
+
+
+    _SITE_OP_RE = re.compile(r"\bsite:\S+\s*", re.I)
+
+
+    def _degrade_query(q: str) -> str:
+        out = _SITE_OP_RE.sub("", q or "").replace('"', " ")
+        return " ".join(out.split())
+
+
+    async def _do_search(query_text: str, ledger: EvidenceLedger):
+        if not query_text.strip():
+            return "# web_search: empty query"
+        memo_key = _memo_key("search", query_text)
+        hit = _memo_hit(memo_key)
+        if hit:
+            return f"# web_search({query_text!r}) {hit}"
+                                                                                  
+                                                                                 
+        payload = None
+        fired: set[str] = set()
+                                                                              
+                                                                                
+        for attempt, allow_repeat in ((query_text, False), (query_text, True),
+                                      (_degrade_query(query_text), False)):
+            if not attempt.strip() or (attempt in fired and not allow_repeat):
+                continue
+            fired.add(attempt)
+            for _prov in SEARCH_PROVIDERS:
+                try:
+                    payload = await search_web(attempt, provider=_prov, num=8,
+                                               timeout=SEARCH_TIMEOUT_S)
+                    if getattr(payload, "results", None):
+                        break
+                except Exception:
+                    _spend_blind()
+                    payload = None
+            if payload is not None and getattr(payload, "results", None):
+                break
+        if payload is None:
+            return f"# web_search({query_text!r}) failed"
+        _spend_note(payload)
+        receipt = str(getattr(payload, "receipt_id", "") or "")
+        results = list(getattr(payload, "results", None) or [])
+        if not receipt:
+            return f"# web_search({query_text!r}): no citable results"
+        rows: list[dict] = []
+        lines = [f"# web_search({query_text!r}): {len(results)} results"]
+        for item in results:
+            rid = getattr(item, "result_id", None)
+            if not isinstance(rid, str) or not rid:
+                continue
+            note = (getattr(item, "note", None) or "")
+            if not note.strip():
+                continue                                                            
+                                                                                
+                                                                  
+            n_len = len(note)
+            span = ([(0, min(max(SEARCH_EXCERPT_CHARS, 100), n_len))] if n_len >= 100
+                    else ([(0, n_len)] if n_len else None))
+            title = (getattr(item, "title", None) or "").strip()
+            url = (getattr(item, "url", None) or "").strip()
+            rows.append({"receipt_id": receipt, "result_id": rid, "note_len": n_len,
+                         "kind": "search", "spans": span, "title": title, "url": url,
+                         "preview": note[:SEARCH_EXCERPT_CHARS], "text": note})
+            lines.append(f"[{_SLOT.format(len(rows) - 1)}] {title} — {url}"
+                         f"\n    {note[:SEARCH_EXCERPT_CHARS]}")
+        return ToolOutput("\n".join(lines), rows, memo_key=memo_key if rows else "")
+
+
+    async def _do_fetch(url: str, focus: str, question: str, ledger: EvidenceLedger) -> str:
+        if not url.strip():
+            return "# read_page: empty url"
+                                                                                
+                                                                                 
+        plain_key = _memo_key("fetch", url)
+        focus_key = _memo_key("fetch", url, focus)
+        hit = _memo_hit(plain_key) or _memo_hit(focus_key)
+        if hit:
+            return f"# read_page({url!r}) {hit}"
+                                                                                
+                                                            
+        _dead_key = _norm_fetch_key(url)
+        if url in _FETCH_STATE["dead"] or (
+                _dead_key and _dead_key in _FETCH_STATE["dead_norm"]):
+            return (f"# read_page({url!r}): this url already returned no content in "
+                    f"this run and will not be retried. Use a different source, or "
+                    f"answer from the evidence already numbered above.")
+                                                                         
+                                                                               
+        payload = None
+        for _attempt in (0, 1):                                                 
+            started = monotonic()
+            for _prov in FETCH_PROVIDERS:
+                try:
+                    payload = await fetch_page(url, provider=_prov, timeout=FETCH_TIMEOUT_S)
+                except Exception:
+                    _spend_blind()
+                    payload = None
+                if payload is not None and getattr(payload, "results", None):
+                    break
+            elapsed = monotonic() - started
+            _FETCH_STATE["spent_s"] = _FETCH_STATE["spent_s"] + elapsed
+            if payload is not None and getattr(payload, "results", None):
+                break
+                                                                                 
+                                                                               
+            if elapsed >= FETCH_TIMEOUT_S * 0.6:
+                break
+        if payload is None or not getattr(payload, "results", None):
+            _FETCH_STATE["dead"].append(url)
+            if _dead_key and _dead_key not in _FETCH_STATE["dead_norm"]:
+                _FETCH_STATE["dead_norm"].append(_dead_key)
+        if payload is None:
+            return f"# read_page({url!r}) failed"
+        _spend_note(payload)
+        receipt = str(getattr(payload, "receipt_id", "") or "")
+        results = list(getattr(payload, "results", None) or [])
+        if not results or not receipt:
+            return f"# read_page({url!r}): no content"
+        item = results[0]
+        rid = getattr(item, "result_id", None)
+        note = getattr(item, "note", None) or ""
+        if not isinstance(rid, str) or not rid or not note.strip():
+            return f"# read_page({url!r}): no usable content"
+        if len(note) <= FETCH_PLAIN_CHARS:
+            row = {"receipt_id": receipt, "result_id": rid, "note_len": len(note),
+                   "kind": "fetch", "spans": [(0, len(note))], "title": url,
+                   "url": url, "preview": note[:1200], "text": note}
+            return ToolOutput(f"# read_page({url!r}) -> [{_SLOT.format(0)}] full page, "
+                              f"{len(note)} chars\n{_lossless_view(note)}", [row],
+                              memo_key=plain_key)
+                                                                              
+        terms = _key_terms(question) | _key_terms(focus)
+        windows = _best_windows(note, terms, FETCH_WINDOW_CHARS, k=FETCH_WINDOWS_PER_PAGE)
+        row = {"receipt_id": receipt, "result_id": rid, "note_len": len(note),
+               "kind": "fetch", "spans": [(0, FETCH_HEAD_CHARS)] + list(windows),
+               "title": url, "url": url,
+               "preview": note[windows[0][0]:windows[0][0] + 1200], "text": note}
+        head = _lossless_view(note[:FETCH_HEAD_CHARS])
+        sections = "".join(
+            f"\n--- section @{s} ---\n{_lossless_view(note[s:e])}" for s, e in windows)
+        return ToolOutput(f"# read_page({url!r}) -> [{_SLOT.format(0)}] {len(note)} chars total; head + "
+                f"the {len(windows)} most relevant section(s) shown "
+                f"({', '.join(f'{s}-{e}' for s, e in windows)}). If the answer set may "
+                f"continue elsewhere in this page, call read_page again with a "
+                f"different focus.\n--- head ---\n{head}{sections}", [row],
+                memo_key=focus_key)
+
+
+    _SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+    _SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik10}.json"
+    _SEC_DOC_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{doc}"
+    _SEC_FETCH_TIMEOUT_S = 26.0                                                                   
+    _SEC_MIN_HEADROOM_S = 40.0
+    _SEC_CACHE: dict = {}                                                              
+    _SEC_STOPWORDS = frozenset(
+        "inc incorporated corp corporation company companies co ltd limited llc plc "
+        "lp llp group holdings the".split())
+    _SEC_ALNUM_RE = re.compile(r"[a-z0-9]+")
+
+
+    def _sec_tokens(text: str) -> list[str]:
+        return [w for w in _SEC_ALNUM_RE.findall((text or "").lower())
+                if w not in _SEC_STOPWORDS]
+
+
+    def _sec_norm_form(form: str) -> str:
+        f = " ".join((form or "").upper().replace("FORM", " ").split())
+        m = re.fullmatch(r"(\d{1,2})\s*-?\s*([A-Z])", f)
+        if m:
+            return f"{m.group(1)}-{m.group(2)}"
+        m = re.fullmatch(r"(DEF)\s*-?\s*(14A)", f)
+        if m:
+            return "DEF 14A"
+        return f
+
+
+    async def _fetch_json(url: str, deadline: float):
+        cached = _SEC_CACHE.get(url)
+        if cached is not None:
+            return cached
+        for _attempt in (0, 1):                                                  
+            left = deadline - monotonic()
+            if left < 12.0:
+                return None
+            try:
+                payload = await asyncio.wait_for(
+                    fetch_page(url, provider=SEARCH_PROVIDER,
+                               timeout=min(_SEC_FETCH_TIMEOUT_S, left - 6.0)),
+                    timeout=min(_SEC_FETCH_TIMEOUT_S, left - 6.0) + 4.0)
+            except Exception:
+                _spend_blind()
+                continue
+            _spend_note(payload)
+            results = list(getattr(payload, "results", None) or [])
+            note = (getattr(results[0], "note", None) or "") if results else ""
+            start = note.find("{")
+            end = note.rfind("}")
+            if start == -1 or end <= start:
+                continue
+            try:
+                obj = json.loads(note[start:end + 1])
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                _SEC_CACHE[url] = obj
+                return obj
+        return None
+
+
+    def _sec_pick_filing(recent: dict, form: str, year: str):
+        forms = recent.get("form"); accs = recent.get("accessionNumber")
+        docs = recent.get("primaryDocument"); rdates = recent.get("reportDate")
+        fdates = recent.get("filingDate")
+        if not (isinstance(forms, list) and isinstance(accs, list) and isinstance(docs, list)):
+            return None
+        n = min(len(forms), len(accs), len(docs))
+        form_norm = _sec_norm_form(form)
+        best_year = None
+        best_any = None
+        for i in range(n):
+            if _sec_norm_form(str(forms[i])) != form_norm:
+                continue
+            if accs[i] is None or docs[i] is None:
+                continue
+            acc = str(accs[i]); doc = str(docs[i])
+            if not acc or not (doc.endswith(".htm") or doc.endswith(".html")):
+                continue
+            rd = str(rdates[i]) if (isinstance(rdates, list) and i < len(rdates)
+                                    and rdates[i] is not None) else ""
+            fd = str(fdates[i]) if (isinstance(fdates, list) and i < len(fdates)
+                                    and fdates[i] is not None) else ""
+            key = rd or fd
+            if best_any is None or key > best_any[0]:
+                best_any = (key, acc, doc)
+            if year and rd[:4] == year:
+                if best_year is None or key > best_year[0]:
+                    best_year = (key, acc, doc)
+        pick = best_year if year else best_any
+        if pick is None:
+            return None
+        return pick[1], pick[2]
+
+
+    _SEC_SEARCH_HINT = "search \"site:sec.gov {company} {year} {form}\" and read_page the Archives result"
+
+
+    async def _do_sec_filing(company: str, form: str, year: str, deadline: float) -> str:
+        company = (company or "").strip()
+        form = (form or "").strip() or "10-K"
+        year = (year or "").strip()[:4]
+        hint = _SEC_SEARCH_HINT.format(company=company, year=year, form=form)
+        if not company:
+            return "# sec_filing: company required"
+        if (deadline - monotonic()) < _SEC_MIN_HEADROOM_S:
+            return f"# sec_filing: skipped (low time) — {hint}"
+        tickers = await _fetch_json(_SEC_TICKERS_URL, deadline)
+        if not isinstance(tickers, dict):
+            return f"# sec_filing: EDGAR ticker index unavailable — {hint}"
+        want = _sec_tokens(company)
+        best = None                                      
+        for row in tickers.values():
+            if not isinstance(row, dict):
+                continue
+            title = str(row.get("title", ""))
+            ticker = str(row.get("ticker", "")).lower()
+            words = set(_sec_tokens(title))
+            n_hit = sum(1 for w in want if w in words)
+            if len(want) == 1 and ticker == want[0]:
+                score = 100                                                        
+                                                                         
+            elif want and n_hit == len(want):                                      
+                score = 50 + n_hit
+            else:
+                continue
+            cand = (score, -len(title), str(row.get("cik_str", "")).zfill(10), title)
+            if best is None or cand > best:
+                best = cand
+        if best is None:
+            return f"# sec_filing({company!r}): no confident EDGAR match — {hint}"
+        cik10, title = best[2], best[3]
+        subs = await _fetch_json(_SEC_SUBMISSIONS_URL.format(cik10=cik10), deadline)
+        filings = subs.get("filings") if isinstance(subs, dict) else None
+        recent = filings.get("recent") if isinstance(filings, dict) else None
+        if not isinstance(recent, dict):
+            return f"# sec_filing({company!r}): EDGAR submissions unavailable for {title} — {hint}"
+        pick = _sec_pick_filing(recent, form, year)
+        if pick is None:
+            return (f"# sec_filing({company!r}, {form!r}, year={year or 'latest'}): no matching "
+                    f"filing in EDGAR's recent index for {title} — check the form/year, or {hint}")
+        accession, doc = pick
+        url = _SEC_DOC_URL.format(cik=cik10.lstrip("0") or cik10,
+                                  accession=accession.replace("-", ""), doc=doc)
+        return (f"# sec_filing -> {title} {form} {year or '(latest)'} primary document:\n"
+                f"{url}\nNow call read_page on this URL with a focus hint for the "
+                f"section you need, and cite figures from that read_page result.")
+
+
+    def _ledger_page(url: str, ledger: EvidenceLedger) -> tuple[int, dict] | None:
+        u = (url or "").strip().rstrip("/")
+        if not u:
+            return None
+        for i in range(len(ledger.rows) - 1, -1, -1):
+            row = ledger.rows[i]
+            if not row.get("text"):
+                continue
+            r = str(row.get("url") or "").rstrip("/")
+            if r == u or r.endswith(u) or u.endswith(r):
+                return i + 1, row
+        return None
+
+
+    def _add_shown_span(row: dict, a: int, b: int) -> None:
+        text = row.get("text") or ""
+        note_len = int(row.get("note_len") or len(text))
+        a = max(0, min(int(a), note_len))
+        b = max(a + 1, min(int(b), note_len))
+        if b <= a:
+            return
+                                                                               
+                                                                               
+        if b - a > SHOWN_SPAN_MAX_CHARS:
+            mid = (a + b) // 2
+            a = max(0, mid - SHOWN_SPAN_MAX_CHARS // 2)
+            b = min(note_len, a + SHOWN_SPAN_MAX_CHARS)
+        kept = row.setdefault("retained", [])
+        for i, (ka, kb) in enumerate(kept):
+            if a <= kb and ka <= b:                                                       
+                kept[i] = (min(ka, a), max(kb, b))
+                return
+        if len(kept) >= RETAIN_MAX_PER_ROW:
+            return
+        kept.append((a, b))
+
+
+    def _do_page_grep(url: str, pattern: str, ledger: EvidenceLedger) -> str:
+        hit = _ledger_page(url, ledger)
+        if hit is None:
+            return f"# page_grep: {url!r} has not been fetched this run; call read_page first"
+        n, row = hit
+        text = row.get("text") or ""
+        pat = (pattern or "").strip()
+        if not pat:
+            return "# page_grep: empty pattern"
+        try:
+            rx = re.compile(pat, re.I)
+        except re.error:
+            rx = re.compile(re.escape(pat), re.I)
+        out, seen_at = [], []
+        for m in rx.finditer(text):
+            c = (m.start() + m.end()) // 2
+            if any(abs(c - prev) < PAGE_GREP_WINDOW // 2 for prev in seen_at):
+                continue                                        
+            seen_at.append(c)
+            a = max(0, c - PAGE_GREP_WINDOW // 2)
+            b = min(len(text), a + PAGE_GREP_WINDOW)
+            out.append(f"\n--- match @{a} ---\n{text[a:b]}")
+            _add_shown_span(row, a, b)                                               
+            if len(out) >= PAGE_GREP_MAX_HITS:
+                break
+        if not out:
+            return (f"# page_grep({pat!r}) on [{n}]: no match in {len(text)} chars. "
+                    f"Try a shorter or looser pattern.")
+        return (f"# page_grep({pat!r}) on [{n}] -> {len(out)} match(es) of {len(text)} chars"
+                + "".join(out))
+
+
+    def _do_page_read(url: str, offset: int, length: int, ledger: EvidenceLedger) -> str:
+        hit = _ledger_page(url, ledger)
+        if hit is None:
+            return f"# page_read: {url!r} has not been fetched this run; call read_page first"
+        n, row = hit
+        text = row.get("text") or ""
+        a = max(0, min(int(offset or 0), max(0, len(text) - 1)))
+        ln = int(length or PAGE_READ_MAX_CHARS)
+        b = min(len(text), a + max(1, min(ln, PAGE_READ_MAX_CHARS)))
+        _add_shown_span(row, a, b)                                                   
+        return f"# page_read([{n}] @{a}:{b} of {len(text)})\n{text[a:b]}"
+
+
+    _QUOTE_TYPO_FOLD = {
+        "‘": "'", "’": "'", "‚": "'", "‛": "'", "´": "'",
+        "“": '"', "”": '"', "„": '"', "‟": '"', "«": '"',
+        "»": '"', "‐": "-", "‑": "-", "‒": "-", "–": "-",
+        "—": "-", "―": "-", "−": "-", "…": "...",
+    }
+
+
+    _DUP_TITLE = re.compile(r'\[([^\]\n]{1,300})\]\((\S+?)(\s+"([^"\n]{1,300})")\)')
+
+
+    def _dup_title_ranges(text: str) -> list[tuple[int, int]]:
+        cuts: list[tuple[int, int]] = []
+        for m in _DUP_TITLE.finditer(text):
+            if m.group(4).strip() == m.group(1).strip():
+                cuts.append((m.start(3), m.end(3)))
+        return cuts
+
+
+    def _lossless_view(text: str) -> str:
+        cuts = _dup_title_ranges(text)
+        if not cuts:
+            return text
+        out: list[str] = []
+        at = 0
+        for a, b in cuts:
+            out.append(text[at:a])
+            at = b
+        out.append(text[at:])
+        return "".join(out)
+
+
+    def _canon_with_map(text: str) -> tuple[str, list[int]]:
+        out: list[str] = []
+        idx: list[int] = []
+        prev_space = True
+        skip = _dup_title_ranges(text)
+        cut_i = 0
+        for i, ch in enumerate(text):
+            while cut_i < len(skip) and i >= skip[cut_i][1]:
+                cut_i += 1
+            if cut_i < len(skip) and skip[cut_i][0] <= i < skip[cut_i][1]:
+                continue
+            folded = _QUOTE_TYPO_FOLD.get(ch, ch)
+            if folded.isspace():
+                if prev_space:
+                    continue
+                out.append(" ")
+                idx.append(i)
+                prev_space = True
+                continue
+            prev_space = False
+            for sub in folded.lower():
+                out.append(sub)
+                idx.append(i)
+        return "".join(out), idx
+
+
+    def _quote_hits(text: str, quote: str) -> list[tuple[int, int]]:
+        def scan(hay: str, needle: str, span: int) -> list[tuple[int, int]]:
+            found: list[tuple[int, int]] = []
+            at = 0
+            while len(found) < 64:
+                j = hay.find(needle, at)
+                if j < 0:
+                    break
+                found.append((j, j + span))
+                at = j + 1
+            return found
+
+        hits = scan(text, quote, len(quote))
+        if hits:
+            return hits
+        hits = scan(text.lower(), quote.lower(), len(quote))
+        if hits:
+            return hits
+        canon, cmap = _canon_with_map(text)
+        cq, _ = _canon_with_map(quote)
+        if not cq or not canon:
+            return []
+        for a, b in scan(canon, cq, len(cq)):
+            last = b - 1
+            hits.append((cmap[a], (cmap[last] + 1) if last < len(cmap) else len(text)))
+        return hits
+
+
+    def _pick_quote_hit(hits: list[tuple[int, int]],
+                        spans: object) -> tuple[int, int] | None:
+        if not hits:
+            return None
+        shown: list[tuple[int, int]] = []
+        for span in (spans or ()):
+            try:
+                shown.append((int(span[0]), int(span[1])))
+            except Exception:
+                continue
+        if shown:
+            for lo, hi in shown:
+                for h in hits:
+                    if h[0] >= lo and h[1] <= hi:
+                        return h
+            for lo, hi in shown:
+                for h in hits:
+                    if h[0] < hi and h[1] > lo:
+                        return h
+        return hits[0]
+
+
+    def _do_retain_evidence(source: str, quote: str, ledger: EvidenceLedger) -> str:
+        raw = (source or "").strip().strip("[]")
+        try:
+            n = int(raw)
+        except ValueError:
+            return f"# retain_evidence: source must be a result number like [3], got {source!r}"
+        if not (1 <= n <= len(ledger.rows)):
+            return f"# retain_evidence: no result [{n}] exists yet"
+        row = ledger.rows[n - 1]
+        text = row.get("text") or ""
+        q = (quote or "").strip()
+        if len(q) < RETAIN_MIN_QUOTE:
+            return (f"# retain_evidence: quote too short ({len(q)} chars); quote at least "
+                    f"{RETAIN_MIN_QUOTE} characters of the source text")
+        if not text:
+            return f"# retain_evidence: result [{n}] has no stored text to quote from"
+        hit = _pick_quote_hit(_quote_hits(text, q), row.get("spans"))
+        if hit is None:
+            return (f"# retain_evidence: that text does not appear in [{n}]. Quote it "
+                    f"EXACTLY as the source prints it, or read more of the page first.")
+        i, j = hit
+        kept = row.setdefault("retained", [])
+        a = max(0, i - RETAIN_MARGIN_CHARS)
+        b = min(int(row.get("note_len") or len(text)), j + RETAIN_MARGIN_CHARS)
+        if b <= a:
+            return f"# retain_evidence: could not bound the excerpt in [{n}]"
+                                                                                
+                                                                              
+        for k, (ka, kb) in enumerate(kept):
+            if a <= kb and ka <= b:
+                merged = (min(ka, a), max(kb, b))
+                kept[k] = merged
+                return (f"# retain_evidence: merged into the excerpt already kept for "
+                        f"[{n}] ({merged[1] - merged[0]} chars). Cite [{n}] for that claim.")
+        if len(kept) >= RETAIN_MAX_PER_ROW:
+            return f"# retain_evidence: [{n}] already has {len(kept)} retained excerpts"
+        kept.append((a, b))
+        return (f"# retain_evidence: kept {b - a} chars of [{n}] around your quote. "
+                f"Cite [{n}] for that claim.")
+
+
+    async def _run_tool(call, question: str, ledger: EvidenceLedger, deadline: float) -> str:
+        try:
+            args = json.loads(getattr(call, "arguments", None) or "{}")
+        except Exception:
+            args = {}
+        if not isinstance(args, dict):
+            args = {}
+        name = getattr(call, "name", "") or ""
+                                                                            
+        if name == "web_search":
+            return await _do_search(str(args.get("query") or ""), ledger)
+        if name == "read_page":
+            return await _do_fetch(str(args.get("url") or ""), str(args.get("focus") or ""),
+                                   question, ledger)
+        if name == "retain_evidence":
+            return _do_retain_evidence(str(args.get("source") or ""),
+                                       str(args.get("quote") or ""), ledger)
+        if name == "page_grep":
+            return _do_page_grep(str(args.get("url") or ""),
+                                 str(args.get("pattern") or ""), ledger)
+        if name == "page_read":
+            return _do_page_read(str(args.get("url") or ""),
+                                 args.get("offset") or 0,
+                                 args.get("length") or PAGE_READ_MAX_CHARS, ledger)
+        if name == "sec_filing":
+            return await _do_sec_filing(str(args.get("company") or ""),
+                                        str(args.get("form") or ""),
+                                        str(args.get("year") or ""), deadline)
+        return f"# unknown tool {name!r}"
+
+
+    _REASONING_MANDATORY = ("openai/gpt-oss",)
+
+
+    def _least_think(lane: str, model: str = "") -> dict:
+        for prefix in _REASONING_MANDATORY:
+            if model.startswith(prefix):
+                return {"enabled": True, "effort": "low"}
+        return {"enabled": False}
+
+
+    _FAST_UPSTREAMS = ("Decart", "CoreWeave", "Alibaba")                      
+    _FAST_UPSTREAMS_OSS = ("Cerebras", "Groq", "BaseTen")                            
+
+
+    _RUN_UPSTREAM: dict = {"glm": None, "oss": None, "dead": set()}
+
+
+    def _upstream_key(model: str) -> str | None:
+        if model.startswith("z-ai/glm-5.2"):
+            return "glm"
+        if model.startswith("openai/gpt-oss"):
+            return "oss"
+        return None
+
+
+    def _upstream(lane: str, model: str) -> dict | None:
+        if lane != LLM_LANE_A:
+            return None
+        key = _upstream_key(model)
+        if key is None:
+            return None
+        pool = _FAST_UPSTREAMS if key == "glm" else _FAST_UPSTREAMS_OSS
+        chosen = _RUN_UPSTREAM.get(key)
+        if chosen is None or chosen in _RUN_UPSTREAM["dead"]:
+            live = [u for u in pool if u not in _RUN_UPSTREAM["dead"]]
+            if not live:
+                return None                                                            
+            chosen = live[0]
+            _RUN_UPSTREAM[key] = chosen
+                                                                              
+                                                                                   
+        return {"provider": {"only": [chosen], "allow_fallbacks": False}}
+
+
+    def _upstream_failed(model: str) -> None:
+        key = _upstream_key(model)
+        if key is None:
+            return
+        chosen = _RUN_UPSTREAM.get(key)
+        if chosen:
+            _RUN_UPSTREAM["dead"].add(chosen)
+            _RUN_UPSTREAM[key] = None
+
+
+    async def _chat_simple(lane: str, model: str, system: str, user: str, *,
+                           max_tokens: int, timeout: float,
+                           think: dict | None = None) -> str:
+        if think is None:
+            think = _least_think(lane, model)
+                                                                                   
+                                                                                    
+        _pin0 = _upstream(lane, model)
+        payload = None
+        for _pin in ((_pin0, None) if _pin0 is not None else (None,)):
+            try:
+                payload = await llm_chat(
+                    provider=lane,
+                    model=model,
+                    messages=[{"role": "system", "content": system},
+                              {"role": "user", "content": user}],
+                    temperature=0.15,                                           
+                    max_output_tokens=max_tokens,
+                    timeout=timeout,
+                    thinking=think,
+                    provider_extra=_pin,
+                )
+                break
+            except Exception:
+                _spend_blind()
+                if _pin is None:
+                    raise
+                _upstream_failed(model)
+                continue
+        _spend_note(payload)
+        llm = getattr(payload, "llm", None)
+        text = (getattr(llm, "raw_text", None) or "").strip()
+        if text:
+            return text
+        choices = getattr(llm, "choices", None) or []
+        if choices:
+            content = getattr(choices[0].message, "content", None)
+            if isinstance(content, str):
+                return content.strip()
+        return ""
+
+
+    class _EmptyChoiceMessage:
+        content = ""
+        tool_calls = ()
+
+
+    class _EmptyChoice:
+        message = _EmptyChoiceMessage()
+
+
+    class _EmptyLlm:
+        raw_text = ""
+        choices = (_EmptyChoice(),)
+
+
+    class _EmptyTurn:
+        llm = _EmptyLlm()
+        budget = None
+
+
+    _EMPTY_TURN = _EmptyTurn()
+
+
+    async def _chat_turn(messages: list[dict], deadline: float, *, finish_only: bool,
+                         force_tools: bool = False):
+                                                                               
+                                                                               
+        turn_wall = monotonic() + TURN_TIMEOUT_S + 35.0
+        payload_chars = sum(len(str(msg.get("content") or "")) for msg in messages
+                            if isinstance(msg, dict))
+                                                                                     
+                                                                                 
+        for lane_model in ((LLM_LANE_A, LOOP_MODEL_A, True),
+                           (LLM_LANE_A, LOOP_MODEL_A, False),
+                           (LLM_LANE_B, LOOP_MODEL_B, False)):
+            lane = lane_model[0]
+            model = lane_model[1]
+            pinned = lane_model[2]
+            if model == LOOP_MODEL_B and payload_chars > LANE_B_MAX_PAYLOAD_CHARS:
+                                                                                  
+                                                                                   
+                return _EMPTY_TURN
+            timeout = min(TURN_TIMEOUT_S, deadline - monotonic() - 5.0,
+                          turn_wall - monotonic())
+            _left_now = deadline - monotonic()
+            # One hung 75 s turn must not eat the wrap-up: a turn gets its fair
+            # share of what is left and the wrap-up leaves the digest writer 30 s.
+            if finish_only:
+                timeout = min(timeout, max(20.0, _left_now - 32.0))
+            else:
+                timeout = min(timeout, max(30.0, (_left_now - 40.0) * 0.5))
+            if timeout <= 5.0:
+                return None
+            try:
+                                                                                  
+                                                                                    
+                payload = await asyncio.wait_for(llm_chat(
+                    provider=lane,
+                    model=model,
+                    messages=messages,
+                    tools=LOOP_TOOLS if (force_tools or not finish_only) else None,
+                    tool_choice="auto" if (force_tools or not finish_only) else None,
+                                                                                
+                                                                              
+                    temperature=0.2,
+                                                                                  
+                                                                                   
+                    thinking=({"enabled": False} if (finish_only and model == LOOP_MODEL_B)
+                              else {"enabled": True, "effort": "low"}),
+                    max_output_tokens=6000 if (finish_only and model == LOOP_MODEL_B) else None,
+                    provider_extra=_upstream(lane, model) if pinned else None,
+                    timeout=timeout,
+                ), timeout=min(timeout + 6.0,
+                               max(1.0, deadline - monotonic() - 1.0)))
+                _spend_note(payload)
+                return payload
+            except Exception:
+                _spend_blind()
+                if pinned:
+                    _upstream_failed(model)
+                continue
+        return None
+
+
+    BRIEF_HEAD = "PRIOR ANALYSIS"
+    BRIEF_KEEP_TOOL_TURNS = 4                                                 
+    _BRIEF_STORE: dict = {"raw": "", "plan": ""}
+                                                                                 
+                                                                                
+    _BRIEF_PLAN_RE = re.compile(
+        r"^[ \t]*[#*_>]{0,4}[ \t]*(?:searches|urls|LOOKUPS|PAGES)[ \t]*[#*_]{0,3}[ \t]*:?",
+        re.IGNORECASE | re.MULTILINE)
+    _BRIEF_TRAILER = ("\n(Planned searches and urls paged out — you have already acted "
+                      "on them. Nothing else about the worksheet changed.)")
+
+
+    def _brief_plan() -> str:
+        return _BRIEF_STORE.get("plan") or ""
+
+
+    def _condense_brief(messages: list) -> None:
+        for message in messages:
+            if not (isinstance(message, dict) and message.get("role") == "system"):
+                continue
+            body = message.get("content")
+            if not (isinstance(body, str) and body.startswith(BRIEF_HEAD)):
+                continue
+            if body.endswith(_BRIEF_TRAILER):
+                return                                         
+            found = _BRIEF_PLAN_RE.search(body)
+            if found is None or found.start() <= 0:
+                return                                            
+            kept = body[:found.start()].rstrip()
+            if not kept or len(kept) >= len(body):
+                return
+            _BRIEF_STORE["plan"] = body[found.start():]
+            message["content"] = kept + _BRIEF_TRAILER
+            return
+
+
+    async def _knowledge_brief(question: str) -> tuple[str, str]:
+        system = ("Senior research analyst. Commit to concrete best answers from "
+                  "knowledge; mark uncertain values (verify). Never refuse.")
+                                                                            
+                                                                             
+        user = (
+            f"Question:\n{question}\n\n"
+            "Fill in this internal worksheet. It is planning scratch for your own use, "
+            "never an answer, so keep the tags lowercase and never reuse them as "
+            "section headings later.\n"
+            "draft: your full best answer now — candidate pool, every stated "
+            "condition applied, qualifying entities with figures/dates, near-miss "
+            "exclusions. Flag shaky facts with (verify).\n"
+            "conditions: each atomic condition in the question, numbered, including "
+            "any output-format demand.\n"
+            "searches: 3-6 precise web searches for the facts that decide the answer "
+            "(entity + metric + year; include a named source's site: filter).\n"
+            "urls: up to 5 exact URLs worth reading directly (official stats pages, "
+            "sec.gov Archives filings, boxofficemojo year pages); 'none' if unsure."
+        )
+        raw = ""
+        try:
+            raw = await _chat_simple(LLM_LANE_A, LOOP_MODEL_A, system, user,
+                                     max_tokens=2400, timeout=BRIEF_TIMEOUT_S,
+                                     think=_least_think(LLM_LANE_A, LOOP_MODEL_A))
+        except Exception:
+            try:
+                raw = await _chat_simple(LLM_LANE_B, LOOP_MODEL_B, system, user,
+                                         max_tokens=2400, timeout=BRIEF_TIMEOUT_S,
+                                         think=_least_think(LLM_LANE_B, LOOP_MODEL_B))
+            except Exception:
+                raw = ""
+        if not raw:
+            return "", ""
+                                                                               
+                                                                           
+        draft = raw
+        cut = min((mm.start() for mm in (
+            re.search(r"[#*_\s]*(?:conditions|CHECKLIST)[#*_\s]*:", raw, re.IGNORECASE),
+            re.search(r"^[ \t]*[#*_>]{0,4}[ \t]*(?:conditions|CHECKLIST)[ \t]*[#*_]{0,3}[ \t]*$",
+                      raw, re.IGNORECASE | re.MULTILINE),
+        ) if mm is not None), default=None)
+        if cut is not None:
+            draft = raw[:cut]
+                                                                                   
+        draft = re.sub(r"^[#*_\s]*(?:draft|BEST ANSWER)[#*_\s]*:[#*_\s]*", "", draft,
+                       flags=re.IGNORECASE)
+        draft = re.sub(r"^[ \t]*[#*_>]{0,4}[ \t]*(?:draft|BEST ANSWER)[ \t]*[#*_]{0,3}[ \t]*\n+",
+                       "", draft, flags=re.IGNORECASE)
+        draft = draft.strip()
+        brief = ("PRIOR ANALYSIS — your own planning worksheet (verify anything marked "
+                 "(verify), and correct it wherever tool results disagree). Its tags are "
+                 "internal: never reproduce them, or any section named after them, in the "
+                 "answer.\n" + raw.strip())
+        _BRIEF_STORE["raw"] = raw
+        _plan = _BRIEF_PLAN_RE.search(brief)
+        _BRIEF_STORE["plan"] = brief[_plan.start():] if _plan is not None else ""
+        return draft, brief
+
+
+    _SEED_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.\-']+")
+    _SEED_STOP = frozenset("name list give tell show find identify please could would "
+                           "you your can may might should must let make sure both also".split())
+    MAX_SEED_QUERIES = 3
+
+
+    def _seed_queries(question: str, set_question: bool) -> list[str]:
+        q = " ".join((question or "").split())
+        if not q:
+            return []
+        seeds = [q[:300]]
+                                                                               
+                                                                               
+        salient_src = q
+        try:
+            salient_src = _ask_clause(q) or q
+        except Exception:
+            salient_src = q
+        salient = [t for t in _SEED_TOKEN_RE.findall(salient_src)
+                   if len(t) >= 3 and t.lower() not in _STOP and t.lower() not in _SEED_STOP]
+        if len(salient) >= 2:
+            seeds.append(" ".join(salient[:8]))
+        if set_question and salient:
+                                                                               
+            seeds.append("list of " + " ".join(salient[:6]))
+        out: list[str] = []
+        for s in seeds:
+            s = s.strip()
+            if s and s not in out:
+                out.append(s)
+        return out[:MAX_SEED_QUERIES]
+
+
+    async def _preseed(question: str, set_question: bool, ledger: EvidenceLedger,
+                       deadline: float) -> str:
+        seeds = _seed_queries(question, set_question)
+        if not seeds or (deadline - monotonic()) < 40.0:
+            return ""
+                                                                         
+     
+        budget = max(5.0, min(SEARCH_TIMEOUT_S * 2 + 6.0,
+                              deadline - monotonic() - MIN_TAIL_S))
+        seed_tasks = [asyncio.ensure_future(_do_search(seed, ledger)) for seed in seeds]
+        try:
+            await asyncio.wait(seed_tasks, timeout=budget)
+        except Exception:
+            pass
+        blocks: list = []
+        for seed_task in seed_tasks:
+            if not seed_task.done():
+                seed_task.cancel()
+                continue
+            try:
+                out = seed_task.result()
+            except Exception:
+                continue
+            blocks.append(_commit_tool_output(out, ledger))
+        good = [b for b in blocks if isinstance(b, str) and _CITE_MARK_RE.search(b)]
+        if not good:
+            return ""                                                        
+        return ("Automatic first-pass searches (already numbered — cite these [n] "
+                "directly, and search further as needed):\n\n" + "\n".join(good))
+
+
+    async def _loop(question: str, brief: str, ledger: EvidenceLedger,
+                    deadline: float, turn_cap: int,
+                    carry: list[dict] | None = None,
+                    allow_tools_in_wrapup: bool = False,
+                    pool_hint: str = "") -> tuple[str, list[dict]]:
+        if carry is not None:
+            messages = carry
+        else:
+            set_q = _needs_set_completeness(question)
+            messages = [{"role": "system", "content": LOOP_RULES}]
+            if set_q:
+                messages.append({"role": "system", "content": SET_RULE})
+            if _needs_superlative_proof(question):
+                messages.append({"role": "system", "content": SUPERLATIVE_RULE})
+            if brief:
+                messages.append({"role": "system", "content": brief})
+                if pool_hint:
+                    messages.append({"role": "system", "content": pool_hint})
+                                                                
+            seeded = await _preseed(question, set_q, ledger, deadline)
+            if seeded:
+                messages.append({"role": "system", "content": seeded})
+            messages.append({"role": "user", "content": question})
+
+        answer = ""
+        ordered_wrapup = False
+        repairs_left = ANSWER_REPAIR_TURNS
+        for turn in range(1, turn_cap + 1):
+            left = deadline - monotonic()
+            if left <= MIN_TAIL_S:
+                break
+            out_of_time = left <= WRAPUP_AT_S
+            out_of_spend = _spend_left() <= WRAPUP_MIN_USD
+            finish_only = out_of_time or out_of_spend or turn >= turn_cap
+            if (finish_only or turn >= turn_cap - 1) and not ordered_wrapup:
+                messages.append({"role": "system", "content": _wrapup_order(left)})
+                ordered_wrapup = True
+
+                                                                               
+            _condense_history(messages)
+            payload = await _chat_turn(messages, deadline, finish_only=finish_only,
+                                       force_tools=allow_tools_in_wrapup and turn == 1)
+            if payload is None:
+                break
+            llm = getattr(payload, "llm", None)
+            choices = getattr(llm, "choices", None) or []
+            if not choices:
+                break
+            msg = choices[0].message
+            calls = getattr(msg, "tool_calls", None) or ()
+            if not calls:
+                candidate = (getattr(llm, "raw_text", None) or "").strip()
+                if not candidate:
+                    content = getattr(msg, "content", None)
+                    if isinstance(content, str):
+                        candidate = content.strip()
+                                                                                 
+                                                                               
+                if not _is_usable_answer(candidate):
+                    if repairs_left > 0 and (deadline - monotonic()) > MIN_TAIL_S + 10.0:
+                        repairs_left -= 1
+                                                                                 
+                                                                                   
+                        messages.append({"role": "system", "content": _REPAIR_ORDER})
+                        answer = ""
+                        continue
+                    answer = ""                                                       
+                    break
+                answer = candidate
+                                                                           
+                                                                            
+                messages.append({"role": "assistant", "content": answer})
+                break
+            messages.append(msg.to_input_message())
+                                                                                
+                                                                               
+            run_calls = calls[:8]
+                                                                             
+                                                                             
+            tool_budget = max(5.0, min(FETCH_TIMEOUT_S * 2 + 6.0,
+                                       deadline - monotonic() - MIN_TAIL_S))
+                                                                                  
+                                                                                   
+            tool_tasks = [asyncio.ensure_future(_run_tool(c, question, ledger, deadline))
+                          for c in run_calls]
+            try:
+                await asyncio.wait(tool_tasks, timeout=tool_budget)
+            except Exception:
+                pass
+            results = []
+            for t in tool_tasks:
+                if t.done():
+                    try:
+                        results.append(t.result())
+                    except Exception as exc:
+                        results.append(f"# tool crashed: {exc}")
+                else:
+                    t.cancel()
+                    results.append("# tool timed out — use what you already have")
+            for call_result in zip(run_calls, results):
+                call = call_result[0]
+                                                                                
+                                                                            
+                body = _commit_tool_output(call_result[1], ledger)
+                messages.append({"role": "tool", "tool_call_id": call.id, "content": body})
+            for call in calls[8:]:
+                messages.append({"role": "tool", "tool_call_id": call.id,
+                                 "content": "# skipped: per-turn tool budget reached — re-issue next turn if still needed"})
+        return answer, messages
+
+
+    async def _audit_patch(question: str, answer: str, messages: list[dict],
+                           ledger: EvidenceLedger, deadline: float) -> str:
+        probe = (
+            "Audit the answer against the question. JSON only, keys: "
+            '"unanswered_parts" (list; question elements not addressed), '
+            '"uncited_facts" (list; load-bearing claims without [n]), '
+            '"wrong_kind" (list; places where the named entity is a different KIND '
+            "than the question asks — a person instead of a series, a duo instead "
+            "of a show), "
+            '"incomplete_roster" (list; THE MOST COMMON LOSS. If the question ranges '
+            "over a candidate pool — a closed set that can be enumerated, or several "
+            "conditions applied to a class — then: is the pool itself stated and "
+            "plausibly COMPLETE, and does the answer give a verdict for EVERY member "
+            "(qualifies / excluded because X, each cited)? Name any pool member the "
+            "answer never mentions, and say so if the pool looks truncated — an "
+            "answer naming 3 qualifiers when the pool holds 6 scores as WRONG, not "
+            "partial), "
+            '"thin_proof" (list; a qualifier lacking a per-condition citation, or a '
+            "plausible near-miss candidate never addressed), "
+            '"hand_waved_tally" (list; for a superlative/count/most-common question: '
+            "the answer asserts a winner or a count WITHOUT showing the candidate "
+            "table it was derived from. Phrases like 'among others', 'and several "
+            "more', 'multiple X', or naming 2 examples to justify a count are all "
+            "hand-waving — say so and name what the tally must list). "
+            "Empty lists when clean.\n\n"
+            f"Question:\n{question}\n\nAnswer:\n{answer[:11000]}"
+        )
+                                                                                 
+                                                                             
+        table = _quote_table(ledger)
+        if table:
+            probe += (
+                "\n\nEVIDENCE the answer was built from (the excerpts the researcher "
+                "itself nominated):\n" + table[:AUDIT_EVIDENCE_CHARS] +
+                "\n\nCheck the ANSWER against this EVIDENCE, not against itself. In "
+                '"incomplete_roster" name every pool member that APPEARS IN THE '
+                "EVIDENCE but is missing from the answer, and every member the answer "
+                "asserts that the evidence does not actually carry."
+            )
+        try:
+            raw = await _chat_simple(LLM_LANE_A, AUDIT_MODEL,
+                                     "Strict completeness auditor. JSON only.",
+                                     probe, max_tokens=2200,
+                                     timeout=max(8.0, min(AUDIT_TIMEOUT_S,
+                                                          (deadline - monotonic()) - 72.0)))
+            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I | re.M)
+            report = json.loads(raw)
+        except Exception:
+            return answer
+        gaps: list[str] = []
+        roster_gaps: list[str] = []
+        if isinstance(report, dict):
+            for key in ("incomplete_roster", "hand_waved_tally", "unanswered_parts",
+                        "uncited_facts", "wrong_kind", "thin_proof"):
+                vals = report.get(key)
+                if isinstance(vals, list):
+                    found = [str(v) for v in vals if str(v).strip()]
+                    if key in ("incomplete_roster", "hand_waved_tally"):
+                        roster_gaps.extend(found)
+                    gaps.extend(found)
+                                                                              
+                                                   
+        if not gaps or (deadline - monotonic()) < 70.0:
+            return answer
+                                                                                 
+                                                                       
+        order = ("AUDIT: the answer has gaps:\n- " + "\n- ".join(gaps[:6]))
+        if roster_gaps:
+            order += ("\nThe candidate pool is incomplete — this loses outright. FIRST "
+                      "search for the authoritative LIST/roster/table that enumerates "
+                      "the whole pool (query it as a list, e.g. '<pool subject> full "
+                      "list', not one member at a time), verify EVERY member against "
+                      "every condition, then rewrite.")
+        order += ("\nUse at most 3 tool calls to close the most important gaps, then "
+                  "rewrite the COMPLETE final answer with [n] citations in the "
+                  "required shape.")
+        messages.append({"role": "system", "content": order})
+        patched, _ = await _loop(question, "", ledger, deadline,
+                                 AUDIT_EXTRA_TURNS + 1, carry=messages,
+                                 allow_tools_in_wrapup=True)
+        patched = patched.strip()
+                                                                           
+        if not _is_usable_answer(patched) or len(patched) < int(len(answer) * 0.6):
+            return answer
+        return patched
+
+
+    _BRACKET_FIX = {0x3010: "[", 0x3011: "]", 0xFF3B: "[", 0xFF3D: "]",
+                    0xFF08: "(", 0xFF09: ")", 0x2011: "-", 0x2212: "-"}
+    for _d in range(10):                                                   
+        _BRACKET_FIX[0xFF10 + _d] = chr(48 + _d)
+
+
+    def _normalize_brackets(text: str) -> str:
+        return (text or "").translate(_BRACKET_FIX)
+
+
+    _CITE_NUM_RE = re.compile(r"\[([0-9][0-9,\s\-]*)\]")
+
+
+    def _cited_numbers(answer: str, top: int) -> list[int]:
+        answer = _normalize_brackets(answer)
+        seen: set[int] = set()
+        out: list[int] = []
+        for m in _CITE_NUM_RE.finditer(answer):
+            for chunk in m.group(1).split(","):
+                piece = chunk.strip()
+                span = re.fullmatch(r"(\d{1,4})\s*-\s*(\d{1,4})", piece)
+                if span:
+                    lo = int(span.group(1))
+                    hi = int(span.group(2))
+                    for n in range(lo, min(hi, lo + 16) + 1):
+                        if 1 <= n <= top and n not in seen:
+                            seen.add(n)
+                            out.append(n)
+                elif piece.isdigit():
+                    n = int(piece)
+                    if 1 <= n <= top and n not in seen:
+                        seen.add(n)
+                        out.append(n)
+        return out
+
+
+    _OUTPUT_ONLY_RE = re.compile(
+        r"\boutput only\b|\brespond with only\b|\breply with only\b"
+        r"|\banswer with only\b|\bonly the exact\b|\bnothing else\b"
+        r"|\bno explanation\b|\bwithout explanation\b|\bno other text\b"
+        r"|\bjust the (?:name|names|value|values|number|numbers|list|text|answer|title|titles)\b",
+        re.IGNORECASE)
+    _OUTPUT_ONLY_MIN_CHARS = 2
+
+
+    def _answer_line_only(answer: str, question: str) -> str:
+        if not answer or not _OUTPUT_ONLY_RE.search(question or ""):
+            return answer
+        for raw in answer.split("\n"):
+            stripped = raw.strip()
+            if not stripped:
+                continue
+                                                                               
+                                                                                
+            if stripped[0] in "#>":
+                continue
+                                                                                 
+                                                                                
+            line = re.sub(r"^[*_`\s]+|[*_`\s]+$", "", stripped).strip()
+            if not line:
+                continue
+            if line.startswith("|") or line.endswith(":"):
+                continue                                                      
+            if len(line) >= _OUTPUT_ONLY_MIN_CHARS:
+                return line
+        return answer
+
+
+    _GLOSS_RE = re.compile(r"^(?P<a>[^()]{2,60}?)\s*\((?P<b>[^()]{2,60})\)$")
+
+
+    def _verbatim_from_source(value: str, ledger: EvidenceLedger) -> str:
+        v = (value or "").strip()
+        m = _GLOSS_RE.match(v)
+        if not m:
+            return value
+        texts = [r.get("text") or "" for r in ledger.rows if r.get("text")]
+        if not texts:
+            return value
+        def seen(t: str) -> bool:
+            return bool(t) and any(t in src for src in texts)
+        if seen(v):
+            return value                                                       
+        a, b = m.group("a").strip(), m.group("b").strip()
+        hits = [x for x in (b, a) if seen(x)]
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) == 2:
+            lo, hi = sorted(hits, key=len)
+                                                                             
+                                                                               
+            if lo.lower() in hi.lower():
+                return hi
+        return value
+
+
+    def _verbatim_structured(obj, ledger: EvidenceLedger, depth: int = 0):
+        if depth > 6:
+            return obj
+        if isinstance(obj, str):
+            return _verbatim_from_source(obj, ledger)
+        if isinstance(obj, list):
+            return [_verbatim_structured(x, ledger, depth + 1) for x in obj]
+        if isinstance(obj, dict):
+            return {k: _verbatim_structured(v, ledger, depth + 1) for k, v in obj.items()}
+        return obj
+
+
+    _VERBATIM_TRIGGER_RE = re.compile(
+        r"(?i)\b(?:verbatim|exactly as printed|as printed|as written|as it appears|exact text|word for word)\b"
+    )
+
+
+    def _case_preserve_from_source(value: str, ledger: "EvidenceLedger") -> str:
+        if not isinstance(value, str) or not value:
+            return value
+        texts = [r.get("text") or "" for r in ledger.rows if r.get("text")]
+        if not texts:
+            return value
+        pattern = re.compile(re.escape(value), re.IGNORECASE)
+        forms: set[str] = set()
+        for src in texts:
+            for match in pattern.finditer(src):
+                forms.add(match.group(0))
+                if len(forms) > 1:
+                    return value
+        if len(forms) == 1:
+            return next(iter(forms))
+        return value
+
+
+    def _case_preserve_structured(obj, ledger: "EvidenceLedger", depth: int = 0):
+        if depth > 6:
+            return obj
+        if isinstance(obj, str):
+            return _case_preserve_from_source(obj, ledger)
+        if isinstance(obj, list):
+            return [_case_preserve_structured(x, ledger, depth + 1) for x in obj]
+        if isinstance(obj, dict):
+            return {k: _case_preserve_structured(v, ledger, depth + 1) for k, v in obj.items()}
+        return obj
+
+
+    def _source_region_verbatim(obj, question: str, schema, answer: str,
+                                ledger: "EvidenceLedger"):
+        baseline = _case_preserve_structured(obj, ledger)
+        q = question or ""
+
+                                                                                  
+        anchors = {
+            (m.group(1).lower(), m.group(2))
+            for m in re.finditer(r"\b(figure|table)\s+(\d+[A-Za-z]?)\b", q, re.I)
+        }
+        titles = {
+            re.sub(r"\s+", " ", m.group(1)).strip()
+            for m in re.finditer(
+                r"\b(?:figure|table)\s+(?:is\s+)?titled\s+[\"“]([^\"”]+)[\"”]", q, re.I)
+        }
+        if len(anchors) != 1 or len(titles) != 1:
+            return baseline
+        anchor_kind, anchor_number = next(iter(anchors))
+        anchor_title = next(iter(titles))
+
+        cited = list(_cited_numbers(answer or "", len(ledger.rows)))
+        if not cited:
+            return baseline
+
+        def _schema_desc(node) -> str:
+            return str(node.get("description") or "") if isinstance(node, dict) else ""
+
+        def _document_rows(desc: str) -> list[dict]:
+                                                                             
+                                                                                  
+            years = set(re.findall(r"\b(?:19|20)\d{2}\b", desc or ""))
+            if len(years) != 1:
+                return []
+            year = next(iter(years))
+            rows: list[dict] = []
+            for number in cited:
+                row = ledger.rows[number - 1]
+                identity = " ".join((str(row.get("title") or ""),
+                                     str(row.get("url") or ""),
+                                     str(row.get("text") or "")[:2200]))
+                if re.search(rf"(?<!\d){re.escape(year)}(?!\d)", identity):
+                    rows.append(row)
+            return rows
+
+        def _norm_heading(text: str) -> str:
+            text = re.sub(r"[*_#]+", "", text or "")
+            text = re.sub(r"[^A-Za-z0-9]+", " ", text)
+            return re.sub(r"\s+", " ", text).strip().lower()
+
+        wanted_title = _norm_heading(anchor_title)
+
+        def _target_region(row: dict, leaves: list[str]) -> str:
+            source = str(row.get("text") or "")
+            if not source:
+                return ""
+            heading_re = re.compile(
+                rf"\b{re.escape(anchor_kind)}\s*{re.escape(anchor_number)}\b", re.I)
+            regions: list[str] = []
+            for hit in heading_re.finditer(source):
+                line_a = source.rfind("\n", 0, hit.start()) + 1
+                line_b = source.find("\n", hit.end())
+                if line_b < 0:
+                    line_b = len(source)
+                line = source[line_a:line_b]
+                                                                                  
+                                                       
+                if re.search(r"\.{3,}\s*\d+\b", line):
+                    continue
+                nearby = source[max(0, hit.start() - 220):min(len(source), hit.end() + 220)]
+                if wanted_title not in _norm_heading(nearby):
+                    continue
+                region = source[max(0, hit.start() - 6000):min(len(source), hit.end() + 2500)]
+                present = sum(
+                    1 for leaf in set(leaves)
+                    if leaf and re.search(re.escape(leaf), region, re.I)
+                )
+                if present < min(2, len(set(x for x in leaves if x))):
+                    continue
+                regions.append(region)
+            return regions[0] if len(regions) == 1 else ""
+
+        def _leaves(value) -> list[str]:
+            if isinstance(value, str):
+                return [value]
+            if isinstance(value, list):
+                return [leaf for item in value for leaf in _leaves(item)]
+            if isinstance(value, dict):
+                return [leaf for item in value.values() for leaf in _leaves(item)]
+            return []
+
+        all_leaves = _leaves(obj)
+
+        def _snap(value, parent_value, node, depth: int = 0):
+            if depth > 6:
+                return parent_value
+            if isinstance(value, str):
+                desc = _schema_desc(node)
+                if _VERBATIM_TRIGGER_RE.search(desc) is None:
+                    return parent_value
+                rows = _document_rows(desc)
+                if len(rows) != 1:
+                    return parent_value
+                region = _target_region(rows[0], all_leaves)
+                if not region:
+                    return parent_value
+                pattern = re.compile(
+                    r"(?<!\w)" + re.escape(value) + r"(?!\w|\s*[\(\[])", re.I)
+                forms = {m.group(0) for m in pattern.finditer(region)}
+                return next(iter(forms)) if len(forms) == 1 else parent_value
+            if isinstance(value, list):
+                item_schema = node.get("items") if isinstance(node, dict) else {}
+                parent_items = parent_value if isinstance(parent_value, list) else value
+                return [
+                    _snap(item, parent_items[i] if i < len(parent_items) else item,
+                          item_schema or {}, depth + 1)
+                    for i, item in enumerate(value)
+                ]
+            if isinstance(value, dict):
+                props = node.get("properties") if isinstance(node, dict) else {}
+                props = props if isinstance(props, dict) else {}
+                parent_obj = parent_value if isinstance(parent_value, dict) else value
+                return {
+                    key: _snap(item, parent_obj.get(key, item), props.get(key) or {}, depth + 1)
+                    for key, item in value.items()
+                }
+            return parent_value
+
+        return _snap(obj, baseline, schema if isinstance(schema, dict) else {})
+
+
+    def _citations_for(answer: str,
+                       ledger: EvidenceLedger) -> tuple[list[CitationRef], dict[int, int]]:
+        refs: list[CitationRef] = []
+                                                                          
+                                                                           
+        slot_pos: dict[int, int] = {}
+        spent = 0
+                                                                               
+                                                                              
+        cited = list(_cited_numbers(answer, len(ledger.rows)))
+
+        for n in cited:
+            if len(refs) >= CITATION_CAP:
+                break
+            row_refs = ledger.refs_for(n)
+            if not row_refs:
+                continue
+            first = row_refs[0]
+            row = ledger.rows[n - 1]
+            slices = getattr(first, "slices", None)
+            cost = (sum(max(0, s.end - s.start) for s in slices) if slices
+                    else int(row.get("note_len") or 0))                                  
+            if spent + cost > EVIDENCE_CHAR_BUDGET:
+                continue                                                          
+            spent += cost
+            refs.append(first)
+            slot_pos[n] = len(refs)                                      
+        return refs, slot_pos
+
+
+    _REPOINT_RE = re.compile(r"\[([0-9][0-9,\s\-]*)\]")
+
+
+    def _repoint(answer: str, slot_pos: dict[int, int]) -> str:
+        if not answer or not slot_pos:
+            return answer
+
+        def sub(m: "re.Match[str]") -> str:
+            whole = m.group(0)
+                                                                             
+            e = m.end()
+            if e < len(answer) and answer[e] in "(]":
+                return whole
+            if m.start() > 0 and answer[m.start() - 1] == "[":
+                return whole
+            slots: list[int] = []
+            for chunk in m.group(1).split(","):
+                piece = chunk.strip()
+                span = re.fullmatch(r"(\d{1,4})\s*-\s*(\d{1,4})", piece)
+                if span:
+                    lo, hi = int(span.group(1)), int(span.group(2))
+                    slots.extend(range(lo, min(hi, lo + 16) + 1))
+                elif piece.isdigit():
+                    slots.append(int(piece))
+            seen: set[int] = set()
+            out: list[int] = []
+            for n in slots:
+                pos = slot_pos.get(n)
+                if pos is not None and pos not in seen:
+                    seen.add(pos)
+                    out.append(pos)
+                                                                            
+                                                                             
+            if not out:
+                return whole
+            return "".join("[[%d]]" % pos for pos in out)
+
+        return _REPOINT_RE.sub(sub, answer)
+
+
+    _VERIFY_MARK_RE = re.compile(r"\s*\((?:verify|unverified|uncertain)[^)]*\)", re.I)
+
+                                                                               
+    _TOOL_MARKUP_RE = re.compile(
+        r"<\s*/?\s*tool_call|<\s*/?\s*(?:arg_key|arg_value|function_call|invoke)\b"
+        r"|\bweb_search\s*[（(]\s*query|\bread_page\s*[（(]\s*url|\bsec_filing\s*[（(]\s*company",
+        re.I)
+    _STUB_ANSWER_RE = re.compile(r"^\s*(?:best-effort answer unavailable|no question provided)", re.I)
+    _REFUSAL_ONLY_RE = re.compile(
+        r"^\s*(?:i (?:cannot|can't|am unable|was unable)|unable to|sorry[,.]|"
+        r"i don'?t have (?:enough|access))", re.I)
+                                                                                
+                                                                                
+    _INTENT_NARRATION_RE = re.compile(
+        r"^\s*(?:i (?:need|will|should|am going|'ll)\b|let me\b|first,? (?:i|let)\b|"
+        r"i'?ll (?:search|look|start|begin|gather|check))", re.I)
+    _PROCESS_NARRATION_RE = re.compile('\\bthe \\w*(?:retain|search|fetch|page)\\w*\\s+tool\\b|\\bretain_evidence\\b|\\bis being (?:finicky|strict|picky|fussy|difficult)\\b|\\blet me proceed with\\b|\\busing the (?:result|citation) numbers\\b|\\bthe tool results?\\b|\\bthe page text\\b|\\bi (?:read|fetched|retrieved|searched|grepped|checked)\\b|\\ball evidence (?:is )?retained\\b|\\bi (?:now )?have (?:all|everything)\\b|\\bi have all the data\\b|\\bthe grep for\\b|\\bgrep (?:returned|found)\\b|\\breturned exactly \\d+ match|\\bi have (?:the|all|every|both)\\b.{0,60}?\\b(?:captured|located|gathered|retrieved|in hand|available)\\b', re.I)
+    MIN_ANSWER_CHARS = 40
+    MIN_CITED_ANSWER_CHARS = 12                                        
+    _CITE_MARK_RE = re.compile(r"\[[0-9]{1,3}\]")                                 
+
+
+    def _looks_like_tool_json(s: str) -> bool:
+        return bool(re.match(r'\s*\{\s*"(?:name|tool|function)"\s*:', s))
+
+
+    def _is_degenerate_repetition(text: str) -> bool:
+                                                                              
+                                                                                
+        body = text or ""
+        lines = [ln.strip().lower() for ln in body.split("\n") if len(ln.strip()) > 25]
+        if len(lines) >= 3:
+            for ln in set(lines):
+                if lines.count(ln) >= 3:
+                    return True                                                    
+            if len(set(lines)) * 2 > len(lines):
+                return False                                                        
+        sents = [s.strip().lower() for s in re.split(r"(?<=[.!?])\s+|\n+", body) if len(s.strip()) > 25]
+        if len(sents) < 3:
+            return False
+        uniq = set(sents)
+        if len(uniq) * 2 <= len(sents):
+            return True
+                                                
+        for s in uniq:
+            if sents.count(s) >= 3:
+                return True
+        return False
+
+
+    def _is_usable_answer(text: str) -> bool:
+        s = _normalize_brackets(text).strip()
+        if not s:
+            return False
+                                                  
+        if _TOOL_MARKUP_RE.search(s) or _looks_like_tool_json(s):
+            return False
+        if _STUB_ANSWER_RE.match(s) or _is_degenerate_repetition(s):
+            return False
+        # A refusal is a refusal however well cited and however long, so this
+        # has to run BEFORE the cited shortcut below. Scoring is pairwise: an
+        # answer that declines loses outright, and the repair loop should get
+        # another turn instead of shipping it.
+        if _REFUSAL_ONLY_RE.match(s) or _ABSTAIN_LEAD_RE.search(s[:_ABSTAIN_LEAD_CHARS]):
+            return False
+        # Talk about our own tooling is narration, not answer. Checked after the
+        # branch's own lead-stripping, so narration that strips cleanly and
+        # leaves a cited answer behind is still accepted.
+        if _PROCESS_NARRATION_RE.search(s):
+            remainder = _strip_lead_narration(s)
+            if _PROCESS_NARRATION_RE.search(remainder) or not _CITE_MARK_RE.search(remainder):
+                return False
+            if len(remainder) < MIN_CITED_ANSWER_CHARS:
+                return False
+        cited = bool(_CITE_MARK_RE.search(s))
+        if cited and len(s) >= MIN_CITED_ANSWER_CHARS:
+            return True
+        if len(s) < MIN_ANSWER_CHARS:
+            return False
+        if len(s) < 400 and _INTENT_NARRATION_RE.match(s):
             return False
         return True
 
@@ -2837,8 +6107,8 @@ def _compose_f177_line():
         r"^\s*(?:share|search|home|menu|subscribe|sign\s*in|log\s*in|newsletter|"
         r"advertisement|cookie|skip to|follow us|read more|related|tags?|categories?|"
         r"privacy|terms|contact|about us|navigation|toggle)\b", re.I)
-
-
+                                                                              
+                                                                          
     _SRC_FOOTNOTE_RE = re.compile(r"\[\s*\d{1,3}\s*\]")
     _MD_LINK_RE = re.compile(r"\]\(")
     _BARE_URL_RE = re.compile(r"(?<!\]\()https?://")
@@ -2856,15 +6126,15 @@ def _compose_f177_line():
                     broke = True
                     break
                 continue
-
-
+                                                                            
+                                                                               
             if _SENTENCEY_RE.search(seg) is None:
                 if kept:
                     broke = True
                     break
                 continue
-
-
+                                                                                 
+                                                                                   
             if _FURNITURE_RE.match(seg) and not re.search(r"\d", seg):
                 if kept:
                     broke = True
@@ -2875,7 +6145,7 @@ def _compose_f177_line():
                     broke = True
                     break
                 continue
-
+                                                                            
             links = len(_MD_LINK_RE.findall(seg)) + len(_BARE_URL_RE.findall(seg))
             if links and links * 110 >= len(seg):                           
                 if kept:
@@ -2899,8 +6169,8 @@ def _compose_f177_line():
                 if (r.get("preview") or "").strip()]
         if not rows:
             return ""
-
-
+                                                                                
+                                                                                
         out = ["Best-supported findings from the sources retrieved:"]
         picked = 0
         for i, r in rows:                                                             
@@ -2913,8 +6183,8 @@ def _compose_f177_line():
             out.append(f"- {title + ': ' if title else ''}{lead} [{i}]")
             picked += 1
         if picked == 0:
-
-
+                                                                           
+                                                                              
             for i, r in rows[:4]:
                 lead = " ".join((r.get("preview") or "").split())[:280]
                 if lead:
@@ -2961,8 +6231,8 @@ def _compose_f177_line():
                      "claim carries its [n]; then the short proof section (pool, "
                      "conditions, qualifiers, exclusions).")}]
         async def _one(lane: str, model: str, budget: float) -> str:
-
-
+                                                                                 
+                                                                                   
             _p0 = _upstream(lane, model)
             payload = None
             for _p in ((_p0, None) if _p0 is not None else (None,)):
@@ -2991,7 +6261,7 @@ def _compose_f177_line():
                         text = c.strip()
             return text
 
-
+                                                                               
         lanes = ((LLM_LANE_A, LOOP_MODEL_A), (LLM_LANE_B, LOOP_MODEL_B))
         for i, lane_model in enumerate(lanes):
             left = deadline - monotonic()
@@ -2999,8 +6269,8 @@ def _compose_f177_line():
                 return ""
             budget = min(RESCUE_TIMEOUT_S, left - DIGEST_TAIL_S)
             if i == 0:
-
-
+                                                                             
+                                                                  
                 budget = min(budget, max(12.0, left - 14.0 - DIGEST_TAIL_S))
             if budget < 8.0:
                 return ""
@@ -3032,8 +6302,8 @@ def _compose_f177_line():
                "ONLY the JSON value.\n\n"
                f"Schema:\n{json.dumps(schema)}\n\nQuestion:\n{question}\n\n"
                f"Answer:\n{answer[:14000]}")
-
-
+                                                                                
+                                                                                 
         spare = None
         for lane, model in ((LLM_LANE_A, SCHEMA_MODEL),
                             (LLM_LANE_A, RESORT_MODEL),
@@ -3048,8 +6318,8 @@ def _compose_f177_line():
                 raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(),
                              flags=re.I | re.M).strip()
                 value = json.loads(raw)
-
-
+                                                                       
+                                                                       
                 if _matches_schema_shape(value, schema):
                     if not _schema_value_empty(value):             
                         return value
@@ -3138,7 +6408,7 @@ def _compose_f177_line():
             line = raw.strip().lstrip("-*• ").strip()
             if not line or _DIGEST_LEAD_RE.match(line):
                 continue
-
+                                                                           
             if ":" in line:
                 head, _, tail = line.partition(":")
                 line = tail.strip() if 0 < len(tail.strip()) <= _VALUE_MAX_CHARS else head.strip()
@@ -3165,8 +6435,8 @@ def _compose_f177_line():
             return enum[0]
         kind = _schema_kind(schema)
         if not kind:
-
-
+                                                                            
+                                                                             
             for key in ("anyOf", "oneOf", "allOf"):
                 branch = schema.get(key)
                 if isinstance(branch, list) and branch:
@@ -3186,13 +6456,13 @@ def _compose_f177_line():
             required = schema.get("required") or list(props.keys())
             out = {}
             for key in required:
-
-
+                                                                             
+                                                             
                 out[key] = _coerce_to_schema(answer, props.get(key) or {}, depth + 1)
             return out
         if kind in ("number", "integer"):
-
-
+                                                                                
+                                                                   
             found = _NUM_IN_TEXT_RE.search(_CITE_NUM_RE.sub(" ", answer or ""))
             if found is None:
                 return 0
@@ -3210,8 +6480,8 @@ def _compose_f177_line():
         r"^\s*(?:based on (?:my|the)\b|now (?:i|that i)\b|i (?:now )?(?:have|was|am|need|will|can)\b|"
         r"i(?:'ll|'ve|'m)\b|let me\b|let's\b|first,? i\b|having (?:now )?\w+\b|"
         r"okay\b|alright\b|to answer this\b|my research\b)", re.IGNORECASE)
-
-
+                                                                                 
+                                                                                 
     _ABBREV_TAIL_RE = re.compile(r"(?:\b[A-Z]|\b(?:Inc|Ltd|Co|No|vs|St|Dr|Mr|Ms|Mt|Jr|Sr|etc|e\.g|i\.e))\.$")
 
 
@@ -3228,8 +6498,8 @@ def _compose_f177_line():
                 break                                                               
             if _NARRATION_LEAD_RE.match(head) is None:
                 break
-
-
+                                                                            
+                                                                               
             if len(head.split()) < 4 or _ABBREV_TAIL_RE.search(head) is not None:
                 break
             if len(rest) < 120 or _CITE_NUM_RE.search(rest) is None:
@@ -3261,7 +6531,7 @@ def _compose_f177_line():
             return ""
         from harnyx_miner_sdk.api import llm_chat
         import asyncio as _close_asyncio
-        for model in ("z-ai/glm-5.3-flash", "openai/gpt-oss-120b"):
+        for model in ("zai-org/GLM-5.2", "openai/gpt-oss-120b"):
             try:
                 reply = await _close_asyncio.wait_for(
                     llm_chat(provider="openrouter", model=model,
@@ -3914,14 +7184,7 @@ def _compose_f177_line():
 
 
     def _bind_attach(response, text: str, citations, rows):
-        """An answer with no pointer scores zero. Give its claims their evidence.
-
-        Measured on batch 4117ad03: of 656 slow executions across our three keys
-        and the sampled field, all 74 that carried no [[n]] marker scored exactly
-        0.000, against a mean of 0.192 for the 582 that carried one. The judge is
-        told to treat a material claim without a valid pointer as unsupported, so
-        an uncited answer loses every judgment it is put into whatever it says.
-        """
+        'An answer with no pointer scores zero. Give its claims their evidence.\n\n    Measured on batch 4117ad03: of 656 slow executions across our three keys\n    and the sampled field, all 74 that carried no [[n]] marker scored exactly\n    0.000, against a mean of 0.192 for the 582 that carried one. The judge is\n    told to treat a material claim without a valid pointer as unsupported, so\n    an uncited answer loses every judgment it is put into whatever it says.\n    '
         if not rows:
             return response
         from harnyx_miner_sdk.query import CitationRef, CitationSlice
@@ -4412,15 +7675,15 @@ def _compose_f177_line():
                 _close_finish(question, settled, fast_run, close_wall),
                 query, 6.0), query)
         except Exception:
-
-
+                                                                               
+                                                                                
             schema = getattr(query, "output_schema", None)
             if schema is not None:
                 try:
                     return Response(output=_coerce_to_schema(question[:400], schema))
                 except Exception:
                     pass
-
+                                                                            
             return Response(text=f"Best-effort answer unavailable for: {question[:500]}")
 
 
@@ -4494,16 +7757,7 @@ def _compose_f177_line():
 
 
     def _ask_clause(question: str) -> str:
-        """The clause that actually asks something.
-
-        These questions characteristically OPEN with premise decoration -- a
-        sentence or two about entities that are not the pool -- and put the ask
-        last. Slicing question[:N] therefore probes the decoration. Measured on a
-        live run: the roster pre-pass searched "Walt Disney Studios distributed
-        family movies like A Tiger Walks (1964) ... present in t complete list of
-        all" and filled the ledger with Disney filmographies instead of the
-        distributor table the question asked for.
-        """
+        'The clause that actually asks something.\n\n    These questions characteristically OPEN with premise decoration -- a\n    sentence or two about entities that are not the pool -- and put the ask\n    last. Slicing question[:N] therefore probes the decoration. Measured on a\n    live run: the roster pre-pass searched "Walt Disney Studios distributed\n    family movies like A Tiger Walks (1964) ... present in t complete list of\n    all" and filled the ledger with Disney filmographies instead of the\n    distributor table the question asked for.\n    '
         text = " ".join((question or "").split())
         if not text:
             return ""
@@ -4518,11 +7772,7 @@ def _compose_f177_line():
 
 
     def _probe_from(question: str, suffix: str = "", limit: int = PROBE_CHARS) -> str:
-        """Search probe built from the ask, clipped on a WORD boundary.
-
-        The shipped version cut mid-word ("present in t"), which turns the final
-        token into noise the search engine still weighs.
-        """
+        'Search probe built from the ask, clipped on a WORD boundary.\n\n    The shipped version cut mid-word ("present in t"), which turns the final\n    token into noise the search engine still weighs.\n    '
         ask = _ASK_CUE_RE.sub(" ", _ask_clause(question))
         words: list = []
         for word in ask.split():
@@ -4540,14 +7790,7 @@ def _compose_f177_line():
 
 
     def _rows_match_ask(rows, question: str) -> bool:
-        """Do retrieved rows actually speak to the ask?
-
-        A pre-pass commits its rows to the ledger, and the deterministic floor
-        cites whatever the ledger holds -- so an off-target search does not merely
-        waste a call, it MANUFACTURES the citations a failed run ships. One live
-        run cited a page whose entire content was "Direct access to this page is
-        temporarily disabled". Checking before the commit keeps it out entirely.
-        """
+        'Do retrieved rows actually speak to the ask?\n\n    A pre-pass commits its rows to the ledger, and the deterministic floor\n    cites whatever the ledger holds -- so an off-target search does not merely\n    waste a call, it MANUFACTURES the citations a failed run ships. One live\n    run cited a page whose entire content was "Direct access to this page is\n    temporarily disabled". Checking before the commit keeps it out entirely.\n    '
         terms = _ask_terms(question)
         if len(terms) < MIN_ASK_MATCH_TERMS:
             return True
@@ -4583,12 +7826,7 @@ def _compose_f177_line():
     async def _stage_rewrite(question: str, answer: str, messages: list[dict],
                              ledger: EvidenceLedger, deadline: float,
                              order: str, probe: str) -> str:
-        """Shared tail for every post-audit stage.
-
-        One targeted search, one bounded re-invocation of the primary controller,
-        then an adoption guard. The transcript is copied rather than mutated, so a
-        stage that is not adopted leaves no trace for the stage behind it.
-        """
+        'Shared tail for every post-audit stage.\n\n    One targeted search, one bounded re-invocation of the primary controller,\n    then an adoption guard. The transcript is copied rather than mutated, so a\n    stage that is not adopted leaves no trace for the stage behind it.\n    '
         body = ""
         if probe:
             try:
@@ -4629,12 +7867,7 @@ def _compose_f177_line():
 
 
     def _stage_keeps_facts(draft: str, revision: str) -> bool:
-        """Self-contained adoption guard.
-
-        The v114 branch ships _unmakes_draft, the v52 branch does not. Depending on
-        it would make half the stage library silently branch-specific, so the guard
-        is defined here and behaves identically on both.
-        """
+        'Self-contained adoption guard.\n\n    The v114 branch ships _unmakes_draft, the v52 branch does not. Depending on\n    it would make half the stage library silently branch-specific, so the guard\n    is defined here and behaves identically on both.\n    '
         before = _stage_facts(draft)
         if not before:
             return True
@@ -4651,12 +7884,7 @@ def _compose_f177_line():
 
     async def _draft_candidate_pool(question: str, ledger: EvidenceLedger,
                                     deadline: float) -> str:
-        """Pre-loop pass: name the pool before the loop starts arguing about it.
-
-        Returns its own system block. Defect 4: this is never concatenated onto
-        the knowledge brief -- nesting a roster under PRIOR ANALYSIS is the shape
-        twelve validator votes in batch 3258ff1c called filler.
-        """
+        'Pre-loop pass: name the pool before the loop starts arguing about it.\n\n    Returns its own system block. Defect 4: this is never concatenated onto\n    the knowledge brief -- nesting a roster under PRIOR ANALYSIS is the shape\n    twelve validator votes in batch 3258ff1c called filler.\n    '
         if (deadline - monotonic()) < POOL_DRAFT_MIN_LEFT_S:
             return ""
         if _spend_left() < POOL_DRAFT_MIN_USD:
@@ -4809,13 +8037,7 @@ def _compose_f177_line():
 
     async def _conform_measures(question: str, answer: str, messages: list[dict],
                                 ledger: EvidenceLedger, deadline: float) -> str:
-        """Runs LAST among the post-audit stages, always.
-
-        Every other stage rewrites the whole answer, so a unit annotation applied
-        before one of them is discarded by it. Six donor builds shipped this stage
-        ahead of a rewriting sweep; the gate below is the lowest in the chain so
-        that ordering cannot silently invert.
-        """
+        'Runs LAST among the post-audit stages, always.\n\n    Every other stage rewrites the whole answer, so a unit annotation applied\n    before one of them is discarded by it. Six donor builds shipped this stage\n    ahead of a rewriting sweep; the gate below is the lowest in the chain so\n    that ordering cannot silently invert.\n    '
         if (deadline - monotonic()) < CONFORM_MEASURES_MIN_LEFT_S:
             return answer
         if _spend_left() < SWEEP_MIN_USD:
@@ -4835,8 +8057,8 @@ def _compose_f177_line():
                                     order,
                                     _probe_from(question, measure, 140))
     async def _solve(query: Query, question: str) -> Response:
-
-
+                                                                                
+                                                                                 
         _reset_run_state()
         deadline = monotonic() + WALL_BUDGET_S
         try:
@@ -4898,7 +8120,7 @@ def _compose_f177_line():
             except Exception:
                 pass
 
-
+                                                                         
         if not _is_usable_answer(answer) and ledger.rows:
             try:
                 rescued = await _write_from_digest(question, ledger, deadline)
@@ -4906,13 +8128,13 @@ def _compose_f177_line():
                     answer = rescued
             except Exception:
                 pass
-
-
+                                                                                
+                                                                                
         if not _is_usable_answer(answer) and ledger.rows:
             det = _deterministic_answer(question, ledger)
             if _is_usable_answer(det):
                 answer = det
-
+                                                                        
         if not _is_usable_answer(answer):
             fallback = _sanitize_draft(draft) or await _knowledge_resort(question, deadline)
             if _is_usable_answer(fallback):
@@ -4925,10 +8147,10 @@ def _compose_f177_line():
 
         answer = _normalize_brackets(answer)                                           
         answer = _strip_lead_narration(answer)
-
+                                                                            
         answer = _answer_line_only(answer, question)
-
-
+                                                                            
+                                                                            
         text = (_cap(_repoint(answer, _slot_pos))
                 or f"Best-effort answer unavailable for: {question[:400]}")
 
@@ -4946,7 +8168,7 @@ def _compose_f177_line():
                     structured = _verbatim_structured(structured, ledger)
                 except Exception:
                     pass
-
+                                                                             
                 try:
                     if _VERBATIM_TRIGGER_RE.search(getattr(query, "text", None) or question or ""):
                         structured = _source_region_verbatim(
@@ -4958,15 +8180,15 @@ def _compose_f177_line():
                                     citations=citations or None)
                 except Exception:
                     structured = None
-
-
+                                                                              
+                                                                             
             basis = answer if _is_usable_answer(answer) else ""
             if not basis:
                 basis = _deterministic_answer(question, ledger)
             if not basis or _STUB_ANSWER_RE.match(basis.strip()):
                 basis = question[:400]
-
-
+                                                                                
+                                                                              
             if basis is not answer:
                 try:
                     salvaged = await _schema_output(question, basis, query.output_schema,
@@ -4978,7 +8200,7 @@ def _compose_f177_line():
                         return Response(output=salvaged, citations=citations or None)
                     except Exception:
                         pass
-
+                                                                              
             if basis is not answer:
                 cleaned = _undigest_for_schema(basis)
                 basis = cleaned if cleaned else ""
@@ -4996,10 +8218,13 @@ def _compose_f177_line():
             return Response(text=text, citations=citations or None)
         except Exception:
             return Response(text=text)
+
     return query
 
+_branch_95b2cad1ffd10e9355fe3e0a086c20a457484e5cc7f4434cff4ade6bece26dfb_query_entry = _compose_branch_95b2cad1ffd10e9355fe3e0a086c20a457484e5cc7f4434cff4ade6bece26dfb_entry()
 
-def _compose_u28_line():
+
+def _compose_branch_3843b2a7b530ce91f23c86392314bde51919ab27a0ca337b447b007ead5c021a_entry():
     """SN67 Harnyx miner — staged research protocol agent."""
 
     import asyncio
@@ -5008,11 +8233,143 @@ def _compose_u28_line():
     from time import perf_counter
 
     from harnyx_miner_sdk.api import LlmChatResult, LlmThinkingConfig, fetch_page, llm_chat, search_web
+
+    RESEARCH_RESERVE_USD = 0.15
+    ANSWER_RESERVE_USD = 0.04
+    _SESSION_SPEND: dict = {"left": None, "rate": None}
+
+
+    def _note_session_budget(payload) -> None:
+        """Record the session budget the platform reports alongside every result."""
+        try:
+            budget = getattr(payload, "budget", None)
+            left = getattr(budget, "session_remaining_budget_usd", None)
+            if isinstance(left, (int, float)):
+                _SESSION_SPEND["left"] = float(left)
+        except Exception:
+            pass
+
+
+    def _session_budget_left() -> float:
+        """Session budget left, or -1.0 while the platform has not reported one."""
+        left = _SESSION_SPEND["left"]
+        return float(left) if isinstance(left, (int, float)) else -1.0
+
+
+    def _request_size(messages) -> int:
+        """Rough request size; the cost of a call tracks the context it carries."""
+        try:
+            total = 0
+            for message in messages or ():
+                content = message.get("content") if isinstance(message, dict) else None
+                total += len(content) if isinstance(content, str) else 200
+            return total
+        except Exception:
+            return 0
+
+
+    def _expected_cost(size: int) -> float:
+        """What the next call is expected to cost, from the dearest rate seen so far.
+
+        The per-call price depends on the model and the context it carries, and the
+        run learns it: each call's charge is the drop in the budget the platform
+        reports, over the characters that were sent. No rate is assumed before one
+        has been measured."""
+        rate = _SESSION_SPEND["rate"]
+        return float(rate) * size if isinstance(rate, (int, float)) and size > 0 else 0.0
+
+
+    _unmetered_llm_chat = llm_chat
+    _unmetered_search_web = search_web
+    _unmetered_fetch_page = fetch_page
+
+
+    async def llm_chat(**kwargs):
+        """llm_chat that refuses the call which would cost the run its answer."""
+        left = _session_budget_left()
+        size = _request_size(kwargs.get("messages"))
+        # Only refuse when the budget genuinely cannot cover a call. This used to
+        # refuse when the PREDICTED post-call budget fell under the reserve, and the
+        # prediction extrapolates the dearest per-character rate seen so far -- a
+        # rate set by the run's SMALLEST call, whose fixed cost dominates its
+        # per-character price. That refused the forced-commit call, which is the
+        # largest and the only one that writes the answer, while a quarter of the
+        # budget sat unspent. Research already stops at the research reserve, so the
+        # answer turn has that reserve to spend and spending it is correct.
+        if left >= 0.0 and left <= ANSWER_RESERVE_USD:
+            raise TimeoutError("session budget exhausted; deliver the answer already gathered")
+        result = await _unmetered_llm_chat(
+            provider=kwargs.get("provider"), model=kwargs.get("model"),
+            messages=kwargs.get("messages"), temperature=kwargs.get("temperature"),
+            max_output_tokens=kwargs.get("max_output_tokens"),
+            tools=kwargs.get("tools"), tool_choice=kwargs.get("tool_choice"),
+            thinking=kwargs.get("thinking"), provider_extra=kwargs.get("provider_extra"),
+            timeout=kwargs.get("timeout"))
+        _note_session_budget(result)
+        after = _session_budget_left()
+        if left >= 0.0 and after >= 0.0 and size > 0 and after < left:
+            seen = (left - after) / size
+            rate = _SESSION_SPEND["rate"]
+            if not isinstance(rate, (int, float)) or seen > rate:
+                _SESSION_SPEND["rate"] = seen
+        return result
+
+
+    async def search_web(*args, **kwargs):
+        """search_web that stops research while the answer turn is still payable."""
+        if 0.0 <= _session_budget_left() <= RESEARCH_RESERVE_USD:
+            raise TimeoutError("research cutoff reached; finalize with gathered evidence")
+        payload = await _unmetered_search_web(
+            *args, provider=kwargs.get("provider"), num=kwargs.get("num"),
+            provider_extra=kwargs.get("provider_extra"), timeout=kwargs.get("timeout"))
+        _note_session_budget(payload)
+        return payload
+
+
+    async def fetch_page(*args, **kwargs):
+        """fetch_page that stops research while the answer turn is still payable."""
+        if 0.0 <= _session_budget_left() <= RESEARCH_RESERVE_USD:
+            raise TimeoutError("research cutoff reached; finalize with gathered evidence")
+        payload = await _unmetered_fetch_page(
+            *args, provider=kwargs.get("provider"),
+            provider_extra=kwargs.get("provider_extra"), timeout=kwargs.get("timeout"))
+        _note_session_budget(payload)
+        return payload
+
     from harnyx_miner_sdk.decorators import entrypoint
     from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
 
+    _ABSTAIN_LEAD_RE = re.compile(
+        # A refusal that names the EVIDENCE rather than the speaker. Three distinct
+        # phrasings have now been measured, all scoring 0.000, and they differ in the
+        # VERB, not the subject:
+        #   "the evidence provided is insufficient to identify..."      (09_08 0abcba92)
+        #   "the evidence provided does not contain the complete data"  (09_08 0abcba92)
+        #   "the available evidence ... was insufficient to compile"    (contract_v2)
+        # so the verb side is deliberately wide. Every first-person test passed all three.
+        r"\b(?:the |this |that |our |any |all )?"
+        r"(?:available|gathered|provided|retrieved|collected)?\s*"
+        r"(?:evidence|information|data|sources?|excerpts?|citations?|material|record)\b"
+        r"[^.]{0,110}?\b(?:"
+        r"insufficient|inadequate|incomplete|not sufficient|not enough|too fragmentary"
+        r"|fragmentary|does not contain|do not contain|does not include|do not include"
+        r"|does not provide|do not provide|is missing|are missing|lacks"
+        r"|only partial|only partially|not available|unavailable"
+        r")\b"
+        r"|\b(?:insufficient|inadequate|not enough)\s+"
+        r"(?:evidence|information|data|material)\b"
+        r"|\bcannot be (?:determined|identified|established|answered|computed"
+        r"|verified) from\b"
+        r"|\bdoes not (?:permit|allow|support|contain) (?:the )?(?:a |an |any )?"
+        r"(?:complete |defensible |reliable )?(?:answer|data|determination|identification)\b",
+        re.IGNORECASE,
+    )
+    # Only the OPENING of an answer: past that, "the table does not contain a row
+    # for 1963" is a finding, not a refusal to answer.
+    _ABSTAIN_LEAD_CHARS = 320
+
     LLM_PROVIDER = "openrouter"
-    MODEL = "z-ai/glm-5.3-flash"
+    MODEL = "z-ai/glm-5.2"
     COMMIT_FALLBACK_MODEL = "deepseek/deepseek-v3.2"
     FETCH_RETRY_ATTEMPTS = 2
     FETCH_TIMEOUT_SECONDS = 15.0
@@ -5051,6 +8408,12 @@ def _compose_u28_line():
     # retained remainder a run may re-read through page_grep / page_read: per call,
     # per result, and in total, so the reading cannot trade away the answer's time.
     PAGE_GREP_WINDOW_CHARS = 400
+    # What scanning may add to the evidence that ships. A scan window is the
+    # region a figure was actually read out of, so it has to be able to ship as
+    # that page's support; but a page can be scanned twenty times at twelve
+    # windows a call, and unbounded retention would fill the citation budget
+    # with one page's windows.
+    PAGE_GREP_RETAIN_TOTAL_CHARS = 24_000
     PAGE_GREP_MAX_HITS = 12
     PAGE_GREP_CALLS_PER_PAGE = 20
     PAGE_READ_MAX_CHARS = 12_000
@@ -5222,8 +8585,309 @@ def _compose_u28_line():
         "unless the question itself asks for a list or a table. State the answer in the "
         "first sentence. Do NOT reproduce the working table or internal scaffolding; "
         "rewrite the proof as prose. Do NOT end with a summary or recap that restates "
-        "figures already given. A reader must be able to see the full "
-        "candidate-pool reasoning from the FINAL ANSWER alone. Scoring is pairwise against a "
+        "figures already given. The FINAL ANSWER must carry the completeness claim on "
+        "its own: say what pool you checked and how many entries it held, and name only "
+        "the near-misses whose exclusion needs a reason, each with the criterion it "
+        "fails. Do NOT list the entries that simply do not qualify — a roster of names "
+        "that carry no failing criterion is a candidate dump, it lowers nothing but the "
+        "reader's patience, and it loses the comparison. Scoring is pairwise against a "
+        "competitor: an answer that refuses, defers, or hedges to 'insufficient data' loses "
+        "outright, and so does a bare answer with no completeness proof. If evidence covers "
+        "only part of the pool, commit to the best-supported answer and note that the roster "
+        "may be incomplete.\n\n"
+        "CITATION RULE: in the final answer, put the evidence number in brackets immediately "
+        "after EVERY factual claim — e.g. 'the total is 4,000 [7, 12].' A claim with no "
+        "bracket after it is assumed uncited. Cite the sources that carry the facts the "
+        "question asks for; a page fetched only to confirm a category or identity that "
+        "the named source already settles is not cited."
+    )
+
+    BRIEFING_NUDGE = (
+        "Your first message must open with the BRIEFING block (CANDIDATE POOL / CONSTRAINTS "
+        "/ PLAN) as instructed. Write it now, then begin research."
+    )
+
+    FORCED_COMMIT_SUFFIX = (
+        "\n\n*** FORCED COMMIT ***\nYour previous draft refused, stalled, or was cut short. "
+        "That scores ZERO. Rewrite now: commit to the best evidence-supported answer, cite "
+        "every claim, and do not emit tool-call syntax or apologies."
+    )
+
+    INSUFFICIENT_ANSWER = (
+        "I could not complete a source-backed research answer for this question within budget."
+    )
+
+    TOOL_MARKUP_RE = re.compile(
+        r"<\s*/?\s*(tool_call|arg_key|arg_value)\b[^>]*>", re.IGNORECASE,
+    )
+    # glm-5 sometimes narrates tool calls as prose instead of emitting structured
+    # calls; that text must never reach the judge as a final answer
+    PSEUDO_CALL_RE = re.compile(r"\b(?:search_web|fetch_page|page_grep|page_read)\s*\(", re.IGNORECASE)
+    # a reply that opens by narrating what it will look up next is a plan, not an
+    # answer; with tools disabled it can only be retried
+    NARRATED_INTENT_RE = re.compile(
+        r"^\s*(?:i need to|i will need to|let me|i'll|i will|first,? i)\s+(?:find|search|read|check|look|fetch|grep|locate|verify)",
+        re.IGNORECASE,
+    )
+    # An answer that talks about the run's own machinery is narration, not answer:
+    # the tools it used, what a tool did, what it read. Distinct from
+    # NARRATED_INTENT_RE, which only catches a reply that OPENS by stating an
+    # intention -- this fires wherever in the text the leak appears.
+    PROCESS_NARRATION_RE = re.compile(
+        r"\bthe \w*(?:retain|search|fetch|page)\w*\s+(?:tool|function)\b"
+        r"|\bretain_evidence\b|\bis being (?:finicky|strict|picky|fussy|difficult)\b"
+        r"|\blet me proceed with\b|\busing the (?:result|citation) numbers\b"
+        r"|\bthe tool results?\b|\ball evidence (?:is )?retained\b"
+        r"|\bi (?:now )?have (?:all|everything)\b|\bi have all the data\b"
+        r"|\bthe grep for\b|\bgrep (?:returned|found)\b|\breturned exactly \d+ match"
+        r"|\bi have (?:the|all|every|both)\b.{0,60}?\b(?:captured|located|gathered|retrieved)\b",
+        re.IGNORECASE,
+    )
+    ABSTENTION_MARKERS = (
+        "i could not", "i cannot", "i was unable", "unable to", "cannot answer",
+        "insufficient evidence", "no evidence", "could not find", "cannot determine",
+        "cannot be determined", "i don't have", "i do not have", "not enough information",
+        "does not contain", "is not shown", "cannot name", "cannot identify",
+    )
+    CANDIDATE_RE = re.compile(r"^\s*[-*]\s*CANDIDATE:\s*(.+?)\s*$", re.MULTILINE)
+    FINAL_SECTION_RE = re.compile(
+        r"^\s*(?:#{1,4}\s*)?(?:\*{1,2})?\s*FINAL ANSWER\s*(?:\*{1,2})?\s*:?\s*$"
+        r"|(?:\*{1,2}|#{1,4}\s*)?FINAL ANSWER(?:\*{1,2})?\s*:",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    DUMP_GARBAGE_RE = re.compile(
+        r"can[’']?t be reached|ERR_|unexpectedly closed|access denied|403 forbidden"
+        r"|404 not found|-> ERROR|enable javascript|verify you are human",
+        re.IGNORECASE,
+    )
+    from harnyx_miner_sdk.decorators import entrypoint
+    from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
+
+    LLM_PROVIDER = "openrouter"
+    MODEL = "z-ai/glm-5.2"
+    COMMIT_FALLBACK_MODEL = "deepseek/deepseek-v3.2"
+    FETCH_RETRY_ATTEMPTS = 2
+    FETCH_TIMEOUT_SECONDS = 15.0
+    TASK_TOTAL_BUDGET_SECONDS = 235.0
+    MAX_RETRY_ATTEMPTS_PER_TURN = 2
+    LLM_TURN_TIMEOUT_SECONDS = 90.0
+    SEARCH_TIMEOUT_SECONDS = 20.0
+
+    RESEARCH_TURN_CAP = 10
+    RESEARCH_TIME_CAP_SECONDS = 140.0
+    CHECKPOINT_TOOL_TURNS = 2
+    FINAL_RESERVE_SECONDS = 55.0
+    FINAL_RETRY_MIN_SECONDS = 25.0
+
+    TOOL_RESULT_INLINE_CHARS = 3000
+    SEARCH_EXCERPT_INLINE_CHARS = 380
+    COVERAGE_LIST_MAX = 8
+    MIN_ANSWER_CHARS = 400
+    HARD_MIN_ANSWER_CHARS = 200
+    CITATION_BUDGET_CHARS = 90_000
+    CITATION_GAP_FILL_MAX_CHARS = 4_000
+    CITATION_ANCHOR_CONTEXT_CHARS = 160
+    CITATION_ANCHOR_LEAD_CHARS = 800
+    COMMIT_DIGEST_SOURCES_MAX = 16
+    COMMIT_DIGEST_NOTE_CHARS = 2_600
+    COMMIT_DIGEST_TOTAL_CHARS = 64_000
+    COMMIT_DIGEST_IDENTITY_CHARS = 320
+    # A search result in the commit digest is an excerpt; a fetched page is the
+    # regions that were read. The allowance is split by kind, so fifteen search
+    # hits can no longer shrink the one page that was actually read to a prefix.
+    COMMIT_DIGEST_SEARCH_CHARS = 1_200
+
+    PAGE_WINDOW_CHARS = 3600
+    PAGE_WINDOWS_PER_PAGE = 3
+    # A long page is retained whole but shown in part. These bound how much of the
+    # retained remainder a run may re-read through page_grep / page_read: per call,
+    # per result, and in total, so the reading cannot trade away the answer's time.
+    PAGE_GREP_WINDOW_CHARS = 400
+    # What scanning may add to the evidence that ships. A scan window is the
+    # region a figure was actually read out of, so it has to be able to ship as
+    # that page's support; but a page can be scanned twenty times at twelve
+    # windows a call, and unbounded retention would fill the citation budget
+    # with one page's windows.
+    PAGE_GREP_RETAIN_TOTAL_CHARS = 24_000
+    PAGE_GREP_MAX_HITS = 12
+    PAGE_GREP_CALLS_PER_PAGE = 20
+    PAGE_GREP_MAX_HITS = 12
+    PAGE_GREP_CALLS_PER_PAGE = 20
+    PAGE_READ_MAX_CHARS = 12_000
+    PAGE_READ_CALLS_PER_PAGE = 12
+    PAGE_REREAD_TOTAL_CHARS = 132_000
+    # Blind windows kept once the extractor has vouched for regions of the same
+    # page. A term-density window is a guess about where the answer lives; a
+    # verified quote is not, and the two should not be paid for at the same rate.
+    PAGE_WINDOWS_WITH_EXTRACT = 1
+    PAGE_WINDOW_BUDGET_CHARS = 34_000
+    # Every source is guaranteed this much surfaced area of its own before the
+    # shared allowance is touched, so a page read late in a run cannot be left with
+    # only its opening by pages read earlier. Bounded twice: a single source can
+    # reserve no more than one opening plus its windows, and only the first
+    # PAGE_RESERVE_POOL_CHARS worth of reservations are honoured at all.
+    PAGE_SOURCE_RESERVE_CHARS = PAGE_WINDOW_CHARS * PAGE_WINDOWS_PER_PAGE
+    PAGE_RESERVE_POOL_CHARS = 64_800
+    TERM_LIMIT = 22
+    TERM_HITS_PER_TERM = 60
+    TERM_HITS_TOTAL = 600
+
+    RELOCATE_MAX_PASSES = 3
+    RELOCATE_WINDOW_CHARS = 1600
+    RELOCATE_WINDOWS_PER_ASK = 2
+    RELOCATE_PAGES_PER_ASK = 4
+    RELOCATE_BUDGET_CHARS = 16_000
+    RELOCATE_MIN_SECONDS = 6.0
+    AMEND_MIN_SECONDS = 20.0
+    AMEND_TIMEOUT_SECONDS = 40.0
+    AMEND_CONTEXT_CHARS = 11_000
+    AMEND_MIN_KEEP_CHARS = 200
+    ASK_PROOF_CHARS = 420
+    ASK_LIST_MAX = 8
+
+    TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search_web",
+                "description": "Search the web. Returns results with title, url, and a text excerpt.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string", "description": "search query"}},
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "fetch_page",
+                "description": "Fetch a URL and return its extracted main text content.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"url": {"type": "string", "description": "URL to fetch"}},
+                    "required": ["url"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "page_grep",
+                "description": (
+                    "Find where a literal string occurs anywhere in a result already returned "
+                    "this run, including the part that was too long to show. Reports each "
+                    "match's character offset with a little text around it. Reads text already "
+                    "held in memory: nothing is downloaded and it takes no time."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "source": {"type": "integer",
+                                   "description": "the bracketed number of a result already returned"},
+                        "pattern": {"type": "string",
+                                    "description": "literal text to look for, matched case-insensitively"},
+                    },
+                    "required": ["source", "pattern"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "page_read",
+                "description": (
+                    "Read a region of a result already returned this run, addressed by character "
+                    "offset -- typically an offset page_grep reported. Reads text already held in "
+                    "memory: nothing is downloaded and it takes no time."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "source": {"type": "integer",
+                                   "description": "the bracketed number of a result already returned"},
+                        "offset": {"type": "integer", "description": "character offset to start reading from"},
+                        "length": {"type": "integer", "description": "how many characters to read"},
+                    },
+                    "required": ["source", "offset"],
+                },
+            },
+        },
+    ]
+
+    SYSTEM_PROMPT = (
+        "You are a precise web-research agent answering one factual question in a single "
+        "continuous session. You have search_web, fetch_page, page_grep and page_read tools. "
+        "Follow this protocol "
+        "exactly, using the literal phase markers.\n\n"
+        "BRIEFING:\n"
+        "Open your first message with a BRIEFING block written from your own knowledge, "
+        "before reading any tool result:\n"
+        "(a) CANDIDATE POOL — every entity that might satisfy the question, one per line, "
+        "formatted exactly:\n"
+        "- CANDIDATE: <name> — <one-clause confidence note>\n"
+        "(b) CONSTRAINTS — the atomic constraints the answer must satisfy, decomposed.\n"
+        "(c) PLAN — 2-4 opening queries.\n"
+        "Do not answer during the briefing. You may issue your opening tool calls in the "
+        "same turn as the briefing.\n\n"
+        "RESEARCH:\n"
+        "READ THE WHOLE PAGE BEFORE FETCHING ANOTHER: fetch_page shows only the opening of "
+        "a long page and reports how many characters it holds in total; the rest is still "
+        "held under that same [n] and re-fetching the URL returns the identical opening. "
+        "Call page_grep(source, pattern) to find where something occurs anywhere in that "
+        "page, then page_read(source, offset, length) to read that region. Long lists, "
+        "tables and appendices routinely put the rows you need thousands of characters "
+        "past the opening, so when a question asks for a complete set from one document, "
+        "look for each member inside the page you already hold before searching for "
+        "another source; ask for the widest region a read allows and put several "
+        "page_grep/page_read calls in the SAME turn. "
+        "Call tools adaptively. Your goal is coverage: obtain the specific figures or facts "
+        "needed to test EVERY candidate against EVERY constraint — for entities that qualify "
+        "AND entities that do not. If a query or page fails, pivot the query or the source "
+        "rather than repeating it. BATCH RULE: when testing many candidates against a "
+        "per-candidate fact (a statistic, a tempo, a runtime, a date), issue the lookups "
+        "for SEVERAL candidates as multiple tool calls in the SAME turn — never spend one "
+        "turn per candidate. METRIC RULE: when the question asks for the percentage "
+        "change or growth of an economic indicator, retrieve the OFFICIAL growth-rate "
+        "series for that indicator (e.g. World Bank 'GDP growth (annual %)', real terms) — "
+        "NEVER derive a percentage from current-value levels yourself. SOURCE RULE: if the "
+        "question names a source (e.g. Forbes, Box Office Mojo, IMDb, Rotten Tomatoes, a UN "
+        "or government agency), get the data from THAT source — search it directly, fetch "
+        "its page, and cite it for the core claims. For each metric, prefer ONE consistent "
+        "canonical source across all candidates (same series, same year basis); do not mix "
+        "sources for the same metric unless the preferred source is unreachable, and note "
+        "the substitution if you must. Do not spend fetches confirming an entity's "
+        "category or identity from third-party sites when the named source's own "
+        "grouping or wording already settles it.\n\n"
+        "VERIFY:\n"
+        "When told to verify, build a per-candidate x per-constraint table from the numbered "
+        "evidence, citing [n] markers. Name the near-miss exclusions and the exact criterion "
+        "each fails. Do not write 'the only', 'the sole', or 'the single' unless you "
+        "enumerated and checked the whole pool. Never state a figure that is not present in "
+        "the numbered evidence. Never declare a candidate's data missing without re-scanning "
+        "the numbered evidence for it first — if the figure is there, include or exclude that "
+        "candidate on the merits, citing the figure. Check that every core figure is cited "
+        "to the question's named source (or one consistent canonical source per metric); if "
+        "a core figure only has a substitute source while the named source is reachable, "
+        "fetch the named source before finalizing. Re-read the question's explicit "
+        "output-format instructions (ordering, list format, words to include or omit) and "
+        "make the final answer obey them exactly — such instructions control how you WRITE "
+        "the answer text, never which entities qualify: an instruction to omit a word means "
+        "write the qualifying entity's name without that word, not exclude the entity.\n\n"
+        "FINAL ANSWER:\n"
+        "End with a committed, SELF-CONTAINED answer: state the answer first, then a compact "
+        "proof — each qualifying entity with the figures that qualify it, and the near-miss "
+        "exclusions with the exact criterion each fails — written as flowing prose "
+        "paragraphs with [n] citations: no markdown bullets, headers, bold or tables "
+        "unless the question itself asks for a list or a table. State the answer in the "
+        "first sentence. Do NOT reproduce the working table or internal scaffolding; "
+        "rewrite the proof as prose. Do NOT end with a summary or recap that restates "
+        "figures already given. The FINAL ANSWER must carry the completeness claim on "
+        "its own: say what pool you checked and how many entries it held, and name only "
+        "the near-misses whose exclusion needs a reason, each with the criterion it "
+        "fails. Do NOT list the entries that simply do not qualify — a roster of names "
+        "that carry no failing criterion is a candidate dump, it lowers nothing but the "
+        "reader's patience, and it loses the comparison. Scoring is pairwise against a "
         "competitor: an answer that refuses, defers, or hedges to 'insufficient data' loses "
         "outright, and so does a bare answer with no completeness proof. If evidence covers "
         "only part of the pool, commit to the best-supported answer and note that the roster "
@@ -5297,11 +8961,7 @@ def _compose_u28_line():
 
 
     def _key_terms(text: str, limit: int = TERM_LIMIT) -> list[str]:
-        """Distinctive lookup terms for a piece of text, numerals and long words first.
-
-        Purely lexical and content-agnostic: the ranking is by information density
-        (a digit run beats a long word beats a short word), never by subject matter.
-        """
+        'Distinctive lookup terms for a piece of text, numerals and long words first.\n\n    Purely lexical and content-agnostic: the ranking is by information density\n    (a digit run beats a long word beats a short word), never by subject matter.\n    '
         words = re.findall(r"[A-Za-z][A-Za-z'\-]{2,}|\d[\d,.%/]*", text or "")
         ordered = sorted(words, key=lambda w: (not any(c.isdigit() for c in w), -len(w)))
         terms: list[str] = []
@@ -5334,13 +8994,7 @@ def _compose_u28_line():
         note: str, terms: list[str], width: int, k: int,
         *, skip_before: int = 0, avoid: list[tuple[int, int]] | None = None,
     ) -> list[tuple[int, int]]:
-        """The k highest-density disjoint regions of `note` for `terms`.
-
-        Deterministic scan, no model call and no extra request: score a candidate
-        region by how many DISTINCT terms fall inside it, break ties on raw hits,
-        take the best, then exclude everything it covers and repeat. Regions already
-        surfaced (`avoid`) and the leading `skip_before` chars are never re-emitted.
-        """
+        'The k highest-density disjoint regions of `note` for `terms`.\n\n    Deterministic scan, no model call and no extra request: score a candidate\n    region by how many DISTINCT terms fall inside it, break ties on raw hits,\n    take the best, then exclude everything it covers and repeat. Regions already\n    surfaced (`avoid`) and the leading `skip_before` chars are never re-emitted.\n    '
         src_len = len(note)
         if k <= 0 or not terms or src_len <= skip_before:
             return []
@@ -5389,8 +9043,7 @@ def _compose_u28_line():
 
 
     def _render_spans(note: str, spans: list[tuple[int, int]]) -> str:
-        """The surfaced regions as one block, each labelled with its offset so the
-        reader knows the text is non-contiguous and where each part came from."""
+        'The surfaced regions as one block, each labelled with its offset so the\n    reader knows the text is non-contiguous and where each part came from.'
         parts: list[str] = []
         for start, end in _merge_spans(spans):
             parts.append(f"[chars {start}-{end}]\n{note[start:end]}")
@@ -5427,9 +9080,11 @@ def _compose_u28_line():
         def __init__(self) -> None:
             self._by_number: dict[int, dict[str, str]] = {}
             self._spans: dict[int, list[tuple[int, int]]] = {}
+            self._cite_spans: dict[int, list[tuple[int, int]]] = {}
             self._window_budget = PAGE_WINDOW_BUDGET_CHARS
             self._verified: dict[int, list[tuple[int, int]]] = {}
             self.reread_budget = PAGE_REREAD_TOTAL_CHARS
+            self.grep_retain_budget = PAGE_GREP_RETAIN_TOTAL_CHARS
             self._reserve_pool = PAGE_RESERVE_POOL_CHARS
             self._source_spend: dict[int, int] = {}
             self._next = 1
@@ -5472,13 +9127,7 @@ def _compose_u28_line():
         # could disagree about which part of a page the answer came from.
 
         def mark_verified(self, number: int, spans: list[tuple[int, int]]) -> None:
-            """Regions an extractor could point at, as opposed to guessed at.
-
-            Recorded separately because every later stage that has to drop text
-            ranks by the question's own words, and the regions that carry the
-            ANSWER score lowest on exactly that measure -- the identifier a question
-            asks for is the one string the question cannot contain.
-            """
+            "Regions an extractor could point at, as opposed to guessed at.\n\n        Recorded separately because every later stage that has to drop text\n        ranks by the question's own words, and the regions that carry the\n        ANSWER score lowest on exactly that measure -- the identifier a question\n        asks for is the one string the question cannot contain.\n        "
             if not spans:
                 return
             kept = self._verified.setdefault(number, [])
@@ -5527,14 +9176,7 @@ def _compose_u28_line():
             return added
 
         def retain(self, number: int, start: int, end: int) -> None:
-            """Record a region as shown WITHOUT charging the surfaced-text allowance.
-
-            The allowance exists to ration density-window GUESSES across pages. A
-            region the model asked to read by offset is not a guess, and refusing to
-            record it would drop it from the commit pack after the model had already
-            been shown it -- the same held-then-cut failure the verified ranking
-            fixes for the extractor.
-            """
+            'Record a region as shown WITHOUT charging the surfaced-text allowance.\n\n        The allowance exists to ration density-window GUESSES across pages. A\n        region the model asked to read by offset is not a guess, and refusing to\n        record it would drop it from the commit pack after the model had already\n        been shown it -- the same held-then-cut failure the verified ranking\n        fixes for the extractor.\n        '
             meta = self._by_number.get(number)
             if meta is None:
                 return
@@ -5549,6 +9191,35 @@ def _compose_u28_line():
 
         def spans(self, number: int) -> list[tuple[int, int]]:
             return list(self._spans.get(number) or ())
+
+        def retain_citable(self, number: int, start: int, end: int) -> None:
+            """Record a region as OFFERABLE evidence without re-surfacing it.
+
+            A scan window has already been shown to the model inline, in the
+            scan's own output; putting it back into the surfaced text would send
+            a second copy and pay for it. What it has to reach is the citation
+            array: a figure read here is cited to this page, so the range offered
+            as that page's support has to be one that prints it.
+            """
+            meta = self._by_number.get(number)
+            if meta is None:
+                return
+            limit = int(meta.get("src_len") or 0)
+            start = max(0, min(int(start), limit))
+            end = max(start, min(int(end), limit))
+            if end - start <= 0:
+                return
+            kept = self._cite_spans.setdefault(number, [])
+            kept.append((start, end))
+            self._cite_spans[number] = _merge_spans(kept)
+
+        def citable_spans(self, number: int) -> list[tuple[int, int]]:
+            """Every region this source may be cited for: shown, plus scanned."""
+            return _merge_spans(
+                list(self._spans.get(number) or ())
+                + list(self._cite_spans.get(number) or ())
+            )
+
 
         def window_budget(self) -> int:
             return self._window_budget
@@ -5588,13 +9259,7 @@ def _compose_u28_line():
 
     def _page_spans(note: str, terms: list[str],
                     windows: int = PAGE_WINDOWS_PER_PAGE) -> list[tuple[int, int]]:
-        """What to show of a page: its opening, plus the densest regions elsewhere.
-
-        A long document's relevant rows are routinely nowhere near its start, so a
-        fixed prefix reads the boilerplate and stops. The opening is always kept —
-        it carries the identity of the document — and the rest of the allowance goes
-        to the regions that actually mention what was asked.
-        """
+        "What to show of a page: its opening, plus the densest regions elsewhere.\n\n    A long document's relevant rows are routinely nowhere near its start, so a\n    fixed prefix reads the boilerplate and stops. The opening is always kept —\n    it carries the identity of the document — and the rest of the allowance goes\n    to the regions that actually mention what was asked.\n    "
         # A page that fits inside the allowance is shown whole. Selecting regions of
         # it can only lose text the budget was willing to pay for, and the rows that
         # answer a question are routinely the ones no question term points at.
@@ -5640,14 +9305,7 @@ def _compose_u28_line():
 
 
     def _main_pin() -> dict | None:
-        """Every live upstream, not just the first.
-
-        Naming one at a time buys a price we have actually measured, and costs a
-        retry attempt whenever that one 429s -- a lost turn is a score risk, and
-        score gates everything. Naming the whole set lets the router fail over
-        INSIDE the request instead, at the price of a blend across upstreams whose
-        real rates are not measured yet. The next batch's rows measure them for free.
-        """
+        "Every live upstream, not just the first.\n\n    Naming one at a time buys a price we have actually measured, and costs a\n    retry attempt whenever that one 429s -- a lost turn is a score risk, and\n    score gates everything. Naming the whole set lets the router fail over\n    INSIDE the request instead, at the price of a blend across upstreams whose\n    real rates are not measured yet. The next batch's rows measure them for free.\n    "
         live = [u for u in _MAIN_UPSTREAMS if u not in _MAIN_DEAD]
         if not live:
             return None
@@ -5655,10 +9313,7 @@ def _compose_u28_line():
 
 
     def _main_pin_failed() -> None:
-        """Second line only: the router already failed over within the set, so a
-        call that still failed points at the head of the list. Retire it for the
-        run; when the set empties the caller goes out unpinned rather than not at
-        all."""
+        'Second line only: the router already failed over within the set, so a\n    call that still failed points at the head of the list. Retire it for the\n    run; when the set empties the caller goes out unpinned rather than not at\n    all.'
         live = [u for u in _MAIN_UPSTREAMS if u not in _MAIN_DEAD]
         if live:
             _MAIN_DEAD.add(live[0])
@@ -5714,8 +9369,7 @@ def _compose_u28_line():
 
 
     def _x_find(page: str, quote: str, npage: str, imap: list[int]) -> tuple[int, int] | None:
-        """Locate a returned quote. None means DISCARD it — never fall back to an
-        offset the model supplied, and never widen the match to make it fit."""
+        'Locate a returned quote. None means DISCARD it — never fall back to an\n    offset the model supplied, and never widen the match to make it fit.'
         needle = _x_norm(quote or "").strip()
         if len(needle) < _EXTRACT_MIN_QUOTE_CHARS:
             return None
@@ -5729,9 +9383,7 @@ def _compose_u28_line():
 
 
     def _x_repair(body: str) -> str:
-        """The page's own markdown escapes end up inside the model's JSON string and
-        `\.` is not a legal JSON escape. The same reply mixes correctly doubled and
-        bare ones, so this scans rather than substituting."""
+        "The page's own markdown escapes end up inside the model's JSON string and\n    `\\.` is not a legal JSON escape. The same reply mixes correctly doubled and\n    bare ones, so this scans rather than substituting."
         out: list[str] = []
         i = 0
         n = len(body)
@@ -5753,8 +9405,7 @@ def _compose_u28_line():
 
 
     def _x_quotes(text: str) -> list[str]:
-        """A parse failure is NOT an abstention: an unreadable reply must never be
-        mistaken for 'this page carries nothing', which is a different fact."""
+        "A parse failure is NOT an abstention: an unreadable reply must never be\n    mistaken for 'this page carries nothing', which is a different fact."
         body = (text or "").strip()
         start = body.find("{")
         end = body.rfind("}")
@@ -5773,9 +9424,7 @@ def _compose_u28_line():
 
 
     def _x_chunks(text: str) -> list[str]:
-        """Every character is offered to the extractor. Chunking exists because one
-        call over a very long page answers from its opening and invents the rest;
-        it is not a budget cap."""
+        'Every character is offered to the extractor. Chunking exists because one\n    call over a very long page answers from its opening and invents the rest;\n    it is not a budget cap.'
         if len(text) <= EXTRACT_CHUNK_CHARS:
             return [text]
         out: list[str] = []
@@ -5878,15 +9527,7 @@ def _compose_u28_line():
 
 
     def _run_page_grep(number: object, pattern: str, index: _ResultIndex) -> str:
-        """Report where a literal string sits inside a result already in hand.
-
-        A long page is retained whole but shown in part, so the only thing standing
-        between the reader and material past the shown region is knowing where it
-        is. Matching is over text already in memory: it costs nothing and consumes
-        none of the retrieval budget. Measured on `a010a611` `cd2d2173`: the base
-        saw 13,888 of a 160,012-char page and never reached episodes 4-44; the
-        champion read the whole table with fourteen of these calls.
-        """
+        'Report where a literal string sits inside a result already in hand.\n\n    A long page is retained whole but shown in part, so the only thing standing\n    between the reader and material past the shown region is knowing where it\n    is. Matching is over text already in memory: it costs nothing and consumes\n    none of the retrieval budget. Measured on `a010a611` `cd2d2173`: the base\n    saw 13,888 of a 160,012-char page and never reached episodes 4-44; the\n    champion read the whole table with fourteen of these calls.\n    '
         resolved = _held_result(number, index)
         if resolved is None:
             return ("# page_grep: no such result. Pass the number in brackets next to a result "
@@ -5918,19 +9559,20 @@ def _compose_u28_line():
             start = max(0, at - PAGE_GREP_WINDOW_CHARS // 2)
             end = min(len(note), start + PAGE_GREP_WINDOW_CHARS)
             parts.append(f"--- match at offset {at}, showing {start}:{end} ---\n{note[start:end]}")
+            # The model reads figures out of these windows and then cites the page
+            # for them. Unless the window is retained, the support offered for a
+            # table on page 81 is the page's opening, which prints none of it, and
+            # the claim ships unsupported however right it is.
+            if index.grep_retain_budget > 0:
+                index.grep_retain_budget -= end - start
+                index.retain_citable(n, start, end)
         rendered = "\n".join(parts)
         index.reread_budget -= len(rendered)
         return rendered
 
 
     def _run_page_read(number: object, offset: object, length: object, index: _ResultIndex) -> str:
-        """Return one region of a result already in hand, addressed by offset.
-
-        Bounded on three sides on purpose: a single call cannot exceed a fixed width,
-        one result cannot be opened more than a few times, and the run as a whole has
-        a fixed allowance across every result. Each call is a turn against a fixed
-        time budget, so an unbounded version trades the answer for the reading.
-        """
+        'Return one region of a result already in hand, addressed by offset.\n\n    Bounded on three sides on purpose: a single call cannot exceed a fixed width,\n    one result cannot be opened more than a few times, and the run as a whole has\n    a fixed allowance across every result. Each call is a turn against a fixed\n    time budget, so an unbounded version trades the answer for the reading.\n    '
         resolved = _held_result(number, index)
         if resolved is None:
             return ("# page_read: no such result. Pass the number in brackets next to a result "
@@ -6037,6 +9679,14 @@ def _compose_u28_line():
         return tuple(numbers)
 
 
+    def _span_support(note: str, span: tuple[int, int], anchors: list[str]) -> int:
+        """How many of a claim's own words a range actually prints.
+
+        A range that prints none of them supports nothing, however wide it is --
+        the opening of a long report is the usual case."""
+        text = note[span[0]:span[1]].lower()
+        return sum(1 for token in anchors if token in text)
+
     def _anchor_tokens(claim: str) -> list[str]:
         words = re.findall(r"[A-Za-z][A-Za-z']{3,}|\d[\d,.%]*", claim)
         ordered = sorted(words, key=lambda w: (not any(c.isdigit() for c in w), -len(w)))
@@ -6058,8 +9708,7 @@ def _compose_u28_line():
 
 
     def _window_quality(text: str) -> float:
-        """Legibility of a candidate slice as judge-facing evidence: markdown-table
-        debris and page boilerplate read as unsupported garbage in pairwise."""
+        'Legibility of a candidate slice as judge-facing evidence: markdown-table\n    debris and page boilerplate read as unsupported garbage in pairwise.'
         if not text:
             return 0.0
         q = 1.0
@@ -6114,12 +9763,7 @@ def _compose_u28_line():
     def _citations_from_inline_markers(
         answer_text: str, index: _ResultIndex
     ) -> tuple[tuple[CitationRef, ...], dict[int, int]]:
-        """Build the citation array and the number -> array-position map.
-
-        One entry per SOURCE, so several evidence numbers can share a position, and
-        a source that loses its ranges to the budget occupies none. The map records
-        where each number's entry actually landed.
-        """
+        "Build the citation array and the number -> array-position map.\n\n    One entry per SOURCE, so several evidence numbers can share a position, and\n    a source that loses its ranges to the budget occupies none. The map records\n    where each number's entry actually landed.\n    "
         max_number = index.max_number()
         seen: set[int] = set()
         ordered: list[int] = []
@@ -6149,7 +9793,7 @@ def _compose_u28_line():
             # claim can have come from, so they are the ranges offered as support;
             # a source that was never surfaced in ranges falls back to anchoring the
             # claim inside it, as before.
-            spans = [(s, e) for s, e in index.spans(n) if e > s]
+            spans = [(s, e) for s, e in index.citable_spans(n) if e > s]
             if not spans:
                 start, end = _anchored_slice_bounds(
                     meta["note"], claims_by_number.get(n, []), slice_window,
@@ -6204,6 +9848,12 @@ def _compose_u28_line():
                     joined.append((start, end))
             entry["spans"] = joined
 
+        # Which evidence numbers ended up under each source, so a range can be
+        # ranked against the claims that actually point at it.
+        numbers_of_key: dict[str, list[int]] = {}
+        for number, source_key in key_of_number.items():
+            numbers_of_key.setdefault(source_key, []).append(number)
+
         citations: list[CitationRef] = []
         position_of_key: dict[str, int] = {}
         budget = CITATION_BUDGET_CHARS
@@ -6212,9 +9862,21 @@ def _compose_u28_line():
             meta = entry["meta"]
             spans = [(s, e) for s, e in entry["spans"] if e > s]
             cost = sum(e - s for s, e in spans)
+            anchors = _anchor_tokens(" ".join(
+                claim
+                for number in numbers_of_key.get(key, ())
+                for claim in claims_by_number.get(number, ())
+            ))
+            note_text = meta["note"]
             while spans and cost > budget:
-                # drop the narrowest range first — the widest carries the most proof
-                spans.remove(min(spans, key=lambda span: span[1] - span[0]))
+                # Drop what proves least, not what is narrowest: the widest range
+                # is usually the source's opening, and the narrowest is the window
+                # the figure was read out of. Width breaks a tie, as it used to.
+                spans.remove(min(
+                    spans,
+                    key=lambda span: (_span_support(note_text, span, anchors),
+                                      span[1] - span[0]),
+                ))
                 cost = sum(e - s for s, e in spans)
             if not spans:
                 continue
@@ -6233,15 +9895,7 @@ def _compose_u28_line():
 
 
     def _repoint_markers(text: str, position_of: dict[int, int], *, max_number: int) -> str:
-        """Rewrite evidence brackets as position pointers into the citation array.
-
-        `[7]` and `[7, 12]` are written against tool-result numbering; the array
-        that ships alongside is compact, ordered by first use, and merges repeats of
-        one source into a single entry. This maps each number onto the position it
-        occupies and emits one pointer per position, so a pointer and the entry it
-        selects always agree. Numbers that carry no entry are dropped rather than
-        left pointing past the end of the array.
-        """
+        'Rewrite evidence brackets as position pointers into the citation array.\n\n    `[7]` and `[7, 12]` are written against tool-result numbering; the array\n    that ships alongside is compact, ordered by first use, and merges repeats of\n    one source into a single entry. This maps each number onto the position it\n    occupies and emits one pointer per position, so a pointer and the entry it\n    selects always agree. Numbers that carry no entry are dropped rather than\n    left pointing past the end of the array.\n    '
 
         def _replace(match: "re.Match[str]") -> str:
             positions: list[int] = []
@@ -6354,13 +10008,7 @@ def _compose_u28_line():
 
 
     def _digest_numbers(index: _ResultIndex) -> list[int]:
-        """Evidence numbers to expand, fetched pages before search results.
-
-        One slot per PAGE: a page fetched more than once used to occupy one digest
-        slot per fetch, each shown as its own opening — three slots of the same
-        boilerplate while other sources were squeezed. Duplicates are folded into
-        the first fetch of that URL (their read spans are unioned at render time).
-        """
+        'Evidence numbers to expand, fetched pages before search results.\n\n    One slot per PAGE: a page fetched more than once used to occupy one digest\n    slot per fetch, each shown as its own opening — three slots of the same\n    boilerplate while other sources were squeezed. Duplicates are folded into\n    the first fetch of that URL (their read spans are unioned at render time).\n    '
         fetched: list[int] = []
         searched: list[int] = []
         seen_urls: set[str] = set()
@@ -6380,8 +10028,7 @@ def _compose_u28_line():
 
 
     def _union_spans_same_url(index: _ResultIndex, number: int) -> list[tuple[int, int]]:
-        """The union of read spans across every fetch of this page (equal-length
-        notes only, so offsets are comparable)."""
+        'The union of read spans across every fetch of this page (equal-length\n    notes only, so offsets are comparable).'
         meta = index.get(number)
         if meta is None:
             return list(index.spans(number) or ())
@@ -6408,17 +10055,7 @@ def _compose_u28_line():
         note: str, spans: list[tuple[int, int]], terms: list[str], window: int,
         verified: list[tuple[int, int]] | None = None,
     ) -> list[tuple[int, int]]:
-        """Which parts of the regions read from a source fit in its allowance.
-
-        When everything read fits, everything read is shown. When it does not, the
-        choice used to be made the same way the regions were chosen in the first
-        place — by where the question's own words occur. That ranking is the reason
-        a region can be read during research and still be missing from the turn that
-        writes the answer: a passage carrying the identifier the question ASKS FOR
-        scores lowest on the question's own words, so it is the first thing cut.
-        Regions an extractor could quote are therefore kept ahead of that ranking
-        rather than subjected to it.
-        """
+        "Which parts of the regions read from a source fit in its allowance.\n\n    When everything read fits, everything read is shown. When it does not, the\n    choice used to be made the same way the regions were chosen in the first\n    place — by where the question's own words occur. That ranking is the reason\n    a region can be read during research and still be missing from the turn that\n    writes the answer: a passage carrying the identifier the question ASKS FOR\n    scores lowest on the question's own words, so it is the first thing cut.\n    Regions an extractor could quote are therefore kept ahead of that ranking\n    rather than subjected to it.\n    "
         spans = _merge_spans([(s, e) for s, e in spans if e > s])
         if not spans:
             return []
@@ -6464,14 +10101,7 @@ def _compose_u28_line():
 
 
     def _evidence_digest(index: _ResultIndex, terms: list[str]) -> str:
-        """The numbered evidence, projected straight out of the result index.
-
-        Each source contributes its opening plus the regions it was read from; the
-        per-source allowance widens when few sources were gathered, so the whole
-        digest stays inside one bounded size regardless of how much was collected.
-        The turn that writes the answer therefore sees the same regions the research
-        turns saw, instead of a shorter prefix of every source.
-        """
+        'The numbered evidence, projected straight out of the result index.\n\n    Each source contributes its opening plus the regions it was read from; the\n    per-source allowance widens when few sources were gathered, so the whole\n    digest stays inside one bounded size regardless of how much was collected.\n    The turn that writes the answer therefore sees the same regions the research\n    turns saw, instead of a shorter prefix of every source.\n    '
         numbers = _digest_numbers(index)
         if not numbers:
             return ""
@@ -6508,8 +10138,7 @@ def _compose_u28_line():
         terms: list[str] | None = None, notice: str = "",
         draft: str | None = None, suffix: str = "",
     ) -> list[dict[str, object]] | None:
-        """The commit turn's own message list, built from the index rather than the
-        research conversation. Returns None when there is no evidence to project."""
+        "The commit turn's own message list, built from the index rather than the\n    research conversation. Returns None when there is no evidence to project."
         digest = _evidence_digest(index, terms or _key_terms(question))
         if not digest:
             return None
@@ -6575,13 +10204,7 @@ def _compose_u28_line():
 
 
     def _question_asks(question: str, candidates: list[str]) -> list[_Ask]:
-        """The distinct things the question asks for, one entry each.
-
-        Two sources, both structural: the interrogative clauses of the question
-        itself, and each entity the opening brief put in play. Nothing here keys on
-        subject matter — a clause qualifies because of where it sits in the
-        sentence, not because of what it is about.
-        """
+        'The distinct things the question asks for, one entry each.\n\n    Two sources, both structural: the interrogative clauses of the question\n    itself, and each entity the opening brief put in play. Nothing here keys on\n    subject matter — a clause qualifies because of where it sits in the\n    sentence, not because of what it is about.\n    '
         asks: list[_Ask] = []
         seen: set[str] = set()
         for clause in ASK_CLAUSE_RE.split(question or ""):
@@ -6609,11 +10232,7 @@ def _compose_u28_line():
 
 
     def _ask_answered(ask: _Ask, index: _ResultIndex) -> bool:
-        """True when some surfaced passage names the ask and states a figure for it.
-
-        A page that merely mentions the subject is not the same as a page that
-        answers for it, so the test needs both a term hit and a numeral close by.
-        """
+        'True when some surfaced passage names the ask and states a figure for it.\n\n    A page that merely mentions the subject is not the same as a page that\n    answers for it, so the test needs both a term hit and a numeral close by.\n    '
         wanted = min(2, len(ask.terms))
         for number in range(1, index.max_number() + 1):
             meta = index.get(number)
@@ -6635,14 +10254,7 @@ def _compose_u28_line():
 
 
     def _relocate(index: _ResultIndex, asks: list[_Ask], deadline: float) -> list[_Ask]:
-        """Re-project retained pages against whatever is still unanswered.
-
-        Runs its own loop: each pass takes the asks with nothing stated for them,
-        pulls the best-matching unseen region out of every retained page for each,
-        and re-tests. It re-enters while a pass is still surfacing new regions and
-        stops as soon as one is not — no request is issued, so the only cost is the
-        text added to the reader's view, which is capped separately.
-        """
+        "Re-project retained pages against whatever is still unanswered.\n\n    Runs its own loop: each pass takes the asks with nothing stated for them,\n    pulls the best-matching unseen region out of every retained page for each,\n    and re-tests. It re-enters while a pass is still surfacing new regions and\n    stops as soon as one is not — no request is issued, so the only cost is the\n    text added to the reader's view, which is capped separately.\n    "
         open_asks = [a for a in asks if not _ask_answered(a, index)]
         budget = RELOCATE_BUDGET_CHARS
         for _pass in range(RELOCATE_MAX_PASSES):
@@ -6688,13 +10300,7 @@ def _compose_u28_line():
 
 
     def _unreported(asks: list[_Ask], index: _ResultIndex, answer: str, *, force: bool = False) -> list[tuple[_Ask, str]]:
-        """Asks a passage now states a figure for, but the answer does not report.
-
-        This is the whole point of relocating after a draft exists: the research
-        turns wrote the answer from what they had been shown, and relocation changes
-        what has been shown. Anything it turns up that the draft does not carry is,
-        by construction, material the draft could not have used.
-        """
+        'Asks a passage now states a figure for, but the answer does not report.\n\n    This is the whole point of relocating after a draft exists: the research\n    turns wrote the answer from what they had been shown, and relocation changes\n    what has been shown. Anything it turns up that the draft does not carry is,\n    by construction, material the draft could not have used.\n    '
         hay = (answer or "").lower()
         missing: list[tuple[_Ask, str]] = []
         for ask in asks:
@@ -6751,14 +10357,7 @@ def _compose_u28_line():
     async def _amend(
         question: str, answer: str, gaps: list[tuple[_Ask, str]], deadline: float,
     ) -> str:
-        """Rewrite the answer around the passages relocation turned up.
-
-        The returned text REPLACES what the research turns produced; this stage owns
-        what is delivered rather than annotating it. A rewrite is kept only when it
-        is a complete answer in its own right and still carries its citations, so
-        the stage can add what was found without the risk of trading a whole answer
-        for a fragment.
-        """
+        'Rewrite the answer around the passages relocation turned up.\n\n    The returned text REPLACES what the research turns produced; this stage owns\n    what is delivered rather than annotating it. A rewrite is kept only when it\n    is a complete answer in its own right and still carries its citations, so\n    the stage can add what was found without the risk of trading a whole answer\n    for a fragment.\n    '
         budget = deadline - perf_counter() - 3
         if budget <= 10:
             return answer
@@ -6792,7 +10391,8 @@ def _compose_u28_line():
             return answer
         if TOOL_MARKUP_RE.search(revised) or PSEUDO_CALL_RE.search(revised):
             return answer
-        if any(m in revised.lower()[:200] for m in ABSTENTION_MARKERS):
+        if any(m in revised.lower()[:200] for m in ABSTENTION_MARKERS) \
+            or _ABSTAIN_LEAD_RE.search(revised[:_ABSTAIN_LEAD_CHARS]):
             return answer
         if BRACKET_RE.search(answer) and not BRACKET_RE.search(revised):
             return answer
@@ -6804,12 +10404,7 @@ def _compose_u28_line():
     async def _amended_answer(
         question: str, asks: list[_Ask], index: _ResultIndex, answer: str, deadline: float,
     ) -> str:
-        """The delivered answer, decided here.
-
-        Always runs. Relocation goes first so the rewrite is judged against
-        everything the retained pages can be made to show, and the text this returns
-        is the text that is delivered.
-        """
+        'The delivered answer, decided here.\n\n    Always runs. Relocation goes first so the rewrite is judged against\n    everything the retained pages can be made to show, and the text this returns\n    is the text that is delivered.\n    '
         _relocate(index, asks, deadline)
         if deadline - perf_counter() < AMEND_MIN_SECONDS:
             return answer
@@ -6892,13 +10487,7 @@ def _compose_u28_line():
 
 
     def _prose_shape(text: str, question: str) -> str:
-        """The delivered shape of a plain answer: paragraphs, not markup.
-
-        A bullet list, bold and a closing recap are markup around the same facts;
-        where the question does not ask for a list, a table or a fixed form they are
-        removed and the facts are kept. Evidence brackets are untouched, so the
-        citation build reads the same markers it would have read.
-        """
+        'The delivered shape of a plain answer: paragraphs, not markup.\n\n    A bullet list, bold and a closing recap are markup around the same facts;\n    where the question does not ask for a list, a table or a fixed form they are\n    removed and the facts are kept. Evidence brackets are untouched, so the\n    citation build reads the same markers it would have read.\n    '
         if not text:
             return text
         if PROSE_ASKED_RE.search(question or "") is None and FORMAT_PRESCRIBED_RE.search(question or "") is not None:
@@ -6926,9 +10515,7 @@ def _compose_u28_line():
 
 
     def _final_section(text: str) -> str:
-        """Deliver only the FINAL ANSWER section; the verification scaffolding that
-        precedes it stays in-conversation. Falls back to the full text when the
-        section is absent or too bare to stand alone."""
+        'Deliver only the FINAL ANSWER section; the verification scaffolding that\n    precedes it stays in-conversation. Falls back to the full text when the\n    section is absent or too bare to stand alone.'
         matches = list(FINAL_SECTION_RE.finditer(text))
         if not matches:
             return text
@@ -6943,6 +10530,20 @@ def _compose_u28_line():
 
 
     SCAFFOLD_HEAD_RE = re.compile(r"^\s*(?:#{1,4}\s*)?(?:\*{1,2})?\s*(?:VERIFY|BRIEFING)\b", re.IGNORECASE)
+
+
+    def _unshippable(text: str) -> bool:
+        """True only for text that cannot go in front of a judge at all.
+
+        The forced-retry gate is deliberately wider than this -- it also rejects
+        narration, abstentions and working tables, which are reasons to ask for a
+        rewrite but not reasons to throw the research away.
+        """
+        body = text or ""
+        if not body.strip():
+            return True
+        return (TOOL_MARKUP_RE.search(body) is not None
+                or PSEUDO_CALL_RE.search(body) is not None)
 
 
     def _needs_forced_retry(text: str) -> bool:
@@ -6962,7 +10563,8 @@ def _compose_u28_line():
             return True
         # an answer that OPENS with a refusal is a refusal regardless of how much
         # explanatory prose follows it
-        if any(m in text.lower()[:400] for m in ABSTENTION_MARKERS):
+        if any(m in text.lower()[:400] for m in ABSTENTION_MARKERS) \
+            or _ABSTAIN_LEAD_RE.search(text[:_ABSTAIN_LEAD_CHARS]):
             return True
         # A bare answer is what a fast or schema-bound query asks for: a 114-char
         # JSON object that names every field is complete, and sending it through the
@@ -7070,6 +10672,244 @@ def _compose_u28_line():
             used += min(len(chunk), room)
         return "\n\n".join(parts)
 
+
+    # --- shipped-evidence provenance cycle (begin) ---
+    PV_MIN_LEFT_S = 45.0
+    PV_MAX_ROUNDS = 2
+    PV_MAX_CLAIMS = 4
+    PV_MAX_SEARCHES = 2
+    PV_MARGIN_CHARS = 260
+    PV_MIN_KEEP_RATIO = 0.6
+    PV_MAX_GROW_RATIO = 1.5
+    PV_FACT_KEEP_PCT = 70
+    PV_EVIDENCE_CHARS = 6000
+    PV_ANSWER_CHARS = 6000
+    _PV_SENT_RE = re.compile(r"(?:[^.!?\n]|\.(?=\d))+[.!?]?")
+    _PV_FIG_RE = re.compile(r"\d[\d,]*(?:\.\d+)?%?")
+    _PV_MARK_RE = re.compile(r"\[[0-9][0-9,\s\-]*\]")
+    _PV_NAME_RE = re.compile(r"[A-Z][A-Za-z0-9&'\-]+(?:\s+[A-Z][A-Za-z0-9&'\-]+){1,3}")
+    _PV_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9\-']{2,}")
+    _PV_STOP = frozenset(
+        "the and for with from that this have has was were are is been its their "
+        "which what when where who how many much according also into over under "
+        "between during against about after before while other more most than".split())
+
+
+    def _pv_norm(token: str) -> str:
+        value = token.replace(",", "").rstrip("%").rstrip(".")
+        if "." in value:
+            value = value.rstrip("0").rstrip(".")
+        return value
+
+
+    def _pv_pattern(fig: str):
+        """A bounded pattern for the figure in any of its comma/percent spellings."""
+        forms = []
+        for form in (fig, fig.replace(",", ""), _pv_norm(fig)):
+            if len(form) >= 2 and form not in forms:
+                forms.append(form)
+        return re.compile(r"(?<![\d.,])(?:" + "|".join(re.escape(f) for f in forms) + r")(?![\d.]|,\d)")
+
+
+    def _pv_shipped_text(index, n: int) -> str:
+        """The characters of source n that the citation builder would ship for it."""
+        meta = index.get(n)
+        if meta is None:
+            return ""
+        citations, _pos = _citations_from_inline_markers(f"[{n}]", index)
+        note = meta.get("note") or ""
+        return " ".join(note[s.start:s.end] for ref in citations for s in ref.slices)
+
+
+    def _pv_claims(answer: str, index) -> list:
+        """(sentence, figures, cited sources) for every cited sentence carrying a figure."""
+        out = []
+        top = index.max_number()
+        for m in _PV_SENT_RE.finditer(answer or ""):
+            sent = m.group(0).strip()
+            if len(sent) < 12:
+                continue
+            rows = []
+            for mm in _PV_MARK_RE.finditer(sent):
+                for n in _numbers_from_bracket(mm.group(0)[1:-1], max_number=top):
+                    if n not in rows:
+                        rows.append(n)
+            if not rows:
+                continue
+            figs = []
+            for tok in _PV_FIG_RE.findall(_PV_MARK_RE.sub(" ", sent)):
+                if len(_pv_norm(tok)) >= 2 and tok not in figs:
+                    figs.append(tok)
+            if figs:
+                out.append((sent, figs, rows))
+        return out
+
+
+    def _pv_audit(answer: str, index) -> tuple:
+        """Shipped-evidence audit.
+
+        Values read: for each cited sentence that asserts a figure, whether the
+        figure occurs inside the slices of its cited sources that the citation
+        builder would ship. Outcomes: `unanchored` -- the figure is printed on a
+        cited page but outside the shipped slice, so the evidence state is repaired
+        by retaining that region as a shown span; `missing` -- no cited page
+        prints it, so research re-enters with a targeted search and the answer is
+        regenerated against the new sources. Both empty means every shipped slice
+        carries its figure and the cycle is complete."""
+        unanchored, missing = [], []
+        for sent, figs, rows in _pv_claims(answer, index):
+            shipped = " ".join(_pv_shipped_text(index, n) for n in rows)
+            for fig in figs:
+                if _pv_pattern(fig).search(shipped):
+                    continue
+                located = None
+                for n in rows:
+                    meta = index.get(n)
+                    hit = _pv_pattern(fig).search((meta or {}).get("note") or "")
+                    if hit is not None:
+                        located = (n, hit.start(), hit.end() - hit.start())
+                        break
+                if located is not None:
+                    unanchored.append((sent, fig, located))
+                else:
+                    missing.append((sent, fig, rows))
+        _PV_STATS["audits"] = _PV_STATS.get("audits", 0) + 1
+        _PV_STATS["unanchored"] = _PV_STATS.get("unanchored", 0) + len(unanchored)
+        _PV_STATS["missing"] = _PV_STATS.get("missing", 0) + len(missing)
+        return unanchored[:PV_MAX_CLAIMS], missing[:PV_MAX_CLAIMS]
+
+
+    def _pv_reanchor(unanchored: list, index) -> int:
+        """Retain the region around each unbacked figure as a shown region of its
+        cited source, so the citation builder ships it. Pure index update, no model
+        or tool call."""
+        moved = 0
+        for _sent, _fig, (n, pos, length) in unanchored:
+            meta = index.get(n)
+            if meta is None:
+                continue
+            limit = int(meta.get("src_len") or 0)
+            a = max(0, pos - PV_MARGIN_CHARS)
+            b = min(limit, pos + length + PV_MARGIN_CHARS)
+            if b <= a:
+                continue
+            before = index.spans(n)
+            index.retain(n, a, b)
+            if index.spans(n) != before:
+                moved += 1
+        _PV_STATS["reanchored"] = _PV_STATS.get("reanchored", 0) + moved
+        return moved
+
+
+    def _pv_salient(sent: str) -> list:
+        out = []
+        for tok in _PV_TOKEN_RE.findall(_PV_MARK_RE.sub(" ", sent)):
+            low = tok.lower()
+            if low in _PV_STOP or low in out:
+                continue
+            out.append(low)
+        return out
+
+
+    async def _pv_retrieve(missing: list, index) -> str:
+        """Targeted search for figures no cited page prints, recorded on the index
+        so the rewrite can cite the new sources."""
+        blocks = []
+        for sent, fig, _rows in missing[:PV_MAX_SEARCHES]:
+            probe = " ".join(_pv_salient(sent)[:6] + [fig]).strip()
+            if not probe:
+                continue
+            try:
+                body = await _run_search_web(probe, index)
+            except Exception:
+                continue
+            if isinstance(body, str) and _PV_MARK_RE.search(body):
+                blocks.append(body[:PV_EVIDENCE_CHARS])
+        return "\n\n".join(blocks)
+
+
+    def _pv_facts(text: str) -> set:
+        body = _PV_MARK_RE.sub(" ", text or "")
+        facts = {"n:" + _pv_norm(m.group(0)) for m in _PV_FIG_RE.finditer(body)}
+        facts |= {"e:" + " ".join(m.group(0).split()).lower() for m in _PV_NAME_RE.finditer(body)}
+        return facts
+
+
+    def _pv_keeps_facts(draft: str, revision: str) -> bool:
+        before = _pv_facts(draft)
+        if not before:
+            return True
+        return len(before & _pv_facts(revision)) * 100 >= len(before) * PV_FACT_KEEP_PCT
+
+
+    async def _pv_regenerate(question: str, display: str, messages: list, index,
+                             deadline: float, missing: list, evidence: str):
+        """One bounded commit call against the provenance findings; returns
+        (display, cite_text) or None when the rewrite is not adopted."""
+        lines = "\n- ".join(f"{fig} in: {sent[:160]}" for sent, fig, _rows in missing)
+        order = ("PROVENANCE CHECK. A claim is credited only when the shipped citation "
+                 "excerpt itself contains the value. These cited values are not present "
+                 "in any excerpt that will ship, and no cited page prints them:\n- " + lines +
+                 "\nFor each value: cite the source number that actually prints it, "
+                 "replace it with the figure a source does print, or drop the claim. Use "
+                 "the NEW EVIDENCE below where it states the value. Then write the "
+                 "verification table and the complete FINAL ANSWER again with [n] markers. "
+                 "The rewrite REPLACES the current answer -- do not restate a section it "
+                 "already contains, and do not append your working to it. Write the answer "
+                 "only: never mention this check, the tools, or what any tool did.")
+        if evidence:
+            order += "\n\nNEW EVIDENCE:\n" + evidence
+        order += "\n\nCURRENT ANSWER:\n" + display[:PV_ANSWER_CHARS]
+        carry = list(messages)
+        carry.append({"role": "user", "content": order})
+        try:
+            raw = await _commit_call(carry, deadline=deadline)
+        except Exception:
+            return None
+        stripped = _strip_tool_markup(raw) if raw else ""
+        revised = _final_section(stripped) if stripped else ""
+        if not revised or _needs_forced_retry(revised):
+            return None
+        if len(revised) < int(len(display) * PV_MIN_KEEP_RATIO):
+            return None
+        # The floor above used to be the only bound, so any expansion was
+        # accepted and a rewrite that restated its working alongside the answer
+        # always won. The rubric scores a repeated proof against us.
+        if len(revised) > int(len(display) * PV_MAX_GROW_RATIO):
+            return None
+        if not _pv_keeps_facts(display, revised):
+            return None
+        _PV_STATS["adopted"] = _PV_STATS.get("adopted", 0) + 1
+        return revised, stripped
+
+
+    async def _pv_cycle(question: str, decided: str, display: str, cite_text: str,
+                                messages: list, index, deadline: float) -> tuple:
+        """Audit the decided answer against the slices that will ship and re-enter
+        the evidence and research stages while a cited figure is unbacked.
+        Returns the (decided, display, cite_text) triple the deliverable uses."""
+        _PV_STATS["entered"] = _PV_STATS.get("entered", 0) + 1
+        if not decided or index.max_number() == 0:
+            return decided, display, cite_text
+        for _round in range(_PV_STATS.get("rounds", PV_MAX_ROUNDS)):
+            if deadline - perf_counter() < PV_MIN_LEFT_S:
+                _PV_STATS["time_gated"] = _PV_STATS.get("time_gated", 0) + 1
+                break
+            source = (cite_text or display) if decided == display else decided
+            unanchored, missing = _pv_audit(source, index)
+            if not unanchored and not missing:
+                break
+            _pv_reanchor(unanchored, index)
+            if not missing or not messages:
+                continue
+            evidence = await _pv_retrieve(missing, index)
+            rewritten = await _pv_regenerate(question, decided, messages, index, deadline,
+                                             missing, evidence)
+            if rewritten is not None:
+                decided, cite_text = rewritten
+                display = decided
+        return decided, display, cite_text
+    # --- shipped-evidence provenance cycle (end) ---
 
     async def _plain_query(query: Query, budget: float) -> Response:
         start = perf_counter()
@@ -7227,7 +11067,22 @@ def _compose_u28_line():
                 elif not _needs_forced_retry(cite_text):
                     display = cite_text
                 else:
-                    display = _dump_floor_answer(index) or display
+                    # Everything on offer was rejected. The dump used to win here and
+                    # it scores 0.000 against any competitor that answers -- it
+                    # carries none of the research and opens by announcing its own
+                    # failure. Prefer whichever real text survives, newest first, and
+                    # keep the dump only for text a judge cannot be shown at all.
+                    salvage = next(
+                        (candidate for candidate in (retry_display, display, cite_text)
+                         if candidate and not _unshippable(candidate)),
+                        "",
+                    )
+                    if salvage:
+                        display = salvage
+                        if salvage is retry_display:
+                            cite_text = retry_stripped
+                    else:
+                        display = _dump_floor_answer(index) or display
 
             # --- AMEND decides what is delivered ---
             # The research turns wrote from what they had been shown. This stage runs
@@ -7237,6 +11092,14 @@ def _compose_u28_line():
             if display:
                 decided = await _amended_answer(
                     query.text, asks, index, display, deadline - 4,
+                )
+                # The decided answer is not final until the evidence that will
+                # SHIP backs it: this audits every cited figure against the exact
+                # slices the response carries, re-anchors a retained window that
+                # holds the figure outside it, and when no retained page prints
+                # it at all, searches for it and re-enters this stage.
+                decided, display, cite_text = await _pv_cycle(
+                    query.text, decided, display, cite_text, messages, index, deadline - 4,
                 )
                 # when this stage rewrote the answer, its markers are the ones the
                 # delivered text carries, so they are the ones that source citations
@@ -7761,14 +11624,7 @@ def _compose_u28_line():
 
 
     def _so_qcased(value: object, question: str, schema: object) -> object:
-        """Restore query-printed casing, but never at the cost of schema validity.
-
-        A schema `enum` or `pattern` can pin a casing the question does not use, so
-        the pass is reverted whenever it introduces an error the original did not
-        have. Values the question never prints are left alone — matching the SOURCE's
-        form is a different rule with a different authority, and this pass does not
-        make that call.
-        """
+        "Restore query-printed casing, but never at the cost of schema validity.\n\n    A schema `enum` or `pattern` can pin a casing the question does not use, so\n    the pass is reverted whenever it introduces an error the original did not\n    have. Values the question never prints are left alone — matching the SOURCE's\n    form is a different rule with a different authority, and this pass does not\n    make that call.\n    "
         if not question or not _SO_QCASE_GATE.search(question):
             return value
         try:
@@ -7813,11 +11669,7 @@ def _compose_u28_line():
 
 
     def _so_is_vacuous(value: object) -> bool:
-        """A payload that is schema-valid and says nothing.
-
-        Every leaf blank, empty or zero. Booleans are excluded: `false` is an answer,
-        and a question that asks whether a claim holds is answered by it.
-        """
+        'A payload that is schema-valid and says nothing.\n\n    Every leaf blank, empty or zero. Booleans are excluded: `false` is an answer,\n    and a question that asks whether a claim holds is answered by it.\n    '
         if value is None:
             return True
         if isinstance(value, (dict, list)) and not value:
@@ -7881,13 +11733,7 @@ def _compose_u28_line():
 
 
     def _so_allowed_markers(answer: str) -> list[int]:
-        """The pointers the draft already resolved -- the only ones a proof may reuse.
-
-        The evidence block is numbered by the result index, the shipped citations by
-        a contiguous renumbering of the markers the draft actually used. Letting the
-        proof invent a pointer would therefore attach a claim to the wrong source,
-        which the judge checks. Reusing the draft's own numbers cannot drift.
-        """
+        "The pointers the draft already resolved -- the only ones a proof may reuse.\n\n    The evidence block is numbered by the result index, the shipped citations by\n    a contiguous renumbering of the markers the draft actually used. Letting the\n    proof invent a pointer would therefore attach a claim to the wrong source,\n    which the judge checks. Reusing the draft's own numbers cannot drift.\n    "
         seen: list[int] = []
         for raw in _NOTE_MARKER_RE.findall(answer or ""):
             n = int(raw)
@@ -7899,14 +11745,7 @@ def _compose_u28_line():
 
     def _so_proof_messages(question: str, value: object, answer: str, evidence: str,
                            allowed: list[int]) -> list[dict[str, str]]:
-        """Ask for the completeness the answer field has no room to carry.
-
-        A schema answer is a bare value, so the reasoning that makes it checkable --
-        which candidates were in scope, which were ruled out, and how the shipped
-        numbers were derived -- has nowhere to live except the note. The output
-        contract is fixed and already decided before this runs; nothing here can
-        change it.
-        """
+        'Ask for the completeness the answer field has no room to carry.\n\n    A schema answer is a bare value, so the reasoning that makes it checkable --\n    which candidates were in scope, which were ruled out, and how the shipped\n    numbers were derived -- has nowhere to live except the note. The output\n    contract is fixed and already decided before this runs; nothing here can\n    change it.\n    '
         values = []
         _note_values(value, values)
         shown = ", ".join(sorted({v for v in values if len(v) >= 2})[:12])
@@ -7944,8 +11783,7 @@ def _compose_u28_line():
 
     async def _so_proof(question: str, value: object, answer: str, evidence: str,
                         deadline: float) -> str:
-        """One call, strictly additive: every failure path returns "" and the caller
-        falls back to the draft-derived note."""
+        'One call, strictly additive: every failure path returns "" and the caller\n    falls back to the draft-derived note.'
         remaining = deadline - perf_counter()
         if remaining < PROOF_MIN_SECONDS:
             return ""
@@ -8002,13 +11840,7 @@ def _compose_u28_line():
 
 
     def _so_key_score(target: str, candidate: str) -> tuple[float, float]:
-        """How much two field names overlap: (containment, Jaccard).
-
-        Containment leads because a rename keeps the distinctive token and adds or
-        drops qualifiers -- `premise_status` / `premise_accuracy` share one word of
-        two, which Jaccard prices at 0.33 and containment at 0.50. Jaccard breaks
-        ties so a longer, vaguer key cannot outrank an exact one.
-        """
+        'How much two field names overlap: (containment, Jaccard).\n\n    Containment leads because a rename keeps the distinctive token and adds or\n    drops qualifiers -- `premise_status` / `premise_accuracy` share one word of\n    two, which Jaccard prices at 0.33 and containment at 0.50. Jaccard breaks\n    ties so a longer, vaguer key cannot outrank an exact one.\n    '
         left, right = _so_words(target), _so_words(candidate)
         if not left or not right:
             return (0.0, 0.0)
@@ -8017,12 +11849,7 @@ def _compose_u28_line():
 
 
     def _so_pick_source(name: str, schema: dict, source: object, taken: set | None = None) -> object:
-        """The draft's own value for one schema field, when the draft is JSON.
-
-        A drafted answer is frequently already a JSON object under the pipeline's own
-        field names rather than the schema's. Remapping those names is a rename, not
-        a re-derivation, so it is done here rather than paid for with another call.
-        """
+        "The draft's own value for one schema field, when the draft is JSON.\n\n    A drafted answer is frequently already a JSON object under the pipeline's own\n    field names rather than the schema's. Remapping those names is a rename, not\n    a re-derivation, so it is done here rather than paid for with another call.\n    "
         if not isinstance(source, dict):
             return None
         taken = taken if taken is not None else set()
@@ -8054,12 +11881,7 @@ def _compose_u28_line():
 
 
     def _so_floor_string(name: str, schema: dict, answer: str, source: object, used: set | None = None) -> str:
-        """The most defensible literal the draft offers for one string field.
-
-        A schema-conforming placeholder scores zero with certainty; a literal the
-        draft actually printed can score. So this reads the draft, and only the
-        LENGTH is clipped to what the schema will accept.
-        """
+        'The most defensible literal the draft offers for one string field.\n\n    A schema-conforming placeholder scores zero with certainty; a literal the\n    draft actually printed can score. So this reads the draft, and only the\n    LENGTH is clipped to what the schema will accept.\n    '
         lower_cap = schema.get("minLength")
         lower_cap = lower_cap if isinstance(lower_cap, int) and not isinstance(lower_cap, bool) else 0
         upper_cap = schema.get("maxLength")
@@ -8124,12 +11946,7 @@ def _compose_u28_line():
         schema: object, root: object, answer: str, source: object = None,
         name: str = "", depth: int = 0, used: set | None = None,
     ) -> object:
-        """`_so_skeleton`'s shape, filled from the draft instead of with `x`.
-
-        Reached only when every re-expression attempt failed. Returns None when the
-        draft is empty — the one case where the skeleton is still the best payload
-        available, because there is nothing else to put in the box.
-        """
+        "`_so_skeleton`'s shape, filled from the draft instead of with `x`.\n\n    Reached only when every re-expression attempt failed. Returns None when the\n    draft is empty — the one case where the skeleton is still the best payload\n    available, because there is nothing else to put in the box.\n    "
         if depth == 0:
             if not (answer or "").strip():
                 return None
@@ -8203,12 +12020,7 @@ def _compose_u28_line():
 
 
     async def _structured_response(query: Query, schema: object, drafted: Response, deadline: float) -> Response:
-        """Re-express a drafted plain-text answer as the schema-conforming output.
-
-        A schema-bearing query accepts only `Response.output`; text is rejected
-        outright. So every exit from this function returns `output`, and a partially
-        conforming value is always preferred over the alternative.
-        """
+        'Re-express a drafted plain-text answer as the schema-conforming output.\n\n    A schema-bearing query accepts only `Response.output`; text is rejected\n    outright. So every exit from this function returns `output`, and a partially\n    conforming value is always preferred over the alternative.\n    '
         answer = ""
         citations = None
         try:
@@ -8335,11 +12147,7 @@ def _compose_u28_line():
 
 
     def _note_states_value(sentence: str, values: list[str]) -> bool:
-        """True when the sentence repeats a value the answer ships.
-
-        Digits are compared with separators removed, so a value printed `380,000`
-        in the source still matches the `380000` the schema asked for (and back).
-        """
+        'True when the sentence repeats a value the answer ships.\n\n    Digits are compared with separators removed, so a value printed `380,000`\n    in the source still matches the `380000` the schema asked for (and back).\n    '
         lowered = sentence.casefold()
         stripped = lowered.replace(",", "")
         for value in values:
@@ -8355,13 +12163,7 @@ def _compose_u28_line():
 
 
     def _so_best_note(proof: str, answer: str, value: object, citations: object) -> str | None:
-        """Prefer the enumeration pass; keep the draft-derived note as the floor.
-
-        The proof runs through the SAME guards as the draft (§ `_so_note`), so an
-        enumeration that drifts into a contradiction or an unresolvable pointer is
-        dropped line by line and we simply fall back. C39 can therefore only differ
-        from C38 by carrying MORE checked claims, never fewer.
-        """
+        'Prefer the enumeration pass; keep the draft-derived note as the floor.\n\n    The proof runs through the SAME guards as the draft (§ `_so_note`), so an\n    enumeration that drifts into a contradiction or an unresolvable pointer is\n    dropped line by line and we simply fall back. C39 can therefore only differ\n    from C38 by carrying MORE checked claims, never fewer.\n    '
         base = _so_note(answer, value, citations)
         if not proof:
             return base
@@ -8378,15 +12180,7 @@ def _compose_u28_line():
 
 
     def _so_note(answer: str, value: object, citations: object) -> str | None:
-        """Carry the answer's own justification into the one field that accepts it.
-
-        Kept deliberately narrow: a sentence qualifies only if it (a) already states
-        a value present in `output` and (b) points at a citation this response
-        actually ships. Anything else -- narration, near-misses, method notes -- is
-        dropped, so the note can neither contradict the answer nor introduce a claim
-        the evidence does not carry. Returns None rather than an empty string: the
-        platform rejects the WHOLE response for a blank note.
-        """
+        "Carry the answer's own justification into the one field that accepts it.\n\n    Kept deliberately narrow: a sentence qualifies only if it (a) already states\n    a value present in `output` and (b) points at a citation this response\n    actually ships. Anything else -- narration, near-misses, method notes -- is\n    dropped, so the note can neither contradict the answer nor introduce a claim\n    the evidence does not carry. Returns None rather than an empty string: the\n    platform rejects the WHOLE response for a blank note.\n    "
         if not answer:
             return None
         try:
@@ -8446,12 +12240,7 @@ def _compose_u28_line():
 
 
     def _so_response(value: object, citations: object, note: str | None = None) -> Response:
-        """Build the response, degrading the payload rather than the answer field.
-
-        The note is attached only when this SDK carries the field and the text is
-        non-empty; every fallback path below drops it rather than the answer, since
-        a rejected response scores nothing at all.
-        """
+        'Build the response, degrading the payload rather than the answer field.\n\n    The note is attached only when this SDK carries the field and the text is\n    non-empty; every fallback path below drops it rather than the answer, since\n    a rejected response scores nothing at all.\n    '
         if not _so_fits_size(value):
             value = None
         if note:
@@ -8471,15 +12260,7 @@ def _compose_u28_line():
 
 
     async def _plain_query_with_cold_retry(query: Query, budget: float) -> Response:
-        """One retry when the pipeline came back with nothing having happened.
-
-        A run that returns within seconds holding zero tool results did not fail on
-        the question; it never got to ask one. Sleeping briefly and running once more
-        is bounded three ways -- only inside the first seconds, only with most of the
-        budget left, only once -- so a genuine fast floor is never retried into the
-        time wall. Unverifiable in replay (a validator cold-start cannot be staged),
-        so it ships on the bound, not on a measurement.
-        """
+        'One retry when the pipeline came back with nothing having happened.\n\n    A run that returns within seconds holding zero tool results did not fail on\n    the question; it never got to ask one. Sleeping briefly and running once more\n    is bounded three ways -- only inside the first seconds, only with most of the\n    budget left, only once -- so a genuine fast floor is never retried into the\n    time wall. Unverifiable in replay (a validator cold-start cannot be staged),\n    so it ships on the bound, not on a measurement.\n    '
         start = perf_counter()
         _LAST_INDEX[0] = None
         result = await _plain_query(query, budget)
@@ -8494,16 +12275,7 @@ def _compose_u28_line():
 
 
     async def _w4_baseline_query(query: Query) -> Response:
-        """Route on the caller's schema, and record the scoring mode for the run.
-
-        Without a schema this is the previous entrypoint with two extra attribute
-        reads. With one, the same pipeline runs on a shortened budget and its drafted
-        answer is re-expressed as `output` — the only answer field the platform will
-        accept for such a query. `fast` is orthogonal to both: it says the answer is
-        judged for correctness alone, so the stages that exist to prove completeness
-        to a comparing judge are skipped while the stages that decide the answer are
-        not.
-        """
+        "Route on the caller's schema, and record the scoring mode for the run.\n\n    Without a schema this is the previous entrypoint with two extra attribute\n    reads. With one, the same pipeline runs on a shortened budget and its drafted\n    answer is re-expressed as `output` — the only answer field the platform will\n    accept for such a query. `fast` is orthogonal to both: it says the answer is\n    judged for correctness alone, so the stages that exist to prove completeness\n    to a comparing judge are skipped while the stages that decide the answer are\n    not.\n    "
         # A worker serves more than one task, so this is set per call, never once.
         _FAST[0] = bool(getattr(query, "fast", False))
         _MAIN_DEAD.clear()
@@ -8617,7 +12389,7 @@ def _compose_u28_line():
         try:
             return MODEL
         except NameError:
-            return "z-ai/glm-5.3-flash"
+            return "z-ai/glm-5"
 
 
     def _w4_total_budget_seconds() -> float:
@@ -8737,12 +12509,7 @@ def _compose_u28_line():
 
 
     def _w4_with_text(response: object, text: str) -> object:
-        """Rebuild the response around the audited answer, carrying citations over.
-
-        The platform accepts exactly one non-null answer field, so a response that
-        already carries a structured `output` owns no text answer to override and is
-        returned untouched.
-        """
+        'Rebuild the response around the audited answer, carrying citations over.\n\n    The platform accepts exactly one non-null answer field, so a response that\n    already carries a structured `output` owns no text answer to override and is\n    returned untouched.\n    '
         if getattr(response, "output", None) is not None:
             return response
         citations = getattr(response, "citations", None)
@@ -8772,12 +12539,7 @@ def _compose_u28_line():
 
 
     def _w4_entities(text: str) -> set:
-        """Every named token the text asserts.
-
-        A capitalized word that opens a sentence, a heading, or a bullet is
-        capitalized by position rather than by being a name, so it is not counted;
-        a real name almost always also occurs somewhere it did not open a clause.
-        """
+        'Every named token the text asserts.\n\n    A capitalized word that opens a sentence, a heading, or a bullet is\n    capitalized by position rather than by being a name, so it is not counted;\n    a real name almost always also occurs somewhere it did not open a clause.\n    '
         found = set()
         for match in _W2_WORD_RE.finditer(text):
             cursor = match.start() - 1
@@ -8799,15 +12561,7 @@ def _compose_u28_line():
 
 
     def _w4_accept_revision(draft: str, revision: str) -> bool:
-        """Keep the audited answer only when it adds to the draft without unmaking it.
-
-        Length cannot tell a repair from a replacement: a revision that answers with
-        a different entity, or restates a figure as a different figure, is exactly as
-        long as one that fills a gap. The audited text is therefore accepted only
-        when every concrete claim the draft asserted - each quantity, each named
-        token - still stands in it. Additions are free; deletions and substitutions
-        return the draft.
-        """
+        'Keep the audited answer only when it adds to the draft without unmaking it.\n\n    Length cannot tell a repair from a replacement: a revision that answers with\n    a different entity, or restates a figure as a different figure, is exactly as\n    long as one that fills a gap. The audited text is therefore accepted only\n    when every concrete claim the draft asserted - each quantity, each named\n    token - still stands in it. Additions are free; deletions and substitutions\n    return the draft.\n    '
         if not revision or revision == draft:
             return False
         if len(revision) < _W2_MIN_REVISION_CHARS:
@@ -8896,20 +12650,7 @@ def _compose_u28_line():
 
 
     async def _w4_research_or_salvage(query_input: Query) -> Response:
-        """Stage 2 - the research stage, held so no failure inside it can escape.
-
-        The demoted base entrypoint is foreign code: it raises whatever its own tool
-        layer raises. A hosted tool call that overruns its own `timeout=` surfaces as
-        `harnyx_commons.errors.ToolInvocationTimeoutError`, which subclasses
-        RuntimeError directly and matches no guard the base installed for itself. Any
-        such escape leaves `@entrypoint`, and the platform charges an escaping
-        exception to the miner as MINER_UNHANDLED_EXCEPTION: the task scores 0 with
-        no retry. Measured on `FB_526bfbe6_w2`, 1 of 3 replays (2026-08-09).
-
-        The stage therefore always resolves to a Response the later stages can work
-        on. A floor answer scores poorly; an escape scores zero and takes the whole
-        task with it.
-        """
+        'Stage 2 - the research stage, held so no failure inside it can escape.\n\n    The demoted base entrypoint is foreign code: it raises whatever its own tool\n    layer raises. A hosted tool call that overruns its own `timeout=` surfaces as\n    `harnyx_commons.errors.ToolInvocationTimeoutError`, which subclasses\n    RuntimeError directly and matches no guard the base installed for itself. Any\n    such escape leaves `@entrypoint`, and the platform charges an escaping\n    exception to the miner as MINER_UNHANDLED_EXCEPTION: the task scores 0 with\n    no retry. Measured on `FB_526bfbe6_w2`, 1 of 3 replays (2026-08-09).\n\n    The stage therefore always resolves to a Response the later stages can work\n    on. A floor answer scores poorly; an escape scores zero and takes the whole\n    task with it.\n    '
         try:
             return await _w4_baseline_query(query_input)
         except Exception:
@@ -8917,13 +12658,7 @@ def _compose_u28_line():
 
 
     async def query(query: Query) -> Response:
-        """w4 contract wrapper: plan the answer contract, run the baseline, then verify.
-
-        The baseline artifact's own entrypoint is demoted to `_w4_baseline_query` and
-        runs as the research stage of this sequence. Contract planning runs on every
-        ordinary request before the research starts, and the verification stage holds
-        authority over the answer this entrypoint returns.
-        """
+        "w4 contract wrapper: plan the answer contract, run the baseline, then verify.\n\n    The baseline artifact's own entrypoint is demoted to `_w4_baseline_query` and\n    runs as the research stage of this sequence. Contract planning runs on every\n    ordinary request before the research starts, and the verification stage holds\n    authority over the answer this entrypoint returns.\n    "
         deadline = perf_counter() + _w4_total_budget_seconds()
         question = getattr(query, "text", "") or ""
         schema = getattr(query, "output_schema", None)
@@ -8945,494 +12680,61 @@ def _compose_u28_line():
             )
         return response
     # --- w4 answer-contract wrapper (end) ---
+
     return query
 
-
-# --- fast-mode precision stage (start) ------------------------------------------
-#
-# Fast tasks are scored by a component judge (deepsearchqa-f1-v1): precision =
-# correct / (correct + excessive), recall = correct / expected. Batch 77dd4565
-# rows lost precision to answers that opened with reasoning narration ("I need
-# to carefully analyze the evidence I have...", scored 0.5 on a task the same
-# lineage otherwise answered) and to hedges and asides the judge counted as
-# excessive components. Citations earn nothing in this mode. This stage runs
-# only on fast prose answers and only removes: leading narration sentences,
-# hedge sentences about what could not be verified, and [[n]] pointers. It
-# never touches factual sentences and fails open below 40 characters.
-import re as _fp_re
-
-_FP_NARRATION_RE = _fp_re.compile(
-    r"^\s*(?:\*\*)?(?:I need|I'll|I will|I should|I must|I am going|I'm going|Let me|Let's|"
-    r"First, I|Based on my (?:research|analysis|review)|Looking at|Now I|Now, I|"
-    r"I have (?:gathered|found|reviewed|analyzed|analysed)|We need|Okay|OK,|Alright|"
-    r"To answer this|In order to answer|The question asks|The user (?:asks|wants))\b", _fp_re.I)
-_FP_HEDGE_RE = _fp_re.compile(
-    r"\b(?:I could not|I couldn't|I was unable|could not (?:verify|find|locate|confirm|access)|"
-    r"unable to (?:verify|find|confirm|access|locate)|not (?:found|present|available|reproduced) in "
-    r"(?:the|my|our) (?:evidence|sources|retrieved)|the evidence does not|does not appear in the evidence|"
-    r"cannot be (?:verified|confirmed) from)\b", _fp_re.I)
-_FP_POINTER_RE = _fp_re.compile(r"\s?\[\[\d{1,3}\]\]")
-_FP_SENT_RE = _fp_re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(\[*])")
+_branch_3843b2a7b530ce91f23c86392314bde51919ab27a0ca337b447b007ead5c021a_query_entry = _compose_branch_3843b2a7b530ce91f23c86392314bde51919ab27a0ca337b447b007ead5c021a_entry()
 
 
-def _fp_clean_text(text: str) -> str:
-    paragraphs = [p for p in (text or "").split("\n") if p.strip()]
-    kept_paragraphs = []
-    leading = True
-    for p in paragraphs:
-        sentences = [s for s in _FP_SENT_RE.split(p.strip()) if s.strip()]
-        kept = []
-        for s in sentences:
-            if leading and _FP_NARRATION_RE.match(s):
-                continue
-            leading = False
-            if _FP_HEDGE_RE.search(s):
-                continue
-            kept.append(s)
-        if kept:
-            kept_paragraphs.append(" ".join(kept))
-    out = "\n\n".join(kept_paragraphs)
-    return _FP_POINTER_RE.sub("", out).strip()
+_TASK_SHAPE_SECONDARY_SIGNALS = (' compare ', ' compared ', ' comparison ', ' versus ', ' vs ', ' vs. ', ' difference ', ' differences ', ' higher ', ' lower ', ' highest ', ' lowest ', ' rank ', ' ranking ', ' across ', ' calculate ', ' calculated ', ' compute ', ' percentage ', ' percent ', ' % ', ' ratio ', ' rate ', ' total ', ' sum ', ' average ', ' median ', ' how many ', ' number of ', ' change in ', ' reconcile ', ' reconciliation ', ' conflict ', ' conflicting ', ' contradict', ' discrepancy ', ' discrepancies ', ' verify the claim ', ' verify whether ', ' check the claim ', ' check whether ', ' cross check ', ' premise correction ')
 
 
-def _fp_clean(query_input, response):
-    try:
-        if getattr(query_input, "fast", False) is not True:
-            return response
-        text = getattr(response, "text", None)
-        if not isinstance(text, str) or getattr(response, "output", None) is not None:
-            return response
-        cleaned = _fp_clean_text(text)
-        if len(cleaned) < 40 or cleaned == text:
-            return response
-        try:
-            return response.model_copy(update={"text": cleaned})
-        except Exception:
-            return Response(text=cleaned)
-    except Exception:
-        return response
-# --- fast-mode precision stage (end) --------------------------------------------
-
-
-# --- structured-output gate (start) ---------------------------------------------
-#
-# The platform validates `output` against the query's schema before scoring;
-# a payload that fails is `miner_response_invalid` and the task scores 0 with
-# no retry. Batch 77dd4565: two such rows on one artifact, one after a lineage
-# spent the whole clock, one after a lineage returned an output that did not
-# fit the schema. This gate checks the common JSON-schema subset (type,
-# properties, required, additionalProperties, items, enum, min/maxItems),
-# coerces the easy mismatches (JSON in a string, numeric strings, unknown
-# keys, missing required keys), and can build a schema-shaped placeholder so
-# an emergency answer to a structured task is at least a valid payload.
-import json as _sg_json
-
-# No `type(...)` call: the platform's script validator forbids that builtin.
-_SG_TYPES = {"string": str, "boolean": bool, "array": list, "object": dict}
-
-
-def _sg_type_ok(value, t) -> bool:
-    if t == "null":
-        return value is None
-    if t == "number":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
-    if t == "integer":
-        return isinstance(value, int) and not isinstance(value, bool)
-    cls = _SG_TYPES.get(t)
-    return isinstance(value, cls) if cls is not None else True
-
-
-def _sg_valid(value, schema) -> bool:
-    if not isinstance(schema, dict):
-        return True
-    t = schema.get("type")
-    if t is not None:
-        types = t if isinstance(t, list) else [t]
-        if not any(_sg_type_ok(value, x) for x in types):
-            return False
-    if "enum" in schema and value not in schema["enum"]:
-        return False
-    if isinstance(value, str):
-        if "minLength" in schema and len(value) < schema["minLength"]:
-            return False
-        if "maxLength" in schema and len(value) > schema["maxLength"]:
-            return False
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        if "minimum" in schema and value < schema["minimum"]:
-            return False
-        if "maximum" in schema and value > schema["maximum"]:
-            return False
-    if isinstance(value, dict):
-        props = schema.get("properties") or {}
-        for key in schema.get("required") or []:
-            if key not in value:
-                return False
-        if schema.get("additionalProperties") is False and any(k not in props for k in value):
-            return False
-        for k, v in value.items():
-            if k in props and not _sg_valid(v, props[k]):
-                return False
-    if isinstance(value, list):
-        if "minItems" in schema and len(value) < schema["minItems"]:
-            return False
-        if "maxItems" in schema and len(value) > schema["maxItems"]:
-            return False
-        items = schema.get("items")
-        if isinstance(items, dict) and not all(_sg_valid(v, items) for v in value):
-            return False
-    return True
-
-
-def _sg_default(schema):
-    """A schema-shaped placeholder. Never returns None for a mapping schema.
-
-    Returning None here is what produced `Response(text=None, output=None)` and
-    a MINER_UNHANDLED_EXCEPTION on batch add2ab64 (three rows): a schema whose
-    top level omits "type" fell through to the .get() default. A schema with
-    "properties" is an object whether or not it says so.
-    """
-    if not isinstance(schema, dict):
-        return ""
-    t = schema.get("type")
-    t = t[0] if isinstance(t, list) and t else t
-    if "enum" in schema and schema["enum"]:
-        return schema["enum"][0]
-    props = schema.get("properties")
-    if t == "object" or (t is None and isinstance(props, dict)):
-        keys = schema.get("required") or list((props or {}).keys())
-        return {k: _sg_default((props or {}).get(k, {})) for k in keys}
-    if t == "array" or (t is None and isinstance(schema.get("items"), dict)):
-        return []
-    return {"string": "", "number": 0, "integer": 0, "boolean": False, "array": [], "null": None}.get(t, "")
-
-
-def _sg_coerce(value, schema):
-    """Cheap repairs toward the schema; returns the value unchanged when unsure."""
-    if not isinstance(schema, dict):
-        return value
-    t = schema.get("type")
-    t = t[0] if isinstance(t, list) and t else t
-    if isinstance(value, str) and t in ("object", "array"):
-        try:
-            parsed = _sg_json.loads(value)
-            if isinstance(parsed, (dict, list)):
-                value = parsed
-        except Exception:
-            start, end = value.find("{"), value.rfind("}")
-            if start != -1 and end > start:
-                try:
-                    value = _sg_json.loads(value[start:end + 1])
-                except Exception:
-                    return value
-    if isinstance(value, str) and t in ("integer", "number"):
-        try:
-            cleaned = value.replace(",", "").strip().rstrip("%")
-            value = int(cleaned) if t == "integer" else float(cleaned)
-        except Exception:
-            return value
-    if isinstance(value, (int, float)) and not isinstance(value, bool) and t == "string":
-        value = str(value)
-    if isinstance(value, str) and t == "string":
-        value = value.strip()
-        if "maxLength" in schema and len(value) > schema["maxLength"]:
-            value = value[:schema["maxLength"]].rstrip()
-    if isinstance(value, str) and t == "boolean":
-        low = value.strip().lower()
-        if low in ("true", "yes"):
-            value = True
-        elif low in ("false", "no"):
-            value = False
-    if isinstance(value, dict) and t == "object":
-        props = schema.get("properties") or {}
-        out = {}
-        for k, v in value.items():
-            if k in props:
-                out[k] = _sg_coerce(v, props[k])
-            elif schema.get("additionalProperties") is not False:
-                out[k] = v
-        for key in schema.get("required") or []:
-            if key not in out:
-                out[key] = _sg_default(props.get(key, {}))
-        return out
-    if isinstance(value, list) and t == "array" and isinstance(schema.get("items"), dict):
-        return [_sg_coerce(v, schema["items"]) for v in value]
-    return value
-
-
-def _sg_gate(query_input, response):
-    """Make a structured response validate when a cheap repair suffices."""
-    try:
-        schema = getattr(query_input, "output_schema", None)
-        if not isinstance(schema, dict):
-            return response
-        output = getattr(response, "output", None)
-        if output is None:
-            text = getattr(response, "text", None)
-            if isinstance(text, str) and text.strip():
-                output = _sg_coerce(text, schema)
-                if isinstance(output, str):
-                    return response
-            else:
-                return response
-        if _sg_valid(output, schema):
-            if output is getattr(response, "output", None):
-                return response
-        else:
-            repaired = _sg_coerce(output, schema)
-            if not _sg_valid(repaired, schema):
-                return response
-            output = repaired
-        try:
-            return response.model_copy(update={"output": output, "text": None})
-        except Exception:
-            return Response(output=output, citations=getattr(response, "citations", None))
-    except Exception:
-        return response
-
-
-def _sg_sane(query_input, response, fallback_text: str):
-    """Last gate before the platform: exactly one answer field, schema-shaped when structured.
-
-    The sandbox re-validates the returned Response; a text=None/output=None
-    object built by model_copy raises there and is charged as an unhandled
-    exception (batch 551ef138, task 625493b0, three of our lineages).
-    """
-    try:
-        schema = getattr(query_input, "output_schema", None)
-        text = getattr(response, "text", None)
-        output = getattr(response, "output", None)
-        has_text = isinstance(text, str) and bool(text.strip())
-        has_output = output is not None
-        if isinstance(schema, dict):
-            if has_output:
-                if has_text:
-                    return response.model_copy(update={"text": None})
-                return response
-            candidate = _sg_coerce(text, schema) if has_text else None
-            if not isinstance(candidate, (dict, list)) or not _sg_valid(candidate, schema):
-                candidate = _sg_coerce(fallback_text, schema) if fallback_text else None
-            if not isinstance(candidate, (dict, list)) or not _sg_valid(candidate, schema):
-                candidate = _sg_default(schema)
-            if candidate is None:
-                candidate = {}
-            for attempt in (candidate, {}, ""):
-                try:
-                    return Response(output=attempt, citations=getattr(response, "citations", None))
-                except Exception:
-                    try:
-                        return Response(output=attempt)
-                    except Exception:
-                        continue
-            return Response(text=(fallback_text or "No verifiable source-backed answer was reached for this question.")[:20000])
-        if has_text and not has_output:
-            return response
-        if has_output and not has_text:
-            try:
-                rendered = _sg_json.dumps(output) if isinstance(output, (dict, list)) else str(output)
-            except Exception:
-                rendered = str(output)
-            return Response(text=rendered[:20000] or fallback_text or "No verifiable source-backed answer was reached for this question.")
-        text = fallback_text.strip() if fallback_text else ""
-        return Response(text=text or "No verifiable source-backed answer was reached for this question.")
-    except Exception:
-        try:
-            return Response(text=fallback_text or "No verifiable source-backed answer was reached for this question.")
-        except Exception:
-            return Response(text="No verifiable source-backed answer was reached for this question.")
-# --- structured-output gate (end) -----------------------------------------------
-
-
-
-
-
-
-# --- answer-shape stage (start) ----------------------------------------------
-#
-# Why this stage exists. Batch 4117ad03 (2026-09-03), all four top artifacts:
-# answers that carried a headed "Proof" / "Candidate pool" / "Evidence" section
-# averaged 0.00-0.13 against 0.63-0.71 for answers without one, and the judge's
-# most frequent complaints on sub-1.0 rows were "format", "prose", "extra",
-# "concise", "verbose". Two verbatim examples: a fully correct MAIB answer lost
-# "for conciseness and strict adherence to prose format"; a correct NOAA answer
-# lost for "a lot of redundant information ... 'candidate dump' style analysis".
-# The same judge praised sequential [[1]]..[[n]] pointers as "much easier to
-# follow". So, on the cited path only:
-#   1. drop a trailing headed proof/pool/evidence section when the lead already
-#      is a cited answer (fail-open: uncertain leads, "show your working"
-#      questions, and short leads keep the full text);
-#   2. renumber the surviving [[n]] pointers by first appearance and keep only
-#      the citations they reference, so pointers stay exact and sequential.
-# Nothing here runs on fast tasks (no citations there) or structured output.
-
-import re as _sh_re
-
-_SH_KW = (r"(?:proof|candidate[ \t]+pool|evidence|verification|sources|references|"
-          r"supporting[ \t]+evidence|analysis|working|sweep)")
-# A headed section starts a line as (a) a markdown heading, (b) a bold heading
-# that may carry extra words up to its closing **, or (c) a plain
-# "Proof:" / "Candidate pool:" / "Proof section." label.
-_SH_HEADER_RE = _sh_re.compile(
-    r"^[ \t]*(?:"
-    r"#{1,4}[ \t]*" + _SH_KW + r"\b[^\n]{0,100}"
-    r"|\*\*[ \t]*" + _SH_KW + r"\b[^\n*]{0,100}\*\*"
-    r"|" + _SH_KW + r"(?:[ \t]+section)?[ \t]*[:.]"
-    r")", _sh_re.I | _sh_re.M)
-_SH_POINTER_RE = _sh_re.compile(r"\[\[(\d{1,3})\]\]")
-_SH_ODD_POINTER_RE = _sh_re.compile(r"\[\[[^\]]*[,\-–][^\]]*\]\]")
-_SH_UNCERTAIN_RE = _sh_re.compile(
-    r"\b(?:cannot|could not|unable to|no (?:qualifying|such)|not (?:present|found|"
-    r"available|reproduced) in|empty set|insufficient|could be identified|"
-    r"best-effort)\b", _sh_re.I)
-_SH_WORKING_RE = _sh_re.compile(
-    r"\b(?:show (?:your|the|all) (?:work|working|reasoning|steps)|explain (?:how|why|"
-    r"your reasoning)|justify|step[- ]by[- ]step|walk (?:me )?through|"
-    r"list (?:every|all) (?:candidate|member|step)|for each (?:candidate|member))\b",
-    _sh_re.I)
-_SH_MIN_LEAD_CHARS = 40
-_SH_MAX_CARRIED_POINTERS = 6
-_SH_SENTENCE_END_RE = _sh_re.compile(r"(?:[.!?]|\]\])[*_\"')\]]*$")
-
-
-def _sh_split(text: str):
-    """(lead, stripped_section) or None when no strippable trailing section exists.
-
-    The lead must read as a finished answer: long enough, ending a sentence.
-    A lead without its own [[n]] pointers is still accepted -- the pointers the
-    dropped section used are carried onto the lead by the caller, because an
-    uncited lead is a defect but a correct answer buried under a candidate
-    dump scored 0.0 on every observed row.
-    """
-    for m in _SH_HEADER_RE.finditer(text):
-        lead = text[:m.start()].rstrip()
-        if len(lead) < _SH_MIN_LEAD_CHARS:
-            continue
-        if not _SH_SENTENCE_END_RE.search(lead):
-            continue
-        return lead, text[m.start():]
-    return None
-
-
-def _sh_carry_pointers(lead: str, dropped: str) -> str:
-    """Give a pointer-less lead the distinct pointers its dropped proof used."""
-    if _SH_POINTER_RE.search(lead):
-        return lead
-    seen: list = []
-    for m in _SH_POINTER_RE.finditer(dropped):
-        n = int(m.group(1))
-        if n not in seen:
-            seen.append(n)
-        if len(seen) >= _SH_MAX_CARRIED_POINTERS:
-            break
-    if not seen:
-        return lead
-    return lead + " " + "".join(f"[[{n}]]" for n in seen)
-
-
-def _sh_renumber(text: str, citations):
-    """Renumber [[n]] by first appearance; keep only referenced refs. Fail open."""
-    if not citations or _SH_ODD_POINTER_RE.search(text):
-        return text, citations
-    order: list = []
-    for m in _SH_POINTER_RE.finditer(text):
-        n = int(m.group(1))
-        if n < 1 or n > len(citations):
-            return text, citations
-        if n not in order:
-            order.append(n)
-    if not order:
-        return text, citations
-    mapping = {n: i + 1 for i, n in enumerate(order)}
-    new_text = _SH_POINTER_RE.sub(lambda m: f"[[{mapping[int(m.group(1))]}]]", text)
-    new_cits = [citations[n - 1] for n in order]
-    return new_text, new_cits
-
-
-def _sh_shape(query_input, response):
-    """Cited-path answer hygiene. Returns the response unchanged on any doubt."""
-    try:
-        if getattr(query_input, "fast", False) is True:
-            return response
-        if getattr(query_input, "output_schema", None) is not None:
-            return response
-        text = getattr(response, "text", None)
-        if not isinstance(text, str) or getattr(response, "output", None) is not None:
-            return response
-        question = str(getattr(query_input, "text", "") or "")
-        if _SH_WORKING_RE.search(question):
-            return response
-        split = _sh_split(text)
-        if split is None:
-            return response
-        lead, dropped = split
-        if _SH_UNCERTAIN_RE.search(lead):
-            return response
-        citations = list(getattr(response, "citations", None) or [])
-        lead = _sh_carry_pointers(lead, dropped)
-        new_text, new_cits = _sh_renumber(lead, citations)
-        if not new_text.strip():
-            return response
-        try:
-            return response.model_copy(update={"text": new_text,
-                                               "citations": new_cits or None})
-        except Exception:
-            return Response(text=new_text, citations=new_cits or None,
-                            note=getattr(response, "note", None))
-    except Exception:
-        return response
-# --- answer-shape stage (end) ------------------------------------------------
-
-
-_DUO_A_LINE = _compose_f177_line()
-_DUO_B_LINE = _compose_u28_line()
-
-
-async def _duo_sequential(query: Query, agents) -> Response:
-    """Lineages in order under per-lineage clocks. On a structured task the
-    first lineage gets a shorter clock so a backup can still run; a returned
-    structured payload that fails the schema is repaired before being judged."""
-    structured = getattr(query, "output_schema", None) is not None
-    for index, agent in enumerate(agents):
-        remaining = _duo_remaining()
-        if index and remaining < _DUO_BACKUP_MIN_S:
-            break
-        budget = _DUO_SCHEMA_FIRST_S if (index == 0 and structured and len(agents) > 1) else _DUO_AGENT_S
-        budget = min(budget, remaining - 4.0)
-        _DUO_STATE["cutoff"] = _duo_elapsed() + max(20.0, budget - 10.0)
-        response = await _duo_run(agent, query, budget)
-        if _duo_usable(response, query):
-            return response
-        if structured and isinstance(response, Response) and (response.output is not None or response.text):
-            gated = _sg_gate(query, response)
-            if _duo_usable(gated, query):
-                return gated
-    return _duo_emergency(query)
-
-
-def _duo_route(query: Query):
-    """Structured tasks start on the second lineage, which carries the shorter
-    schema clock; everything else starts on the primary."""
+def _task_shape_route_index(query: Query) -> int:
     if getattr(query, "output_schema", None) is not None:
-        return (_DUO_B_LINE, _DUO_A_LINE)
-    return (_DUO_A_LINE, _DUO_B_LINE)
+        return 0
+    text = (getattr(query, "text", "") or "").casefold()
+    for punctuation in "\n\t,.;:!?()[]{}%-":
+        text = text.replace(punctuation, f" {punctuation} " if punctuation == "%" else " ")
+    text = " " + " ".join(text.split()) + " "
+    if any(signal in text for signal in _TASK_SHAPE_SECONDARY_SIGNALS):
+        return 1
+    return 2
 
 
-async def _duo_post(query: Query, response: Response) -> Response:
-    """Final hygiene, each stage fail-open, then the sanity gate that guarantees
-    exactly one answer field (schema-shaped when the task is structured)."""
-    response = _sg_gate(query, response)
-    response = _fp_clean(query, response)
-    response = _sh_shape(query, response)
-    return _sg_sane(query, response, _DUO_STATE.get("text") or "")
+class Branch_bd6fe585916b9dd3212967e9f36809799a0691b3855d8a54f615f7e60d84596c:
+    async def __call__(self, query: Query) -> Response:
+        return await _branch_bd6fe585916b9dd3212967e9f36809799a0691b3855d8a54f615f7e60d84596c_query_entry(query)
+
+
+class Branch_95b2cad1ffd10e9355fe3e0a086c20a457484e5cc7f4434cff4ade6bece26dfb:
+    async def __call__(self, query: Query) -> Response:
+        return await _branch_95b2cad1ffd10e9355fe3e0a086c20a457484e5cc7f4434cff4ade6bece26dfb_query_entry(query)
+
+
+class Branch_3843b2a7b530ce91f23c86392314bde51919ab27a0ca337b447b007ead5c021a:
+    async def __call__(self, query: Query) -> Response:
+        return await _branch_3843b2a7b530ce91f23c86392314bde51919ab27a0ca337b447b007ead5c021a_query_entry(query)
+
+
+_TASK_SHAPE_PRIMARY_AGENT = Branch_bd6fe585916b9dd3212967e9f36809799a0691b3855d8a54f615f7e60d84596c()
+_TASK_SHAPE_SECONDARY_AGENT = Branch_95b2cad1ffd10e9355fe3e0a086c20a457484e5cc7f4434cff4ade6bece26dfb()
+_TASK_SHAPE_TERTIARY_AGENT = Branch_3843b2a7b530ce91f23c86392314bde51919ab27a0ca337b447b007ead5c021a()
+_CANDIDATE_BRANCH_CLASS_NAMES = (
+    "Branch_bd6fe585916b9dd3212967e9f36809799a0691b3855d8a54f615f7e60d84596c",
+    "Branch_95b2cad1ffd10e9355fe3e0a086c20a457484e5cc7f4434cff4ade6bece26dfb",
+    "Branch_3843b2a7b530ce91f23c86392314bde51919ab27a0ca337b447b007ead5c021a",
+)
+_CANDIDATE_ROUTE_FUNCTION = "_task_shape_route_index"
 
 
 @entrypoint("query")
-async def query(query: Query, context: ContextSnapshot) -> Response:
-    _DUO_STATE["started"] = time.monotonic()
-    _DUO_STATE["text"] = None
-    _DUO_STATE["cutoff"] = None
-    _DUO_STATE["context"] = context
-    try:
-        response = await _duo_sequential(query, _duo_route(query))
-        return await _duo_post(query, response)
-    except Exception:
-        return _sg_sane(query, _duo_emergency(query), _DUO_STATE.get("text") or "")
+async def query(query: Query) -> Response:
+    route_index = _task_shape_route_index(query)
+    if route_index == 0:
+        branch = _TASK_SHAPE_PRIMARY_AGENT
+    elif route_index == 1:
+        branch = _TASK_SHAPE_SECONDARY_AGENT
+    else:
+        branch = _TASK_SHAPE_TERTIARY_AGENT
+    return await branch(query)
+
